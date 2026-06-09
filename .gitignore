@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# paavod runtime state (when run locally for dev)
+/var-paavo/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

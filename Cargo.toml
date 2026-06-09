@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/paavo-proto",
+    "crates/paavo-meta",
+    "crates/paavo-db",
+    "crates/paavo-build",
+    "crates/paavo-probe",
+    "crates/paavo-runner",
+    "crates/paavo-core",
+    "crates/paavod",
+    "crates/paavo-cli",
+    "crates/paavo-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/felipebalbi/paavo"
+authors = ["Felipe Balbi <febalbi@microsoft.com>"]
+# `rust-version` deliberately omitted at the workspace level — the daemon
+# pins 1.95 via rust-toolchain.toml, but published library crates (notably
+# the planned paavo-meta upstream contribution) will declare their own MSRV
+# per crate when they ship.
+
+[workspace.dependencies]
+# Internal
+paavo-proto  = { path = "crates/paavo-proto" }
+paavo-meta   = { path = "crates/paavo-meta" }
+paavo-db     = { path = "crates/paavo-db" }
+paavo-build  = { path = "crates/paavo-build" }
+paavo-probe  = { path = "crates/paavo-probe" }
+paavo-runner = { path = "crates/paavo-runner" }
+paavo-core   = { path = "crates/paavo-core" }
+
+# Serialization / data
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+ulid        = { version = "1.2.1", features = ["serde"] }
+blake3      = "1.8.5"
+hex         = "0.4"
+
+# Async / HTTP / runtime
+tokio       = { version = "1", features = ["full"] }
+axum        = { version = "0.7", features = ["multipart", "macros"] }
+tower       = "0.5"
+tower-http  = { version = "0.6", features = ["trace", "limit"] }
+reqwest     = { version = "0.12", features = ["json", "multipart", "stream"] }
+futures     = "0.3"
+bytes       = "1"
+
+# Errors / logging
+anyhow      = "1"
+thiserror   = "2"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Storage
+rusqlite    = { version = "0.32", features = ["bundled"] }
+refinery    = { version = "0.8", features = ["rusqlite"] }
+
+# Scheduling
+tokio-cron-scheduler = "0.15.1"
+cron        = "0.12"
+
+# Probe / embedded decode
+probe-rs       = "0.31"
+defmt-decoder  = "1.1.0"
+object         = "0.36"
+
+# CLI / TUI
+clap        = { version = "4", features = ["derive", "env"] }
+indicatif   = "0.17"
+
+# Web (paavo-web only)
+leptos       = { version = "0.7", features = ["ssr"] }
+leptos_axum  = "0.7"
+
+# Test deps
+tempfile    = "3"
+proptest    = "1"
+assert_cmd  = "2"
+predicates  = "3"
+mockall     = "0.13"
+insta       = { version = "1", features = ["json"] }
+
+# Concurrency
+parking_lot     = "0.12"
+crossbeam-channel = "0.5"
+
+# Misc
+chrono      = { version = "0.4", features = ["serde"] }
+once_cell   = "1"
+tar         = "0.4"
+walkdir     = "2"
+
+# teleprobe-meta from embassy-rs (re-exported by paavo-meta)
+teleprobe-meta = { git = "https://github.com/embassy-rs/teleprobe", branch = "main" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
