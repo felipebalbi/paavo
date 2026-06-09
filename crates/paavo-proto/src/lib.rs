@@ -12,3 +12,15 @@
 
 /// Crate name, used by a smoke doctest.
 pub const CRATE_NAME: &str = "paavo-proto";
+
+mod board;
+mod ids;
+mod job;
+mod log;
+
+pub use board::{BoardHealth, BoardSelector, BoardSpec, ProbeSelector};
+pub use ids::JobId;
+pub use job::{
+    AbortReason, JobOutcome, JobSource, JobSpec, JobState, Priority, TerminalOutcome, TimeoutReason,
+};
+pub use log::{LogFrame, LogLevel};

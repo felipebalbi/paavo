@@ -9,7 +9,7 @@ description = "Wire types and protocol definitions shared across the paavo works
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 ulid = { workspace = true }
-chrono = { workspace = true }
-thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
