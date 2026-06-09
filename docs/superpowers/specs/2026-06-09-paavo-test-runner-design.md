@@ -1,0 +1,927 @@
+# paavo — design
+
+**Date:** 2026-06-09
+**Status:** Draft for review
+**Author:** Felipe Balbi
+**Repo:** `paavo` (new, to be created at `github.com/felipebalbi/paavo`)
+
+> Named after Paavo Nurmi, the *Flying Finn* — Olympic distance runner. Fitting
+> for a test runner whose nightly job is long-distance: hours-long stability
+> soaks against embedded targets.
+
+---
+
+## 1. Purpose & scope
+
+`paavo` is a self-hosted, Linux-based hardware-in-the-loop (HIL) test
+orchestrator for the `embassy-mcxa` HAL (and any future embassy chip wired up
+to the lab). It runs on one dedicated lab machine that owns a fleet of NXP
+eval boards connected via probe-rs probes.
+
+paavo serves two distinct workflows on the same physical fleet:
+
+1. **Nightly automated test runs** against the latest `embassy-rs/embassy`
+   `main`, plus paavo's own long-running stability ("soak") tests that are not
+   appropriate for the upstream repository.
+2. **Ad-hoc developer requests** during the day, via `paavo-cli`, where a
+   developer uploads a single test crate, has it built on the lab machine, run
+   on the requested board kind, and the result streamed back.
+
+The boards (mcxa266 fleet, rt685-evk fleet) are wired with a semi-standard,
+documented harness so any test that targets a given board kind can run on any
+healthy instance of that kind without rewiring.
+
+### Non-goals (explicitly out of scope)
+
+- **Not a CI replacement.** paavo does not gate PRs on GitHub, does not post
+  status checks, does not run on PR events. It is an unattended lab service
+  driven by a clock and by developer CLI calls.
+- **Not multi-tenant.** No authentication. paavo binds to a private network
+  only; security is delegated to the network perimeter.
+- **Not cross-platform** for the daemon. The daemon runs on Linux only.
+  `paavo-cli` is a thin HTTP client and works from Linux, macOS, and Windows
+  developer workstations.
+- **Not a teleprobe replacement on the user-facing side.** We keep using
+  `teleprobe-meta`'s `target!()` / `timeout!()` macros inside test source code
+  so test authors are unaffected. But paavo does **not** link the `teleprobe`
+  binary's internals as a library (teleprobe is currently a binary-only
+  crate; refactoring it just for paavo is unjustified). paavo-runner talks to
+  `probe-rs` directly and decodes defmt via `defmt-decoder`. See §4.3 and §16.
+
+---
+
+## 2. Background and prior art
+
+- **`embassy-rs/teleprobe`** — already runs the per-binary flash-from-RAM
+  + defmt-monitor loop the embassy project relies on. It is, however, a
+  binary-only crate (`main.rs`, no `lib.rs`). Refactoring it into a library
+  purely so paavo can link it would add maintenance burden on a fork the
+  embassy team doesn't promise stability for. Instead, paavo talks to
+  `probe-rs` directly and reuses the same on-chip protocol via the public
+  `teleprobe-meta` crate (which **is** a library and is what test authors
+  interact with). Where teleprobe has solved a non-obvious problem — e.g.
+  the NXP RT685S "skip post-load reset" quirk — paavo reimplements the
+  equivalent logic on the probe-rs API.
+- **`embassy-rs/embassy` tests** (e.g. `tests/mcxa2xx/src/bin/*.rs`) — already
+  follow a clean per-binary test convention: success = `defmt::info!("Test
+  OK")` followed by `cortex_m::asm::bkpt()`; failure = panic, assert, or
+  timeout. We adopt this convention unchanged.
+- **`teleprobe-meta`** — provides the `target!()` and `timeout!()` macros that
+  embed metadata into the ELF's `.teleprobe.*` link sections. We extend with
+  one new sibling macro (see §6.4) and otherwise consume it as-is.
+- **Prior work (`usain`)** — the user's earlier Python test runner whose
+  spiritual successor this is. Named for Usain Bolt. paavo is the Rust
+  rewrite-from-scratch, with a different name (Paavo Nurmi) to signal that it
+  is not a port.
+
+---
+
+## 3. Architecture overview
+
+paavo is **three binaries in one cargo workspace**, separated along genuine
+runtime boundaries:
+
+- **`paavod`** — the daemon. Headless, foreground process, supervised by
+  systemd. Owns the job queue, the board fleet, the SQLite database, the
+  build sandbox, and the HTTP API. Drives flashing and monitoring by talking
+  to `probe-rs` directly via the `paavo-probe` crate.
+- **`paavo-web`** — the read-only viewer. Leptos SSR web UI, bound by default
+  to `127.0.0.1:8081`. Opens the SQLite file in read-only WAL mode. Separate
+  systemd unit; can be restarted or upgraded independently of the daemon.
+- **`paavo-cli`** — the developer client. HTTP client to `paavod`. Subcommands
+  include `run`, `new`, `cancel`, `logs`, `boards`, `jobs`, `board add`,
+  `board quarantine`, `board unquarantine`.
+
+### 3.1 Top-level data flow
+
+```
+dev workstation                       lab machine (Linux)
+┌──────────────┐                      ┌──────────────────────────────────────┐
+│ paavo-cli    │     HTTP/JSON        │            paavod                    │
+│              │ ───────────────────► │ ┌──────────┐   ┌─────────────────┐   │
+│ + crate.tar  │      crate.tar       │ │ HTTP API │──►│ Job queue (mem) │   │
+│              │                      │ └──────────┘   └────────┬────────┘   │
+│              │ ◄────────────────    │      ▲                  │            │
+│              │   NDJSON log frames  │ ┌────┴─────┐    ┌───────▼──────┐     │
+└──────────────┘                      │ │ Sched/   │◄──►│ BoardWorker  │     │
+                                      │ │ timer    │    │ (per board)  │     │
+                                      │ └──────────┘    └──────┬───────┘     │
+                                      │      │                 │ paavo-probe │
+                                      │      ▼                 ▼  → probe-rs │
+                                      │ ┌────────────────────────────────┐   │
+                                      │ │     SQLite (WAL mode)          │◄──┐
+                                      │ └────────────────────────────────┘   │
+                                      │  systemd: paavod.service             │
+                                      └──────────────────────────────────────┘
+                                                                             │
+                                      ┌──────────────────────────────────────┘
+                                      ▼
+                                      ┌──────────────────────────────────────┐
+                                      │            paavo-web                 │
+                                      │  Leptos SSR, reads SQLite RO         │
+                                      │  systemd: paavo-web.service          │
+                                      └──────────────────────────────────────┘
+```
+
+### 3.2 Why two-binary daemon/UI split (not one binary)
+
+- The daemon must stay up to honor the nightly schedule; the UI is
+  nice-to-have. Different uptime SLOs.
+- The UI bringing in the Leptos toolchain (WASM, trunk, etc) should not force
+  the headless daemon build to drag those deps.
+- A UI crash must not poison in-flight jobs.
+
+SQLite (WAL mode + busy-timeout) is the only IPC between them: the daemon
+writes, the UI reads. The web UI does not need to show "live tailing" of the
+currently-running job's log because that is the dev workflow's job (the
+streaming NDJSON response from `POST /jobs`); the web UI's job is the
+historical view.
+
+---
+
+## 4. Workspace layout
+
+```
+paavo/
+├── Cargo.toml                      # workspace
+├── rust-toolchain.toml             # pin rustc for the daemon
+├── README.md
+├── LICENSE-APACHE, LICENSE-MIT
+│
+├── crates/
+│   ├── paavo-proto/                # wire types: Job, JobSpec, BoardSpec,
+│   │                               #   JobStatus, LogFrame, BoardHealth, etc.
+│   │                               # serde (de)serialization. No I/O.
+│   │
+│   ├── paavo-meta/                  # no_std helper crate for test crates.
+│   │                               # Re-exports teleprobe-meta's existing
+│   │                               #   target!() and timeout!() macros,
+│   │                               #   adds inactivity_timeout!(). Lives in
+│   │                               #   paavo until upstreamed (see §16.2).
+│   │
+│   ├── paavo-db/                   # SQLite schema, migrations, typed queries
+│   │                               # Owns the schema. RW and RO handles.
+│   │
+│   ├── paavo-build/                # Crate-tar unpack, sandbox dir mgmt,
+│   │                               #   cargo build invocation, ELF discovery,
+│   │                               #   build-cache reuse policy.
+│   │
+│   ├── paavo-probe/               # Low-level probe driver. Wraps probe-rs
+│   │                               #   directly:
+│   │                               #   - connect via probe selector
+│   │                               #   - parse .teleprobe.* ELF sections
+│   │                               #     (via `object`)
+│   │                               #   - load ELF (RAM-from-flash or flash,
+│   │                               #     per analysis; RT685S quirk handled)
+│   │                               #   - start RTT, decode defmt frames
+│   │                               #     (via `defmt-decoder`)
+│   │                               #   - emit Event stream
+│   │                               #     (Frame | Bkpt | Panic | Disconnect)
+│   │                               # No watchdog, no job concept.
+│   │
+│   ├── paavo-runner/                # Owns a probe for the duration of one job
+│   │                               #   via paavo-probe. Runs the inactivity
+│   │                               #   + hard-max watchdog. Streams defmt
+│   │                               #   frames out as LogFrame.
+│   │
+│   ├── paavo-core/                 # Scheduler, priority queue, board fleet,
+│   │                               #   BoardWorker, quarantine policy.
+│   │                               # Glues db + build + runner. No HTTP.
+│   │
+│   ├── paavod/                     # Binary. HTTP server (axum), config,
+│   │                               #   nightly cron, systemd integration,
+│   │                               #   signal handling.
+│   │
+│   ├── paavo-cli/                  # Binary. clap CLI. HTTP client to paavod.
+│   │
+│   └── paavo-web/                  # Binary. Leptos SSR. Reads paavo-db RO.
+│
+├── templates/                      # cargo-generate templates (one per board)
+│   ├── mcxa266/
+│   │   ├── cargo-generate.toml
+│   │   ├── Cargo.toml.liquid
+│   │   ├── memory.x
+│   │   ├── build.rs
+│   │   ├── .cargo/config.toml
+│   │   └── src/main.rs
+│   └── rt685-evk/
+│       └── (same structure)
+│
+├── soak-tests/                     # paavo's own long-running stability tests
+│   ├── mcxa266/
+│   │   ├── dma-stress-overnight/   # each subdir = one full test crate
+│   │   └── ...
+│   └── rt685-evk/
+│       └── ...
+│
+├── contrib/
+│   ├── paavod.service              # systemd unit
+│   ├── paavo-web.service
+│   └── paavo.toml.example          # annotated config
+│
+└── docs/superpowers/specs/         # design + plan docs
+```
+
+### 4.1 Crate boundary rules (enforced from day one)
+
+- `paavo-proto` depends on no other workspace crate.
+- `paavo-meta` is `no_std`; depends on `teleprobe-meta`. Consumed only by
+  scaffolded test crates (not by any paavo binary).
+- `paavo-db` depends only on `paavo-proto`.
+- `paavo-build` depends only on `paavo-proto`.
+- `paavo-probe` depends on `paavo-proto`. Pulls in `probe-rs`,
+  `defmt-decoder`, `object`. No other workspace crate.
+- `paavo-runner` depends on `paavo-proto` and `paavo-probe`.
+- `paavo-core` depends on `paavo-proto`, `paavo-db`, `paavo-build`,
+  `paavo-runner`. **No HTTP.**
+- `paavod` is the only place `axum` lives.
+- `paavo-web` is the only place `leptos` lives.
+- `paavo-cli` is the only place a user-facing TUI lives (clap, indicatif).
+
+### 4.2 Why this split
+
+- Integration tests for `paavo-core` can use an in-memory `paavo-db` and a
+  fake `paavo-runner` (no probes, no cargo) so nightly scheduling logic is
+  unit-testable deterministically.
+- `paavo-web` can evolve its Leptos version independently of the daemon.
+- A future "remote builder" feature is a `paavo-build` trait swap, not a
+  daemon rewrite.
+
+### 4.3 BoardWorker concurrency
+
+- One `BoardWorker` **OS thread** per board (not a tokio task), because
+  `probe-rs` is blocking and an OS thread is easier to abandon cleanly when
+  a probe call hangs.
+- A paired watchdog OS thread per BoardWorker (see §6).
+- Communication between the axum task layer and the BoardWorker threads is
+  via `crossbeam_channel` or `flume` (mpsc, blocking on the worker side,
+  awaitable on the axum side).
+
+---
+
+## 5. Job lifecycle and state machine
+
+### 5.1 States
+
+```
+                            ┌──────────┐
+                            │ Submitted│  POST /jobs accepted; tar persisted;
+                            │ (queued) │  row written to DB
+                            └────┬─────┘
+                                 │ scheduler picks job + board
+                                 ▼
+                            ┌──────────┐
+                            │ Building │  paavo-build: untar, cargo build,
+                            │          │  locate ELF
+                            └────┬─────┘
+                ┌────────────────┼────────────────┐
+       build error                build OK
+                ▼                                  ▼
+        ┌─────────────┐                     ┌──────────┐
+        │ Failed      │                     │ Running  │  paavo-runner attached
+        │ (BuildErr)  │                     │          │  to probe, streaming
+        └─────────────┘                     └────┬─────┘
+                                                 │
+            ┌───────────────────┬────────────────┼─────────────────┐
+       "Test OK" + bkpt    panic / assert  watchdog tripped   cancelled
+            │                   │                │                  │
+            ▼                   ▼                ▼                  ▼
+       ┌────────┐         ┌──────────┐    ┌──────────┐       ┌──────────┐
+       │ Passed │         │ Failed   │    │ TimedOut │       │ Aborted  │
+       └────────┘         │ (TestErr)│    └──────────┘       └──────────┘
+                          └──────────┘
+```
+
+Plus two terminal states reachable from anywhere via infra failure:
+
+- `Failed { InfraErr }` — probe attach failed, mass-erase failed, RTT init
+  failed.
+- `Aborted { DaemonShutdown }` — daemon got SIGTERM mid-job.
+
+### 5.2 Terminal outcomes (six)
+
+| Outcome              | Counts toward board infra-failure?                |
+| -------------------- | ------------------------------------------------- |
+| `Passed`             | no                                                |
+| `Failed{TestErr}`    | no                                                |
+| `Failed{BuildErr}`   | no                                                |
+| `Failed{InfraErr}`   | **yes**                                           |
+| `TimedOut{Inactivity}` | yes **only** if BoardWorker could not release the probe |
+| `TimedOut{HardMax}`  | no                                                |
+| `Aborted{User}`      | no                                                |
+| `Aborted{DaemonShutdown}` | no                                           |
+
+This split matters: a buggy soak test that hangs the chip would otherwise
+quarantine a perfectly good board.
+
+### 5.3 Priority queue rules
+
+Two priorities for v1:
+
+- `Interactive` — submitted via `paavo-cli run`.
+- `Scheduled` — submitted by the nightly cron job.
+
+Scheduler algorithm:
+
+1. Pop the highest-priority Submitted job.
+2. If multiple healthy boards match its `board_selector`, pick the
+   **least-recently-used** healthy board (rotates load + exposes flaky
+   boards faster).
+3. If no eligible healthy board is free, leave the job in the queue and try
+   the next priority cohort.
+
+**Starvation protection**: a `Scheduled` job queued longer than
+`starvation_threshold` (default 6 h) is promoted to `Interactive` priority.
+Tunable in config.
+
+### 5.4 Cancellation
+
+`paavo-cli cancel <job_id>` effect by current state:
+
+- `Submitted` → row marked `Aborted{User}`, removed from queue.
+- `Building` → SIGINT to the child `cargo` process, wait for exit, mark
+  `Aborted{User}`.
+- `Running` → signal watchdog with `force_cancel`; watchdog sends Cancel to
+  BoardWorker.
+
+### 5.5 Board selector
+
+A `JobSpec` includes a `board_selector` that the scheduler matches against
+board inventory:
+
+- `{ kind: "mcxa266" }` — any healthy board of this kind. Dev default.
+- `{ kind: "mcxa266", instance: "mcxa266-02" }` — specific board (debugging a
+  flaky instance).
+- `{ kind: "mcxa266", wiring_profile: "alt-spi" }` — boards tagged with named
+  wiring profiles; selector requires the profile.
+
+Selectors matching no possible board (e.g. typo `mcxap266`) are **rejected at
+enqueue time**, not silently queued forever.
+
+---
+
+## 6. Timeouts, watchdog, drain
+
+### 6.1 Watchdog responsibilities
+
+Inside `paavo-runner`, two threads cooperate per running job:
+
+```
+BoardWorker thread (owns probe)
+  ├─ runs paavo-probe's Session::run in a loop, pushing every event into an mpsc
+  └─ on each event push, updates a shared AtomicInstant "last_activity"
+
+Watchdog thread (paired with the worker)
+  ├─ sleeps in 5 s ticks
+  ├─ on each tick:
+  │    if now() - last_activity > inactivity_timeout
+  │      OR now() - start > hard_max:
+  │        send Cancel to BoardWorker
+  │        if BoardWorker doesn't drop the probe within 10 s grace:
+  │           mark job as TimedOut + probe_unresponsive
+  │           signal BoardWorker to abandon the probe (worker thread exits)
+  │           bump infra_failure counter on the board
+  └─ exits when BoardWorker exits
+```
+
+### 6.2 Defaults (config-tunable)
+
+- **Inactivity timeout (no defmt frame received)**: **120 s**, overridable per
+  test via a new `paavo_meta::inactivity_timeout!()` macro (see §6.4).
+- **Ad-hoc hard wall-clock max**: **15 minutes**, overridable via
+  `paavo-cli run --timeout 4h`.
+- **Scheduled soak hard max**: **4 hours**, overridable via the soak test's
+  `paavo_meta::timeout!()`.
+- **Daemon-wide ceiling**: **8 hours**. Any test requesting more is refused at
+  enqueue time.
+
+### 6.3 SIGTERM drain semantics
+
+- On `SIGTERM`, paavod stops accepting new jobs (HTTP returns 503).
+- All active workers' watchdogs are signalled to use
+  `min(remaining, grace_period)` as the hard max, with `grace_period`
+  defaulting to 60 s.
+- Any job still running after grace is marked `Aborted{DaemonShutdown}` with
+  partial defmt log persisted.
+- v1: an in-flight nightly soak job is *not* saved by extending its timeout.
+  v2 may add `--drain-wait=8h`.
+
+### 6.4 New `inactivity_timeout!()` macro
+
+We add a sibling to `paavo_meta::target!()` and `paavo_meta::timeout!()`
+(which re-export `teleprobe_meta::{target, timeout}`),
+shipped in the `paavo-meta` workspace crate (§4):
+
+```rust
+// In paavo-meta/src/lib.rs
+//
+// Re-export the existing teleprobe-meta macros so test crates only need
+// one dependency:
+pub use teleprobe_meta::{target, timeout};
+
+/// Set the per-job no-frame inactivity timeout, in seconds.
+#[macro_export]
+macro_rules! inactivity_timeout {
+    ($val:literal) => {
+        #[link_section = ".teleprobe.inactivity_timeout"]
+        #[used]
+        #[no_mangle]
+        static _TELEPROBE_INACTIVITY_TIMEOUT: u32 = $val;
+    };
+}
+```
+
+`paavo-probe` reads this section from the ELF (via `object`); if absent, falls
+back to the job's `inactivity_timeout_ms`, which itself falls back to the
+daemon default.
+
+The section name keeps the `.teleprobe.*` prefix on purpose so that, once the
+macro is upstreamed to `embassy-rs/teleprobe`'s `teleprobe-meta` crate,
+existing ELFs continue to work unchanged. Until then, the macro lives in
+`paavo-meta`.
+
+---
+
+## 7. Storage model (SQLite)
+
+WAL mode, single writer (paavod), one reader (paavo-web), no other processes
+should open the DB. Five tables:
+
+### 7.1 `board`
+
+| column                         | type | notes                                         |
+| ------------------------------ | ---- | --------------------------------------------- |
+| `id`                           | TEXT PK | e.g. `mcxa266-01`                          |
+| `kind`                         | TEXT | e.g. `mcxa266`, `rt685-evk`                   |
+| `probe_selector`               | JSON | VID:PID:serial                                |
+| `chip_name`                    | TEXT | for probe-rs                                  |
+| `target_name`                  | TEXT | must match `paavo_meta::target!()` in ELF |
+| `wiring_profile`               | TEXT | nullable                                      |
+| `health`                       | TEXT | enum: `healthy` / `quarantined`               |
+| `quarantine_reason`            | TEXT | nullable                                      |
+| `consecutive_infra_failures`   | INT  |                                               |
+| `last_used_at`                 | INT  | epoch ms                                      |
+| `created_at`                   | INT  |                                               |
+
+### 7.2 `job`
+
+| column                | type     | notes                                            |
+| --------------------- | -------- | ------------------------------------------------ |
+| `id`                  | TEXT PK  | ULID                                             |
+| `priority`            | INT      | smaller = higher                                 |
+| `submitter`           | TEXT     | identifier from CLI; no auth                     |
+| `source`              | TEXT     | enum: `cli` / `scheduler`                        |
+| `board_selector`      | JSON     |                                                  |
+| `inactivity_timeout_ms` | INT    |                                                  |
+| `hard_max_ms`         | INT      |                                                  |
+| `state`               | TEXT     | enum: `submitted` / `building` / `running` / `passed` / `failed` / `timedout` / `aborted` |
+| `outcome_detail`      | JSON     | nullable, e.g. `{"kind":"Failed","reason":"TestErr"}` |
+| `board_id`            | TEXT     | nullable; set when scheduled                     |
+| `submitted_at`        | INT      |                                                  |
+| `started_at`          | INT      | nullable                                         |
+| `finished_at`         | INT      | nullable                                         |
+| `tar_blake3`          | TEXT     | hash of the uploaded tar (build cache key)       |
+| `tar_path`            | TEXT     | where on disk the tar lives                     |
+| `elf_path`            | TEXT     | nullable; set after build                       |
+
+### 7.3 `log_frame`
+
+| column      | type | notes                                |
+| ----------- | ---- | ------------------------------------ |
+| `job_id`    | TEXT FK |                                   |
+| `seq`       | INT  | monotonic per-job                    |
+| `ts_us`     | INT  | microseconds since job start         |
+| `level`     | TEXT | `trace`/`debug`/`info`/`warn`/`error` |
+| `target`    | TEXT |                                      |
+| `message`   | TEXT |                                      |
+
+PRIMARY KEY `(job_id, seq)`. Big table; retention policy in §7.6.
+
+### 7.4 `build_cache`
+
+| column         | type    | notes                              |
+| -------------- | ------- | ---------------------------------- |
+| `tar_blake3`   | TEXT PK | cache key                          |
+| `elf_path`     | TEXT    |                                    |
+| `built_at`     | INT     |                                    |
+| `last_used_at` | INT     |                                    |
+| `size_bytes`   | INT     |                                    |
+
+LRU eviction when total `size_bytes` exceeds `build_cache.max_bytes` config
+value (default 5 GiB).
+
+### 7.5 `schedule`
+
+| column                | type    | notes                              |
+| --------------------- | ------- | ---------------------------------- |
+| `id`                  | TEXT PK | e.g. `nightly`                     |
+| `cron`                | TEXT    |                                    |
+| `enabled`             | INT     | bool                               |
+| `last_triggered_at`   | INT     | nullable                           |
+| `last_completed_at`   | INT     | nullable                           |
+
+The **corpus** (which test crates to run) is config-file only, not DB —
+version-controlled in `paavo.toml`.
+
+### 7.6 Log retention (v1)
+
+- Keep full log for any job whose terminal state was not `Passed` —
+  indefinitely.
+- Keep full log for `Passed` jobs for **30 days**, then truncate to summary
+  lines only (`level >= warn`).
+- Vacuum runs nightly after the scheduled run, off-peak.
+
+Tunable in config. `retention.passed_full_log_days = -1` disables truncation.
+
+### 7.7 Why JSON for `outcome_detail`
+
+Variants carry different fields (`BuildErr` → compile diagnostics; `TestErr`
+→ panic message + frame number; `TimedOut` → duration + reason). JSON is
+flexible; the alternative of separate columns leaves most rows NULL. Both
+paavod and paavo-web parse the JSON via the same `paavo-proto` types.
+
+---
+
+## 8. Build environment
+
+paavo does **not** pin embassy. The test crate's own `Cargo.toml` is the
+source of truth for which embassy revision is built against:
+
+- A dev iterates against their own `felipebalbi/embassy` branch by pointing
+  their test crate at it (`embassy-mcxa = { git = "...", branch = "..." }`).
+- Nightly soak test crates in `paavo/soak-tests/mcxa266/*/Cargo.toml` git-dep
+  `embassy-rs/embassy` `main`.
+- "Periodically pull from embassy-rs/embassy" is therefore implemented by
+  `cargo update -p embassy-mcxa` (and friends) inside each soak test crate's
+  build sandbox, before `cargo build`. paavo never does git operations on
+  embassy itself.
+
+### 8.1 Build sandbox
+
+For each job, paavo-build:
+
+1. Looks up `tar_blake3` in the `build_cache` table. If hit, jump to §8.2.
+2. Untars the crate into `${paavo_state}/sandboxes/${job_id}/`.
+3. Sets `CARGO_TARGET_DIR=${paavo_state}/cargo-target/` (shared across jobs
+   for incremental reuse; cargo's own locking handles concurrent reads).
+4. Runs `cargo update -p <relevant pkgs>` if the test crate is a known soak
+   test from `soak-tests/` (config flag).
+5. Runs `cargo build --release` (build profile from job spec; default
+   release).
+6. Discovers the ELF via `[package.metadata.embassy].build.artifact-dir` or,
+   if absent, by scanning `target/<triple>/release/`.
+7. Records the ELF path under `build_cache` and returns it.
+
+### 8.2 Build cache reuse
+
+- Content-addressed by tar `blake3`. If the dev re-runs the exact same tar
+  (e.g. testing flakiness), build is instant.
+- A 1-byte edit to `src/main.rs` produces a fresh tar hash; cache miss; full
+  rebuild (incremental cargo target dir saves most work in practice).
+- LRU eviction when total cache size exceeds `build_cache.max_bytes` (default
+  5 GiB).
+
+---
+
+## 9. HTTP API (paavod ↔ paavo-cli)
+
+Bound by default to `127.0.0.1:8080`, overridable via config (`server.bind`).
+JSON request/response except where noted.
+
+### 9.1 Job submission
+
+`POST /jobs`
+
+- Multipart body: `crate.tar` (the tarred crate) + JSON metadata
+  (`board_selector`, `priority`, `timeout`, `inactivity_timeout`,
+  `submitter`).
+- Response: `{ "job_id": "01H..." }` + `202 Accepted` if enqueued;
+  `400 Bad Request` if the selector matches no possible board or the
+  requested timeout exceeds the daemon ceiling.
+
+### 9.2 Job log streaming
+
+`GET /jobs/:id/stream`
+
+- Long-lived NDJSON response. One JSON line per `LogFrame`. Ends with a
+  `{"type":"terminal","outcome":...}` line when the job reaches a terminal
+  state.
+- If the job is already terminal when the call arrives, the response is the
+  full historical log plus the terminal line, then closes.
+
+### 9.3 Job query
+
+- `GET /jobs/:id` — current job row + outcome.
+- `GET /jobs?state=running&limit=50` — paginated query.
+- `POST /jobs/:id/cancel` — see §5.4.
+
+### 9.4 Board management
+
+- `GET /boards` — current fleet, health, last-used.
+- `POST /boards` — add board (used by `paavo-cli board add`). Validates
+  probe_selector resolves to a connected probe before accepting.
+- `POST /boards/:id/quarantine` — manual quarantine.
+- `POST /boards/:id/unquarantine` — clear quarantine, reset failure counter.
+
+### 9.5 Health
+
+- `GET /health` — liveness probe; returns `200` with a small JSON blob even
+  while draining.
+- `GET /ready` — readiness; returns `503` during shutdown drain.
+
+---
+
+## 10. CLI surface (`paavo-cli`)
+
+The CLI is the only user-facing terminal experience. All other terminal
+behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
+
+### 10.1 Developer workflow subcommands
+
+- `paavo-cli run <path> [--board-kind mcxa266] [--instance mcxa266-02] [--timeout 1h] [--inactivity 60s] [--priority interactive]`
+  - `<path>` may be a `.rs` file, a crate directory, or a pre-built ELF.
+  - If `.rs`: detect parent test-crate (walk up looking for `Cargo.toml`); if
+    none, refuse with a hint to run `paavo-cli new` first.
+  - If directory: tar the crate.
+  - If `.elf`: skip build (paavod accepts a pre-built ELF as a degenerate
+    crate tar with a single ELF + marker file).
+  - Streams the NDJSON log to the terminal until terminal outcome; exit code
+    reflects outcome (0 = Passed, non-zero per outcome class).
+- `paavo-cli new <crate-name> --board-kind mcxa266 [--kind quick|soak]`
+  - Thin wrapper around `cargo generate` against the paavo repo's templates.
+- `paavo-cli cancel <job_id>`
+- `paavo-cli logs <job_id> [--follow]`
+- `paavo-cli jobs [--state running] [--limit 20]`
+
+### 10.2 Operator subcommands
+
+- `paavo-cli boards`
+- `paavo-cli board add --kind mcxa266 --instance mcxa266-02 --probe 1366:1015:000123456789 --chip MCXA266VFL --target frdm-mcx-a266 [--wiring-profile default]`
+- `paavo-cli board quarantine <id> --reason "broken JTAG header"`
+- `paavo-cli board unquarantine <id>`
+
+### 10.3 Server discovery
+
+- `PAAVO_HOST` env var (e.g. `http://lab.local:8080`).
+- `--host` flag overrides.
+- Per-user `~/.config/paavo/cli.toml` for persistent defaults.
+
+---
+
+## 11. Web UI (`paavo-web`)
+
+- Leptos SSR. Bound to `127.0.0.1:8081` by default.
+- Opens `${paavo_state}/paavo.sqlite` in read-only WAL mode with a
+  conservative busy timeout.
+- Pages (v1):
+  - **`/`** — dashboard: board fleet health, currently-running jobs,
+    last 24h pass/fail summary.
+  - **`/jobs`** — filterable list (date range, board, state, source).
+  - **`/jobs/:id`** — single job: metadata + full log frames (paginated;
+    "tail" mode for in-progress jobs polls every 2 s).
+  - **`/boards`** — board details, recent jobs per board, quarantine
+    history.
+  - **`/schedule`** — nightly run history, next scheduled trigger time.
+- No write actions in the UI for v1 (no "cancel job" button, no "quarantine
+  board" button). All mutations go through `paavo-cli`. Reasons: keeps the
+  daemon/UI contract one-way; avoids needing auth/CSRF in the UI.
+
+---
+
+## 12. cargo-generate templates
+
+In `paavo/templates/<board-kind>/`.
+
+### 12.1 Template inputs (cargo-generate placeholders)
+
+- `project-name` (required)
+- `board-kind` (single-select; locked when generated via `paavo-cli new
+  --board-kind`)
+- `test-kind` (single-select: `quick` / `soak`; default `quick`)
+- `embassy-rev` (default `main`; can be a branch, tag, or SHA)
+
+### 12.2 What the template produces
+
+```
+<project-name>/
+├── Cargo.toml             # depends on embassy-{mcxa,...}, defmt, defmt-rtt,
+│                          #   panic-probe, paavo-meta, cortex-m,
+│                          #   cortex-m-rt, plus paavo-test-prelude.
+├── Cargo.lock             # committed for reproducibility
+├── build.rs               # wires link_ram.x (vendored under templates/shared/)
+├── memory.x               # board-specific
+├── .cargo/config.toml     # target triple; no runner = (run via paavo-cli)
+└── src/main.rs            # skeleton with paavo_meta::target!() set,
+                           #   embassy main, "TODO: write your test here"
+```
+
+### 12.3 The crate shape is the wire format
+
+The scaffolded crate shape is identical to:
+
+- what `paavo-cli run <crate-dir>` tars and uploads, and
+- what lives in `paavo/soak-tests/<board-kind>/<name>/`.
+
+This means a test that started life as `paavo-cli new my-test`, was iterated
+on by a dev with `paavo-cli run`, and is then promoted into the nightly
+corpus, can be moved into `soak-tests/` with no changes.
+
+### 12.4 Shared linker scripts
+
+`paavo/templates/shared/link_ram_cortex_m.x` is a verbatim copy of the same
+file from `embassy-rs/teleprobe` (MIT/Apache-2.0 dual-licensed, attribution
+in a header comment). Templates' `build.rs` writes it into `OUT_DIR` and
+passes `-Tlink_ram.x` to the linker so test binaries are linked for
+flash-from-RAM execution, matching the upstream embassy convention.
+
+The `teleprobe.x` linker fragment (which preserves the `.teleprobe.*`
+sections containing target / timeout / inactivity_timeout) ships with the
+`teleprobe-meta` crate's `build.rs`; since `paavo-meta` depends on
+`teleprobe-meta`, this is wired transitively at no cost.
+
+### 12.5 `paavo-test-prelude` (deferred)
+
+A small `no_std` lib that re-exports the common imports (`defmt`,
+`embassy_executor`, `embassy_time`, `panic_probe as _`, `defmt_rtt as _`,
+`paavo_meta`). Lives in the paavo repo as a published-or-path-dep crate.
+**Deferred to a later milestone**; v1 templates spell out all imports
+explicitly, and use `paavo-meta` directly for `target!()` / `timeout!()` /
+`inactivity_timeout!()`.
+
+---
+
+## 13. Configuration (`paavo.toml`)
+
+A single TOML file on the lab machine, default path
+`/etc/paavo/paavo.toml`, overridable via `--config` and `PAAVO_CONFIG`.
+
+```toml
+[server]
+bind = "127.0.0.1:8080"
+state_dir = "/var/lib/paavo"
+
+[web]
+bind = "127.0.0.1:8081"
+
+[timeouts]
+default_inactivity_s = 120
+default_ad_hoc_hard_max_s = 900       # 15 min
+default_scheduled_hard_max_s = 14400  # 4 h
+daemon_ceiling_s = 28800              # 8 h
+shutdown_grace_s = 60
+
+[scheduler]
+starvation_threshold_s = 21600        # 6 h
+nightly_cron = "0 19 * * *"           # 7pm daily
+
+[build_cache]
+max_bytes = 5_368_709_120             # 5 GiB
+
+[retention]
+passed_full_log_days = 30             # -1 = never truncate
+
+[quarantine]
+consecutive_infra_failures = 3
+
+[[corpus]]
+name = "embassy-mcxa-regression"
+path = "/var/lib/paavo/checkouts/embassy/tests/mcxa2xx"
+cargo_update = ["embassy-mcxa", "embassy-executor"]
+
+[[corpus]]
+name = "paavo-soak-mcxa266"
+path = "/var/lib/paavo/checkouts/paavo/soak-tests/mcxa266"
+cargo_update = []
+```
+
+Plus boards, which live in a separate file managed by `paavo-cli board add`
+(so an admin command does not have to know the format of the main config):
+
+```toml
+# /var/lib/paavo/boards.toml
+[[board]]
+id = "mcxa266-01"
+kind = "mcxa266"
+probe_selector = { vid = "1366", pid = "1015", serial = "000123456789" }
+chip_name = "MCXA266VFL"
+target_name = "frdm-mcx-a266"
+wiring_profile = "default"
+```
+
+---
+
+## 14. Deployment
+
+Linux only. Installed via `cargo install --path crates/paavod` (and `paavod`
++ `paavo-web` separately). systemd units shipped under `contrib/`.
+
+### 14.1 systemd
+
+`contrib/paavod.service` — runs as a dedicated `paavo` user, restart on
+failure, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/paavo`,
+`StateDirectory=paavo`, no privileges except USB device access (via udev
+rules for the probes).
+
+`contrib/paavo-web.service` — same `paavo` user, only needs read access to
+`/var/lib/paavo/paavo.sqlite*`.
+
+### 14.2 udev
+
+Document the probe-rs udev rules in `contrib/99-probes.rules`. paavo does
+*not* install them automatically; the operator runs `cp contrib/99-probes.rules /etc/udev/rules.d/`.
+
+### 14.3 Security posture (v1)
+
+- No auth. Daemon binds `127.0.0.1` by default. Operator who wants LAN
+  access reconfigures bind + protects with firewall / WireGuard / Tailscale.
+- Web UI same posture.
+- No TLS in v1. If a future v2 wants LAN exposure, add reverse-proxy notes
+  (caddy / nginx terminating TLS).
+
+---
+
+## 15. Testing strategy
+
+- **`paavo-proto`** — pure types; doctests for serde round-trip.
+- **`paavo-db`** — integration tests against in-memory SQLite; schema
+  migration tests forward and backward (where possible).
+- **`paavo-build`** — feed it a tiny fixture crate (a no-op embedded crate
+  pinned in `tests/fixtures/`); assert it produces an ELF. Build cache
+  reuse test.
+- **`paavo-probe`** — unit-test the .teleprobe.* section parser against
+  fixture ELFs in `tests/fixtures/`. The probe-rs adapter is harder to unit
+  test without hardware; cover it with a trait + fake-probe mock for the
+  parts paavo-runner cares about (event emission, disconnect simulation,
+  RAM-vs-flash decision).
+- **`paavo-runner`** — fake `paavo-probe::Session` (trait + mock impl) covers
+  all event shapes; watchdog test that fires Cancel after configured silence,
+  and a separate test for the hard-max path.
+- **`paavo-core`** — integration tests with in-memory DB and fake runner;
+  cover: priority ordering, starvation promotion, board LRU pick,
+  quarantine on N consecutive infra failures, board un-quarantine resets
+  counter, board selector rejection.
+- **`paavod`** — end-to-end with `axum`'s `TestServer`; cover full job
+  lifecycle with fake runner.
+- **`paavo-cli`** — assert_cmd-style tests against `paavod` test server.
+- **Hardware-in-the-loop smoke test** — manual, run once per release: spin
+  up paavod against a real mcxa266 + rt685-evk, submit one passing test and
+  one panicking test, confirm outcomes and log capture.
+
+---
+
+## 16. Prerequisite work (outside the paavo repo)
+
+### 16.1 Upstreaming `teleprobe-meta::inactivity_timeout!()`
+
+The macro lives in the paavo workspace as part of `paavo-meta` (§4, §6.4).
+Once it's exercised in production, propose it upstream to
+`embassy-rs/teleprobe`'s `teleprobe-meta` crate. The section name
+(`.teleprobe.inactivity_timeout`) is chosen so the upstream form and the
+paavo-vendored form are wire-compatible: ELFs built with either macro will
+be read identically by `paavo-probe`.
+
+Until accepted upstream, scaffolded test crates depend on `paavo-meta`. After
+acceptance, `paavo-meta` becomes a thin re-export shim and eventually goes
+away.
+
+### 16.2 (Not required) teleprobe library refactor
+
+Earlier drafts proposed refactoring `felipebalbi/teleprobe` into a library so
+`paavo-runner` could link it. This was rejected: paavo uses `probe-rs` and
+`defmt-decoder` directly via the `paavo-probe` crate, and reuses
+`teleprobe-meta` (which is already a library) for the on-ELF metadata
+convention. The teleprobe binary is not modified.
+
+---
+
+## 17. Items deferred to v2 (explicit)
+
+- Per-job env vars / build features overrides (today the test crate's
+  Cargo.toml is the source of truth).
+- Job dependencies / fan-out (every job is independent).
+- Result-derived alerts (notify on first failure of a previously-passing
+  test).
+- Auto power-cycle on board failure (requires controllable USB hub / smart
+  plug hardware).
+- Auth (any kind).
+- TLS / LAN exposure of the web UI.
+- Multi-machine paavo (one daemon, many lab machines as probe-rs sources).
+- `paavo-test-prelude` shared crate (§12.5).
+- Web UI write actions.
+- Per-board subprocess workers (Approach C from brainstorming).
+
+---
+
+## 18. Open questions for spec review
+
+These were recorded with the recommended answer; flag any that should
+change before we move to the implementation plan.
+
+1. ~~teleprobe lib refactor as a prerequisite work item~~ — **resolved
+   during review**: dropped entirely. paavo talks to `probe-rs` directly via
+   `paavo-probe`. See §16.2.
+2. **`soak-tests/` lives in the paavo repo for v1** — recommended **yes**.
+   Alternative: separate `paavo-soak-tests` repo. Easy to split later if it
+   becomes annoying.
+3. **`outcome_detail` as JSON column vs. separate columns** — recommended
+   **JSON**. Tradeoffs in §7.7.
