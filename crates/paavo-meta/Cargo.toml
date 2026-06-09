@@ -6,5 +6,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "no_std metadata macros for paavo test crates: target!, timeout!, inactivity_timeout!. Self-contained, no upstream dep."
+build = "build.rs"
 
 [dependencies]
