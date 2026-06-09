@@ -1,0 +1,32 @@
+[package]
+name = "paavo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "paavo command-line client."
+
+[dependencies]
+paavo-proto = { workspace = true }
+clap        = { workspace = true }
+reqwest     = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif   = { workspace = true }
+chrono      = { workspace = true }
+futures     = { workspace = true }
+bytes       = { workspace = true }
+tar         = { workspace = true }
+walkdir     = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile   = { workspace = true }

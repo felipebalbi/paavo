@@ -1,0 +1,19 @@
+[package]
+name = "paavo-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Low-level probe-rs + defmt-decoder driver for paavo."
+
+[dependencies]
+paavo-proto    = { workspace = true }
+probe-rs       = { workspace = true }
+defmt-decoder  = { workspace = true }
+object         = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+parking_lot    = { workspace = true }
+crossbeam-channel = { workspace = true }
+chrono         = { workspace = true }

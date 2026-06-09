@@ -1,0 +1,20 @@
+[package]
+name = "paavo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Scheduler, board fleet, quarantine policy, build-cache glue for paavo. No HTTP, no async runtime."
+
+[dependencies]
+paavo-proto  = { workspace = true }
+paavo-db     = { workspace = true }
+paavo-build  = { workspace = true }
+paavo-runner = { workspace = true }
+rusqlite     = { workspace = true }
+thiserror    = { workspace = true }
+chrono       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
