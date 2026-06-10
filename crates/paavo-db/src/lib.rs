@@ -24,5 +24,5 @@ pub use build_cache::{BuildCacheEntry, BuildCacheStats};
 pub use db::Db;
 pub use error::{DbError, Result};
 pub use job::{JobRow, NewJob, OutcomeRecord};
-pub use log::LogFrameRow;
+pub use log::{LogFrameDb, LogFrameRow};
 pub use schedule::{ScheduleRow, ScheduleUpdate};
