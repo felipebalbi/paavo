@@ -1,4 +1,6 @@
-//! SQLite-backed persistence for paavo.
+//! SQLite-backed persistence for paavo. Owns the schema; exposes typed
+//! query helpers per table. Single writer (paavod), single reader
+//! (paavo-web).
 //!
 //! ```
 //! assert_eq!(paavo_db::CRATE_NAME, "paavo-db");
@@ -8,3 +10,19 @@
 
 /// Crate name, used by a smoke doctest.
 pub const CRATE_NAME: &str = "paavo-db";
+
+mod board;
+mod build_cache;
+mod db;
+mod error;
+mod job;
+mod log;
+mod schedule;
+
+pub use board::BoardRow;
+pub use build_cache::{BuildCacheEntry, BuildCacheStats};
+pub use db::Db;
+pub use error::{DbError, Result};
+pub use job::{JobRow, NewJob, OutcomeRecord};
+pub use log::LogFrameRow;
+pub use schedule::{ScheduleRow, ScheduleUpdate};
