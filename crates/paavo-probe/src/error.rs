@@ -8,20 +8,20 @@ pub enum ProbeError {
     /// `object` crate refused to parse the ELF.
     #[error("elf parse: {0}")]
     Elf(#[from] object::Error),
-    /// A `.teleprobe.target` section was empty or contained no NUL-terminated
+    /// A `.paavo.target` section was empty or contained no NUL-terminated
     /// string.
-    #[error("`.teleprobe.target` section is empty or malformed")]
+    #[error("`.paavo.target` section is empty or malformed")]
     EmptyTarget,
-    /// A `.teleprobe.target` section had unexpected wire format (NUL-less,
+    /// A `.paavo.target` section had unexpected wire format (NUL-less,
     /// interior NUL with trailing bytes, or invalid UTF-8).
-    #[error("`.teleprobe.target` section is malformed: {reason}")]
+    #[error("`.paavo.target` section is malformed: {reason}")]
     MalformedTarget {
         /// Human-readable diagnostic (e.g. "missing trailing NUL",
         /// "interior NUL at byte 5 with 3 trailing bytes after",
         /// "invalid UTF-8 at byte 7").
         reason: String,
     },
-    /// A `.teleprobe.timeout` / `.teleprobe.inactivity_timeout` section was
+    /// A `.paavo.timeout` / `.paavo.inactivity_timeout` section was
     /// not exactly 4 bytes (u32 LE).
     #[error("`{section}` section must be 4 bytes (u32 LE), got {got}")]
     BadIntegerSection {

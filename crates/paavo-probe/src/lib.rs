@@ -1,5 +1,5 @@
 //! Low-level probe driver. Wraps `probe-rs` and `defmt-decoder` and parses
-//! the `.teleprobe.*` ELF sections that scaffolded test crates emit via the
+//! the `.paavo.*` ELF sections that scaffolded test crates emit via the
 //! `paavo-meta` macros.
 //!
 //! Layered for testability:

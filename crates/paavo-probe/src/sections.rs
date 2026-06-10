@@ -1,11 +1,11 @@
-//! Parser for the `.teleprobe.*` ELF sections embedded by the `paavo-meta`
-//! macros (and, incidentally, by any existing tooling that emits the same
-//! section names — wire-format compatible).
+//! Parser for the `.paavo.*` ELF sections embedded by the `paavo-meta`
+//! macros. The section namespace is owned end-to-end by this workspace;
+//! no external tool produces these sections today.
 //!
 //! Wire format reminder (matches what `paavo-meta` emits):
-//! - `.teleprobe.target`            — NUL-terminated UTF-8 byte string.
-//! - `.teleprobe.timeout`           — exactly 4 bytes, `u32` little-endian.
-//! - `.teleprobe.inactivity_timeout` — exactly 4 bytes, `u32` little-endian.
+//! - `.paavo.target`             — NUL-terminated UTF-8 byte string.
+//! - `.paavo.timeout`            — exactly 4 bytes, `u32` little-endian.
+//! - `.paavo.inactivity_timeout` — exactly 4 bytes, `u32` little-endian.
 
 use crate::error::{ProbeError, Result};
 use object::{Object, ObjectSection};
@@ -18,17 +18,17 @@ use object::{Object, ObjectSection};
 /// real build-wiring bug.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MetaSections {
-    /// `.teleprobe.target` — must match a `BoardSpec::target_name` in the
+    /// `.paavo.target` — must match a `BoardSpec::target_name` in the
     /// inventory.
     pub target: Option<String>,
-    /// `.teleprobe.timeout` — per-test hard-max override, in seconds.
+    /// `.paavo.timeout` — per-test hard-max override, in seconds.
     pub timeout_s: Option<u32>,
-    /// `.teleprobe.inactivity_timeout` — per-test inactivity override, in
+    /// `.paavo.inactivity_timeout` — per-test inactivity override, in
     /// seconds.
     pub inactivity_timeout_s: Option<u32>,
 }
 
-/// Parse the three `.teleprobe.*` sections out of an ELF byte buffer.
+/// Parse the three `.paavo.*` sections out of an ELF byte buffer.
 ///
 /// - Missing sections yield `None` on the corresponding field — they are
 ///   not errors.
@@ -39,14 +39,14 @@ pub fn parse_meta_sections(elf: &[u8]) -> Result<MetaSections> {
     let file = object::File::parse(elf)?;
     let mut out = MetaSections::default();
 
-    if let Some(s) = section_data(&file, ".teleprobe.target")? {
+    if let Some(s) = section_data(&file, ".paavo.target")? {
         out.target = Some(parse_cstring(s)?);
     }
-    if let Some(s) = section_data(&file, ".teleprobe.timeout")? {
-        out.timeout_s = Some(parse_u32_le(".teleprobe.timeout", s)?);
+    if let Some(s) = section_data(&file, ".paavo.timeout")? {
+        out.timeout_s = Some(parse_u32_le(".paavo.timeout", s)?);
     }
-    if let Some(s) = section_data(&file, ".teleprobe.inactivity_timeout")? {
-        out.inactivity_timeout_s = Some(parse_u32_le(".teleprobe.inactivity_timeout", s)?);
+    if let Some(s) = section_data(&file, ".paavo.inactivity_timeout")? {
+        out.inactivity_timeout_s = Some(parse_u32_le(".paavo.inactivity_timeout", s)?);
     }
     Ok(out)
 }

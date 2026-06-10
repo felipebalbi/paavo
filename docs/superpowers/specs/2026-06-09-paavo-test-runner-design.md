@@ -67,7 +67,7 @@ healthy instance of that kind without rewiring.
   OK")` followed by `cortex_m::asm::bkpt()`; failure = panic, assert, or
   timeout. We adopt this convention unchanged.
 - **`teleprobe-meta`** — provides the `target!()` and `timeout!()` macros that
-  embed metadata into the ELF's `.teleprobe.*` link sections. We extend with
+  embed metadata into the ELF's `.paavo.*` link sections (a paavo-native format that mirrors the embassy teleprobe layout). We extend with
   one new sibling macro (see §6.4) and otherwise consume it as-is.
 - **Prior work (`usain`)** — the user's earlier Python test runner whose
   spiritual successor this is. Named for Usain Bolt. paavo is the Rust
@@ -169,7 +169,7 @@ paavo/
 │   ├── paavo-probe/               # Low-level probe driver. Wraps probe-rs
 │   │                               #   directly:
 │   │                               #   - connect via probe selector
-│   │                               #   - parse .teleprobe.* ELF sections
+│   │                               #   - parse .paavo.* ELF sections
 │   │                               #     (via `object`)
 │   │                               #   - load ELF (RAM-from-flash or flash,
 │   │                               #     per analysis; RT685S quirk handled)
@@ -423,7 +423,7 @@ pub use teleprobe_meta::{target, timeout};
 #[macro_export]
 macro_rules! inactivity_timeout {
     ($val:literal) => {
-        #[link_section = ".teleprobe.inactivity_timeout"]
+        #[link_section = ".paavo.inactivity_timeout"]
         #[used]
         #[no_mangle]
         static _TELEPROBE_INACTIVITY_TIMEOUT: u32 = $val;
@@ -435,10 +435,7 @@ macro_rules! inactivity_timeout {
 back to the job's `inactivity_timeout_ms`, which itself falls back to the
 daemon default.
 
-The section name keeps the `.teleprobe.*` prefix on purpose so that, once the
-macro is upstreamed to `embassy-rs/teleprobe`'s `teleprobe-meta` crate,
-existing ELFs continue to work unchanged. Until then, the macro lives in
-`paavo-meta`.
+The section name uses a `.paavo.*` prefix; the schema mirrors embassy teleprobe's layout but uses a distinct namespace so paavo's tooling owns the wire format end-to-end.
 
 ---
 
@@ -734,10 +731,10 @@ in a header comment). Templates' `build.rs` writes it into `OUT_DIR` and
 passes `-Tlink_ram.x` to the linker so test binaries are linked for
 flash-from-RAM execution, matching the upstream embassy convention.
 
-The `teleprobe.x` linker fragment (which preserves the `.teleprobe.*`
-sections containing target / timeout / inactivity_timeout) ships with the
-`teleprobe-meta` crate's `build.rs`; since `paavo-meta` depends on
-`teleprobe-meta`, this is wired transitively at no cost.
+The `paavo.x` linker fragment (which preserves the `.paavo.*`
+sections containing target / timeout / inactivity_timeout) ships with
+`paavo-meta`'s own `build.rs`; downstream test crates pick it up via
+`-Tpaavo.x` in their RUSTFLAGS.
 
 ### 12.5 `paavo-test-prelude` (deferred)
 
@@ -848,7 +845,7 @@ Document the probe-rs udev rules in `contrib/99-probes.rules`. paavo does
 - **`paavo-build`** — feed it a tiny fixture crate (a no-op embedded crate
   pinned in `tests/fixtures/`); assert it produces an ELF. Build cache
   reuse test.
-- **`paavo-probe`** — unit-test the .teleprobe.* section parser against
+- **`paavo-probe`** — unit-test the .paavo.* section parser against
   fixture ELFs in `tests/fixtures/`. The probe-rs adapter is harder to unit
   test without hardware; cover it with a trait + fake-probe mock for the
   parts paavo-runner cares about (event emission, disconnect simulation,
@@ -876,9 +873,8 @@ Document the probe-rs udev rules in `contrib/99-probes.rules`. paavo does
 The macro lives in the paavo workspace as part of `paavo-meta` (§4, §6.4).
 Once it's exercised in production, propose it upstream to
 `embassy-rs/teleprobe`'s `teleprobe-meta` crate. The section name
-(`.teleprobe.inactivity_timeout`) is chosen so the upstream form and the
-paavo-vendored form are wire-compatible: ELFs built with either macro will
-be read identically by `paavo-probe`.
+(`.paavo.inactivity_timeout`) so per-test overrides ride alongside the
+existing target/timeout sections under the same paavo namespace.
 
 Until accepted upstream, scaffolded test crates depend on `paavo-meta`. After
 acceptance, `paavo-meta` becomes a thin re-export shim and eventually goes

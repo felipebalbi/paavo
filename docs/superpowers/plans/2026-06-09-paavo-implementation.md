@@ -4,9 +4,9 @@
 
 **Goal:** Build paavo — a self-hosted Linux HIL test runner for embassy-mcxa with three binaries (`paavod` daemon, `paavo-web` viewer, `paavo-cli` client) following TDD throughout.
 
-**Architecture:** Cargo workspace with 10 crates separated along genuine runtime boundaries (proto/meta/db/build/probe/runner/core + 3 binaries). SQLite WAL for persistence and daemon→UI IPC. probe-rs + defmt-decoder directly via `paavo-probe` (no teleprobe lib dependency). One OS thread per board for blocking probe-rs work, paired watchdog thread.
+**Architecture:** Cargo workspace with 10 crates separated along genuine runtime boundaries (proto/meta/db/build/probe/runner/core + 3 binaries). SQLite WAL for persistence and daemon→UI IPC. probe-rs + defmt-decoder driven directly via `paavo-probe`. One OS thread per board for blocking probe-rs work, paired watchdog thread.
 
-**Tech Stack:** Rust 1.95, axum, clap, rusqlite + refinery, probe-rs 0.31, defmt-decoder 1.1.0, blake3, ulid, tokio-cron-scheduler, cargo-generate (templates). `paavo-meta` (own metadata macro crate, no upstream dep) emits the `.teleprobe.*` ELF sections that `paavo-probe` parses. Web UI is server-side HTML via axum (no client framework); UnoCSS (CDN runtime) provides utility-class styling.
+**Tech Stack:** Rust 1.95, axum, clap, rusqlite + refinery, probe-rs 0.31, defmt-decoder 1.1.0, blake3, ulid, tokio-cron-scheduler, cargo-generate (templates). `paavo-meta` (own metadata macro crate, no upstream dep) emits the `.paavo.*` ELF sections that `paavo-probe` parses. Web UI is server-side HTML via axum (no client framework); UnoCSS (CDN runtime) provides utility-class styling.
 
 **Spec reference:** `docs/superpowers/specs/2026-06-09-paavo-test-runner-design.md`
 
@@ -179,7 +179,7 @@ debug = 1
 opt-level = 1
 ```
 
-> Note: `paavo-meta` owns its metadata macros (`target!`, `timeout!`, `inactivity_timeout!`) directly — no external git dep, no upstream coordination cost. The macros emit `.teleprobe.*` ELF sections so that `paavo-probe` (and any existing teleprobe-based tooling) reads the wire format unchanged.
+> Note: `paavo-meta` owns its metadata macros (`target!`, `timeout!`, `inactivity_timeout!`) directly — no external git dep, no upstream coordination cost. The macros emit `.paavo.*` ELF sections that `paavo-probe` reads; the namespace is owned end-to-end by this workspace.
 
 - [ ] **Step 4: Create LICENSE-APACHE**
 
@@ -330,7 +330,7 @@ build = "build.rs"
 [dependencies]
 ```
 
-> Empty `[dependencies]` is intentional — `paavo-meta` owns its macros end-to-end. The companion `build.rs` (added in Task 1.2) writes the linker fragment that preserves `.teleprobe.*` sections. For Task 0.2's skeleton we leave `build.rs` for Task 1.2 to add; the empty `lib.rs` below will compile without it.
+> Empty `[dependencies]` is intentional — `paavo-meta` owns its macros end-to-end. The companion `build.rs` (added in Task 1.2) writes the linker fragment that preserves `.paavo.*` sections. For Task 0.2's skeleton we leave `build.rs` for Task 1.2 to add; the empty `lib.rs` below will compile without it.
 
 `crates/paavo-meta/src/lib.rs`:
 ```rust
@@ -454,7 +454,7 @@ chrono         = { workspace = true }
 `crates/paavo-probe/src/lib.rs`:
 ```rust
 //! Low-level probe driver. Wraps `probe-rs` and `defmt-decoder` and parses
-//! `.teleprobe.*` ELF sections.
+//! `.paavo.*` ELF sections.
 //!
 //! ```
 //! assert_eq!(paavo_probe::CRATE_NAME, "paavo-probe");
@@ -1395,29 +1395,29 @@ git -C D:\workspace\paavo commit -m "feat(proto): core types JobId/JobSpec/Board
 
 ### Task 1.2: paavo-meta — owns target!, timeout!, inactivity_timeout!
 
-Spec coverage: §6.4 (macro definition). `paavo-meta` is self-contained — no upstream `teleprobe-meta` dep. It owns three macros and the linker fragment that preserves their sections in cross-compiled embedded builds. The section names keep the `.teleprobe.*` prefix as the on-ELF wire format that `paavo-probe` parses (and that any existing teleprobe-based tooling reads identically).
+Spec coverage: §6.4 (macro definition). `paavo-meta` is self-contained — it owns three macros and the linker fragment that preserves their sections in cross-compiled embedded builds. The section name prefix is `.paavo.*`, owned end-to-end by this workspace; no external tool reads these sections today.
 
 **Files:**
 - Modify: `crates/paavo-meta/src/lib.rs`
 - Create: `crates/paavo-meta/build.rs`
-- Create: `crates/paavo-meta/teleprobe.x`
+- Create: `crates/paavo-meta/paavo.x`
 - Create: `crates/paavo-meta/tests/macro_expansion.rs`
 
 - [ ] **Step 1: Add the linker fragment**
 
-`crates/paavo-meta/teleprobe.x` — preserves the `.teleprobe.*` sections so they survive `cargo build --release` for embedded targets (cortex-m linker drops unreferenced sections by default).
+`crates/paavo-meta/paavo.x` — preserves the `.paavo.*` sections so they survive `cargo build --release` for embedded targets (cortex-m linker drops unreferenced sections by default).
 
 ```
-/* paavo-meta linker fragment. Preserves the .teleprobe.* ELF sections
+/* paavo-meta linker fragment. Preserves the .paavo.* ELF sections
  * emitted by target!(), timeout!(), and inactivity_timeout!() so that
  * paavo-probe can read them out of the linked binary. */
 SECTIONS
 {
-    .teleprobe (INFO) :
+    .paavo (INFO) :
     {
-        KEEP(*(.teleprobe.target))
-        KEEP(*(.teleprobe.timeout))
-        KEEP(*(.teleprobe.inactivity_timeout))
+        KEEP(*(.paavo.target))
+        KEEP(*(.paavo.timeout))
+        KEEP(*(.paavo.inactivity_timeout))
     }
 }
 INSERT AFTER .text;
@@ -1427,8 +1427,8 @@ INSERT AFTER .text;
 
 `crates/paavo-meta/build.rs`:
 ```rust
-//! Copy `teleprobe.x` into `OUT_DIR` and tell rustc to add `OUT_DIR` to the
-//! linker search path. Downstream test crates can then put `-Tteleprobe.x`
+//! Copy `paavo.x` into `OUT_DIR` and tell rustc to add `OUT_DIR` to the
+//! linker search path. Downstream test crates can then put `-Tpaavo.x`
 //! in their RUSTFLAGS (the cargo-generate templates do this in Milestone 6).
 
 use std::env;
@@ -1437,10 +1437,10 @@ use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let frag = include_str!("teleprobe.x");
-    fs::write(out.join("teleprobe.x"), frag).expect("writing teleprobe.x to OUT_DIR");
+    let frag = include_str!("paavo.x");
+    fs::write(out.join("paavo.x"), frag).expect("writing paavo.x to OUT_DIR");
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=teleprobe.x");
+    println!("cargo:rerun-if-changed=paavo.x");
     println!("cargo:rerun-if-changed=build.rs");
 }
 ```
@@ -1450,7 +1450,7 @@ fn main() {
 `crates/paavo-meta/tests/macro_expansion.rs`:
 ```rust
 //! Compile-and-link tests for the macro surface. We can't easily assert
-//! that the macros land in `.teleprobe.*` sections on a host build —
+//! that the macros land in `.paavo.*` sections on a host build —
 //! that's the embedded linker's job, and the host build steers them into
 //! `.rodata.*` instead. But we *can* prove the macros expand and link on
 //! the host: that catches typos in the macro bodies.
@@ -1491,16 +1491,15 @@ Replace `crates/paavo-meta/src/lib.rs` with:
 //! - [`inactivity_timeout!`] — per-test override for the inactivity
 //!   watchdog, in seconds.
 //!
-//! The companion `build.rs` ships a linker fragment (`teleprobe.x`) that
-//! preserves the `.teleprobe.*` sections through the embedded linker.
-//! The section name prefix is `.teleprobe.*` for wire-format compatibility
-//! with any tooling (including the upstream embassy `teleprobe` binary)
-//! that already reads those names.
+//! The companion `build.rs` ships a linker fragment (`paavo.x`) that
+//! preserves the `.paavo.*` sections through the embedded linker.
+//! The section name prefix is `.paavo.*` and is owned end-to-end by this
+//! workspace; no external tool reads these sections today.
 #![no_std]
 #![forbid(unsafe_code)]
 
 /// Embed a target identifier as a NUL-terminated byte string in
-/// `.teleprobe.target`. Match against `BoardSpec::target_name` server-side.
+/// `.paavo.target`. Match against `BoardSpec::target_name` server-side.
 ///
 /// **Call at most once per binary**: the macro emits a `#[no_mangle]`
 /// static; a second invocation in the same crate is a hard linker error.
@@ -1513,7 +1512,7 @@ Replace `crates/paavo-meta/src/lib.rs` with:
 #[macro_export]
 macro_rules! target {
     ($val:literal) => {
-        #[cfg_attr(target_os = "none", link_section = ".teleprobe.target")]
+        #[cfg_attr(target_os = "none", link_section = ".paavo.target")]
         #[cfg_attr(not(target_os = "none"), link_section = ".rodata.paavo_meta_target")]
         #[used]
         #[no_mangle]
@@ -1530,7 +1529,7 @@ macro_rules! target {
     };
 }
 
-/// Embed the per-test hard-max wall clock (seconds) in `.teleprobe.timeout`.
+/// Embed the per-test hard-max wall clock (seconds) in `.paavo.timeout`.
 ///
 /// **Call at most once per binary**: the macro emits a `#[no_mangle]`
 /// static; a second invocation in the same crate is a hard linker error.
@@ -1541,7 +1540,7 @@ macro_rules! target {
 #[macro_export]
 macro_rules! timeout {
     ($val:literal) => {
-        #[cfg_attr(target_os = "none", link_section = ".teleprobe.timeout")]
+        #[cfg_attr(target_os = "none", link_section = ".paavo.timeout")]
         #[cfg_attr(
             not(target_os = "none"),
             link_section = ".rodata.paavo_meta_timeout"
@@ -1553,7 +1552,7 @@ macro_rules! timeout {
 }
 
 /// Embed the per-test inactivity-timeout override (seconds) in
-/// `.teleprobe.inactivity_timeout`. `paavo-probe` reads this section; if
+/// `.paavo.inactivity_timeout`. `paavo-probe` reads this section; if
 /// absent, falls back to the job's `inactivity_timeout_ms`, which itself
 /// falls back to the daemon's configured default.
 ///
@@ -1566,7 +1565,7 @@ macro_rules! inactivity_timeout {
     ($val:literal) => {
         #[cfg_attr(
             target_os = "none",
-            link_section = ".teleprobe.inactivity_timeout"
+            link_section = ".paavo.inactivity_timeout"
         )]
         #[cfg_attr(
             not(target_os = "none"),
@@ -1579,7 +1578,7 @@ macro_rules! inactivity_timeout {
 }
 ```
 
-> The `cfg_attr` split is because `link_section = ".teleprobe.*"` is rejected by some host linkers (ld/lld on Linux/macOS will accept it; some Windows linkers won't). The host path steers them into `.rodata.*` so the workspace test compiles everywhere. The macro's real consumer is cross-compiled embedded builds, where the first arm fires and `teleprobe.x` preserves the section through the linker.
+> The `cfg_attr` split is because `link_section = ".paavo.*"` is rejected by some host linkers (ld/lld on Linux/macOS will accept it; some Windows linkers won't). The host path steers them into `.rodata.*` so the workspace test compiles everywhere. The macro's real consumer is cross-compiled embedded builds, where the first arm fires and `paavo.x` preserves the section through the linker.
 
 - [ ] **Step 6: Run the test to confirm it passes**
 
@@ -1589,13 +1588,13 @@ Expected: 1 passed (`macros_expand_and_link`).
 - [ ] **Step 7: Confirm the workspace still builds**
 
 Run: `cargo build --workspace`
-Expected: green. `paavo-meta`'s new `build.rs` runs once, writes `teleprobe.x` into the crate's `OUT_DIR`.
+Expected: green. `paavo-meta`'s new `build.rs` runs once, writes `paavo.x` into the crate's `OUT_DIR`.
 
 - [ ] **Step 8: Commit**
 
 ```pwsh
 git -C D:\workspace\paavo add crates/paavo-meta Cargo.toml Cargo.lock
-git -C D:\workspace\paavo commit -m "feat(meta): own target!/timeout!/inactivity_timeout! macros + teleprobe.x linker fragment"
+git -C D:\workspace\paavo commit -m "feat(meta): own target!/timeout!/inactivity_timeout! macros + paavo.x linker fragment"
 ```
 
 ---
@@ -3806,7 +3805,7 @@ Goal: `paavo-probe` (ELF section parser, probe-rs adapter behind a trait, defmt-
 
 ### Task 2.1: paavo-probe — ELF section parser
 
-Spec coverage: §4 (`paavo-probe` responsibilities), §6.4 (`.teleprobe.inactivity_timeout`), on-ELF section convention (`.teleprobe.target`, `.teleprobe.timeout` emitted by `paavo-meta` macros).
+Spec coverage: §4 (`paavo-probe` responsibilities), §6.4 (`.paavo.inactivity_timeout`), on-ELF section convention (`.paavo.target`, `.paavo.timeout` emitted by `paavo-meta` macros).
 
 **Files:**
 - Create: `crates/paavo-probe/src/lib.rs` (replace skeleton)
@@ -3863,9 +3862,9 @@ fn parses_all_three_sections_when_present() {
     let timeout = (3600u32).to_le_bytes();
     let inact = (60u32).to_le_bytes();
     let elf = synth_elf(&[
-        (".teleprobe.target", target),
-        (".teleprobe.timeout", &timeout),
-        (".teleprobe.inactivity_timeout", &inact),
+        (".paavo.target", target),
+        (".paavo.timeout", &timeout),
+        (".paavo.inactivity_timeout", &inact),
     ]);
     let m = parse_meta_sections(&elf).unwrap();
     assert_eq!(m.target.as_deref(), Some("frdm-mcx-a266"));
@@ -3875,7 +3874,7 @@ fn parses_all_three_sections_when_present() {
 
 #[test]
 fn missing_sections_become_none() {
-    let elf = synth_elf(&[(".teleprobe.target", b"foo\0")]);
+    let elf = synth_elf(&[(".paavo.target", b"foo\0")]);
     let m = parse_meta_sections(&elf).unwrap();
     assert_eq!(m.target.as_deref(), Some("foo"));
     assert_eq!(m.timeout_s, None);
@@ -3884,7 +3883,7 @@ fn missing_sections_become_none() {
 
 #[test]
 fn empty_target_section_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.target", b"")]);
+    let elf = synth_elf(&[(".paavo.target", b"")]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("target") && msg.contains("empty"), "{msg}");
@@ -3892,7 +3891,7 @@ fn empty_target_section_is_an_error() {
 
 #[test]
 fn wrong_size_timeout_section_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.timeout", &[1u8, 2, 3])]);
+    let elf = synth_elf(&[(".paavo.timeout", &[1u8, 2, 3])]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("timeout") && msg.contains("4 bytes"), "{msg}");
@@ -3926,17 +3925,17 @@ pub enum ProbeError {
     /// `object` crate refused to parse the ELF.
     #[error("elf parse: {0}")]
     Elf(#[from] object::Error),
-    /// A `.teleprobe.target` section was empty (or first byte was NUL).
-    #[error("`.teleprobe.target` section is empty")]
+    /// A `.paavo.target` section was empty (or first byte was NUL).
+    #[error("`.paavo.target` section is empty")]
     EmptyTarget,
-    /// A `.teleprobe.target` section had unexpected wire format (NUL-less,
+    /// A `.paavo.target` section had unexpected wire format (NUL-less,
     /// interior NUL with trailing bytes, or invalid UTF-8).
-    #[error("`.teleprobe.target` section is malformed: {reason}")]
+    #[error("`.paavo.target` section is malformed: {reason}")]
     MalformedTarget {
         /// Human-readable diagnostic.
         reason: String,
     },
-    /// A `.teleprobe.timeout` / `.teleprobe.inactivity_timeout` section was
+    /// A `.paavo.timeout` / `.paavo.inactivity_timeout` section was
     /// not exactly 4 bytes (u32 LE).
     #[error("`{section}` section must be 4 bytes (u32 LE), got {got}")]
     BadIntegerSection {
@@ -3960,7 +3959,7 @@ pub type Result<T, E = ProbeError> = std::result::Result<T, E>;
 
 `crates/paavo-probe/src/sections.rs`:
 ```rust
-//! Parser for the `.teleprobe.*` ELF sections embedded by the `paavo-meta`
+//! Parser for the `.paavo.*` ELF sections embedded by the `paavo-meta`
 //! macros (and, incidentally, by any existing tooling that emits the same
 //! section names — wire-format compatible).
 
@@ -3970,17 +3969,17 @@ use object::{Object, ObjectSection};
 /// Parsed contents of all three optional metadata sections.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MetaSections {
-    /// `.teleprobe.target` — must match a `BoardSpec::target_name` in the
+    /// `.paavo.target` — must match a `BoardSpec::target_name` in the
     /// inventory.
     pub target: Option<String>,
-    /// `.teleprobe.timeout` — per-test hard-max override, in seconds.
+    /// `.paavo.timeout` — per-test hard-max override, in seconds.
     pub timeout_s: Option<u32>,
-    /// `.teleprobe.inactivity_timeout` — per-test inactivity override, in
+    /// `.paavo.inactivity_timeout` — per-test inactivity override, in
     /// seconds.
     pub inactivity_timeout_s: Option<u32>,
 }
 
-/// Parse the three `.teleprobe.*` sections out of an ELF byte buffer.
+/// Parse the three `.paavo.*` sections out of an ELF byte buffer.
 ///
 /// - Missing sections yield `None` on the corresponding field — they are
 ///   not errors.
@@ -3991,15 +3990,15 @@ pub fn parse_meta_sections(elf: &[u8]) -> Result<MetaSections> {
     let file = object::File::parse(elf)?;
     let mut out = MetaSections::default();
 
-    if let Some(s) = section_data(&file, ".teleprobe.target")? {
+    if let Some(s) = section_data(&file, ".paavo.target")? {
         out.target = Some(parse_cstring(s)?);
     }
-    if let Some(s) = section_data(&file, ".teleprobe.timeout")? {
-        out.timeout_s = Some(parse_u32_le(".teleprobe.timeout", s)?);
+    if let Some(s) = section_data(&file, ".paavo.timeout")? {
+        out.timeout_s = Some(parse_u32_le(".paavo.timeout", s)?);
     }
-    if let Some(s) = section_data(&file, ".teleprobe.inactivity_timeout")? {
+    if let Some(s) = section_data(&file, ".paavo.inactivity_timeout")? {
         out.inactivity_timeout_s =
-            Some(parse_u32_le(".teleprobe.inactivity_timeout", s)?);
+            Some(parse_u32_le(".paavo.inactivity_timeout", s)?);
     }
     Ok(out)
 }
@@ -4015,7 +4014,7 @@ fn section_data<'a>(
     Ok(Some(data))
 }
 
-/// Parse `.teleprobe.target` wire format: exactly N non-NUL bytes
+/// Parse `.paavo.target` wire format: exactly N non-NUL bytes
 /// followed by a single trailing NUL.
 ///
 /// Anything else (empty, no NUL, interior NUL with trailing bytes,
@@ -4063,7 +4062,7 @@ fn parse_u32_le(name: &'static str, bytes: &[u8]) -> Result<u32> {
 `crates/paavo-probe/src/lib.rs`:
 ```rust
 //! Low-level probe driver. Wraps `probe-rs` and `defmt-decoder` and parses
-//! the `.teleprobe.*` ELF sections that scaffolded test crates emit via the
+//! the `.paavo.*` ELF sections that scaffolded test crates emit via the
 //! `paavo-meta` macros.
 //!
 //! Layered for testability:
@@ -4199,7 +4198,7 @@ Expected: green.
 
 ```pwsh
 git -C D:\workspace\paavo add crates/paavo-probe
-git -C D:\workspace\paavo commit -m "feat(probe): .teleprobe.* ELF section parser + ProbeSession trait surface"
+git -C D:\workspace\paavo commit -m "feat(probe): .paavo.* ELF section parser + ProbeSession trait surface"
 ```
 
 ---

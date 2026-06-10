@@ -1,5 +1,5 @@
 //! Compile-and-link tests for the macro surface. We can't easily assert
-//! that the macros land in `.teleprobe.*` sections on a host build —
+//! that the macros land in `.paavo.*` sections on a host build —
 //! that's the embedded linker's job, and the host build steers them into
 //! `.rodata.*` instead. But we *can* prove the macros expand and link on
 //! the host: that catches typos in the macro bodies.

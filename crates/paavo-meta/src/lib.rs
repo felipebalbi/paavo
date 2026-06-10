@@ -8,16 +8,15 @@
 //! - [`inactivity_timeout!`] — per-test override for the inactivity
 //!   watchdog, in seconds.
 //!
-//! The companion `build.rs` ships a linker fragment (`teleprobe.x`) that
-//! preserves the `.teleprobe.*` sections through the embedded linker.
-//! The section name prefix is `.teleprobe.*` for wire-format compatibility
-//! with any tooling (including the upstream embassy `teleprobe` binary)
-//! that already reads those names.
+//! The companion `build.rs` ships a linker fragment (`paavo.x`) that
+//! preserves the `.paavo.*` sections through the embedded linker.
+//! The section name prefix is `.paavo.*` and is owned end-to-end by this
+//! workspace; no external tool reads these sections today.
 #![no_std]
 #![forbid(unsafe_code)]
 
 /// Embed a target identifier as a NUL-terminated byte string in
-/// `.teleprobe.target`. Match against `BoardSpec::target_name` server-side.
+/// `.paavo.target`. Match against `BoardSpec::target_name` server-side.
 ///
 /// **Call at most once per binary**: the macro emits a `#[no_mangle]`
 /// static; a second invocation in the same crate is a hard linker error.
@@ -30,7 +29,7 @@
 #[macro_export]
 macro_rules! target {
     ($val:literal) => {
-        #[cfg_attr(target_os = "none", link_section = ".teleprobe.target")]
+        #[cfg_attr(target_os = "none", link_section = ".paavo.target")]
         #[cfg_attr(not(target_os = "none"), link_section = ".rodata.paavo_meta_target")]
         #[used]
         #[no_mangle]
@@ -47,7 +46,7 @@ macro_rules! target {
     };
 }
 
-/// Embed the per-test hard-max wall clock (seconds) in `.teleprobe.timeout`.
+/// Embed the per-test hard-max wall clock (seconds) in `.paavo.timeout`.
 ///
 /// **Call at most once per binary**: the macro emits a `#[no_mangle]`
 /// static; a second invocation in the same crate is a hard linker error.
@@ -58,7 +57,7 @@ macro_rules! target {
 #[macro_export]
 macro_rules! timeout {
     ($val:literal) => {
-        #[cfg_attr(target_os = "none", link_section = ".teleprobe.timeout")]
+        #[cfg_attr(target_os = "none", link_section = ".paavo.timeout")]
         #[cfg_attr(not(target_os = "none"), link_section = ".rodata.paavo_meta_timeout")]
         #[used]
         #[no_mangle]
@@ -67,7 +66,7 @@ macro_rules! timeout {
 }
 
 /// Embed the per-test inactivity-timeout override (seconds) in
-/// `.teleprobe.inactivity_timeout`. `paavo-probe` reads this section; if
+/// `.paavo.inactivity_timeout`. `paavo-probe` reads this section; if
 /// absent, falls back to the job's `inactivity_timeout_ms`, which itself
 /// falls back to the daemon's configured default.
 ///
@@ -78,7 +77,7 @@ macro_rules! timeout {
 #[macro_export]
 macro_rules! inactivity_timeout {
     ($val:literal) => {
-        #[cfg_attr(target_os = "none", link_section = ".teleprobe.inactivity_timeout")]
+        #[cfg_attr(target_os = "none", link_section = ".paavo.inactivity_timeout")]
         #[cfg_attr(
             not(target_os = "none"),
             link_section = ".rodata.paavo_meta_inactivity_timeout"

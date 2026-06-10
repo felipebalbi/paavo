@@ -1,4 +1,4 @@
-//! Integration tests for the `.teleprobe.*` ELF section parser.
+//! Integration tests for the `.paavo.*` ELF section parser.
 //!
 //! Rather than depend on a cross-compiled fixture ELF (which would require
 //! an ARM toolchain in CI), we synthesise minimal ELFs in-process with the
@@ -46,9 +46,9 @@ fn parses_all_three_sections_when_present() {
     let timeout = 3600u32.to_le_bytes();
     let inact = 60u32.to_le_bytes();
     let elf = synth_elf(&[
-        (".teleprobe.target", target),
-        (".teleprobe.timeout", &timeout),
-        (".teleprobe.inactivity_timeout", &inact),
+        (".paavo.target", target),
+        (".paavo.timeout", &timeout),
+        (".paavo.inactivity_timeout", &inact),
     ]);
     let m = parse_meta_sections(&elf).unwrap();
     assert_eq!(m.target.as_deref(), Some("frdm-mcx-a266"));
@@ -58,7 +58,7 @@ fn parses_all_three_sections_when_present() {
 
 #[test]
 fn missing_sections_become_none() {
-    let elf = synth_elf(&[(".teleprobe.target", b"foo\0")]);
+    let elf = synth_elf(&[(".paavo.target", b"foo\0")]);
     let m = parse_meta_sections(&elf).unwrap();
     assert_eq!(m.target.as_deref(), Some("foo"));
     assert_eq!(m.timeout_s, None);
@@ -67,7 +67,7 @@ fn missing_sections_become_none() {
 
 #[test]
 fn empty_target_section_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.target", b"")]);
+    let elf = synth_elf(&[(".paavo.target", b"")]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("target") && msg.contains("empty"), "{msg}");
@@ -75,7 +75,7 @@ fn empty_target_section_is_an_error() {
 
 #[test]
 fn wrong_size_timeout_section_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.timeout", &[1u8, 2, 3])]);
+    let elf = synth_elf(&[(".paavo.timeout", &[1u8, 2, 3])]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("timeout") && msg.contains("4 bytes"), "{msg}");
@@ -83,7 +83,7 @@ fn wrong_size_timeout_section_is_an_error() {
 
 #[test]
 fn oversize_timeout_section_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.timeout", &[1u8, 2, 3, 4, 5])]);
+    let elf = synth_elf(&[(".paavo.timeout", &[1u8, 2, 3, 4, 5])]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("timeout") && msg.contains("4 bytes"), "{msg}");
@@ -91,7 +91,7 @@ fn oversize_timeout_section_is_an_error() {
 
 #[test]
 fn target_section_without_trailing_nul_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.target", b"frdm-mcx-a266")]);
+    let elf = synth_elf(&[(".paavo.target", b"frdm-mcx-a266")]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("missing trailing NUL"), "{msg}");
@@ -99,7 +99,7 @@ fn target_section_without_trailing_nul_is_an_error() {
 
 #[test]
 fn target_section_with_interior_nul_and_trailing_bytes_is_an_error() {
-    let elf = synth_elf(&[(".teleprobe.target", b"frdm\0junk")]);
+    let elf = synth_elf(&[(".paavo.target", b"frdm\0junk")]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("interior NUL"), "{msg}");
@@ -108,7 +108,7 @@ fn target_section_with_interior_nul_and_trailing_bytes_is_an_error() {
 #[test]
 fn target_section_with_invalid_utf8_is_an_error() {
     // 0xff is not valid UTF-8.
-    let elf = synth_elf(&[(".teleprobe.target", b"\xff\xfe\0")]);
+    let elf = synth_elf(&[(".paavo.target", b"\xff\xfe\0")]);
     let err = parse_meta_sections(&elf).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("invalid UTF-8"), "{msg}");
