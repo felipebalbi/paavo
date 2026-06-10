@@ -17,3 +17,8 @@ tracing        = { workspace = true }
 parking_lot    = { workspace = true }
 crossbeam-channel = { workspace = true }
 chrono         = { workspace = true }
+
+[dev-dependencies]
+# `object`'s ELF *writer* lives behind the non-default `write` feature.
+# The runtime dep only needs the default `read` surface.
+object = { workspace = true, features = ["write"] }
