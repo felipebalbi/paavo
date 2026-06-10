@@ -19,6 +19,15 @@ pub enum BuildError {
     /// `std::io::Error`, so they land here too.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The artifact-dir hint in `[package.metadata.embassy].build.artifact-dir`
+    /// pointed to a path that doesn't exist under the crate dir. This is
+    /// always a manifest authoring error, distinct from "I scanned and
+    /// found no ELF in the expected location" (`NoElf`).
+    #[error("hint-dir does not exist: {dir}")]
+    HintDirMissing {
+        /// The fully-joined `crate_dir + artifact_dir` that we expected to find.
+        dir: String,
+    },
     /// Manifest parse error.
     #[error("manifest: {0}")]
     Manifest(String),
