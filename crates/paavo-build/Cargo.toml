@@ -12,7 +12,6 @@ tar = { workspace = true }
 blake3 = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
