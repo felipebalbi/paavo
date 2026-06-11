@@ -7908,6 +7908,12 @@ pub mod app_state;
 pub mod routes;
 ```
 
+Add the new runtime dep to `crates/paavod/Cargo.toml` `[dependencies]`:
+```toml
+parking_lot = { workspace = true }
+```
+(`AppState` uses `parking_lot::Mutex`; `tower` is already a dep so `ServiceExt::oneshot` works in the integration test.)
+
 - [ ] **Step 4: Add the health integration test**
 
 `crates/paavod/tests/api_health.rs`:
