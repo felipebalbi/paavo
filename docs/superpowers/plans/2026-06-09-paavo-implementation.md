@@ -6780,47 +6780,19 @@ The cancel path is a thin wrapper over `JobRow::finalize` for Submitted + a sign
 ```rust
 mod common;
 
-use chrono::Utc;
-use common::{fresh_db, insert_board, list_inventory_specs};
-use paavo_core::{enqueue_job, CoreError, EnqueueRequest};
-use paavo_proto::{
-    AbortReason, BoardHealth, BoardSelector, JobId, JobOutcome, JobSource,
-    JobState, Priority,
-};
+use common::{enqueue_with, fresh_db, insert_board};
+use paavo_core::CoreError;
+use paavo_proto::{AbortReason, BoardHealth, JobOutcome, JobState};
 
-fn enqueue(db: &paavo_db::Db) -> JobId {
-    let id = JobId::new();
-    enqueue_job(
-        db.raw_conn(),
-        &list_inventory_specs(db),
-        EnqueueRequest {
-            job_id: id,
-            priority: Priority::Interactive,
-            submitter: "x".into(),
-            source: JobSource::Cli,
-            board_selector: BoardSelector {
-                kind: "mcxa266".into(),
-                instance: None,
-                wiring_profile: None,
-            },
-            inactivity_timeout_ms: 120_000,
-            hard_max_ms: 900_000,
-            tar_blake3: "x".into(),
-            tar_path: "/tmp/x.tar".into(),
-            daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
-        },
-    )
-    .unwrap();
-    id
-}
+const NOW: i64 = 1_700_000_000_000;
 
 #[test]
 fn cancel_submitted_job_finalizes_with_aborted_user() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
-    let id = enqueue(&db);
+    let id = enqueue_with(&db, NOW, |_| {});
 
-    let outcome = paavo_core::cancel_if_submitted(db.raw_conn(), &id).unwrap();
+    let outcome = paavo_core::cancel_if_submitted(db.raw_conn(), &id, NOW + 1).unwrap();
     assert_eq!(
         outcome,
         Some(JobOutcome::Aborted {
@@ -6841,21 +6813,39 @@ fn cancel_submitted_job_finalizes_with_aborted_user() {
 fn cancel_running_job_returns_not_cancellable_inline() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
-    let id = enqueue(&db);
+    let id = enqueue_with(&db, NOW, |_| {});
+
     // Force into Running state.
     paavo_db::JobRow::transition_to_building(
         db.raw_conn(),
         &id,
         "mcxa266-01",
-        Utc::now().timestamp_millis(),
+        NOW + 1,
     )
     .unwrap();
     paavo_db::JobRow::transition_to_running(db.raw_conn(), &id, "/cache/foo.elf").unwrap();
 
-    let res = paavo_core::cancel_if_submitted(db.raw_conn(), &id);
+    let res = paavo_core::cancel_if_submitted(db.raw_conn(), &id, NOW + 2);
     let err = res.unwrap_err();
     assert!(matches!(err, CoreError::NotCancellable {
         state: JobState::Running
+    }), "{err}");
+}
+
+#[test]
+fn cancel_already_finalized_returns_not_cancellable() {
+    // Aborted/Passed/Failed/TimedOut are all terminal; cancel must reject.
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+    let id = enqueue_with(&db, NOW, |_| {});
+
+    // First cancel succeeds.
+    paavo_core::cancel_if_submitted(db.raw_conn(), &id, NOW + 1).unwrap();
+
+    // Second cancel must reject; state is now Aborted.
+    let err = paavo_core::cancel_if_submitted(db.raw_conn(), &id, NOW + 2).unwrap_err();
+    assert!(matches!(err, CoreError::NotCancellable {
+        state: JobState::Aborted
     }), "{err}");
 }
 ```
@@ -6876,13 +6866,20 @@ pub use cancel::cancel_if_submitted;
 //! M4.
 
 use crate::error::{CoreError, Result};
-use chrono::Utc;
 use paavo_proto::{AbortReason, JobId, JobOutcome, JobState};
 use rusqlite::Connection;
 
-/// If the job is in `Submitted` state, mark it `Aborted{User}` and return the
-/// outcome. Otherwise, return `NotCancellable`.
-pub fn cancel_if_submitted(conn: &Connection, id: &JobId) -> Result<Option<JobOutcome>> {
+/// If the job is in `Submitted` state, mark it `Aborted{User}` and return
+/// the outcome. Otherwise, return `NotCancellable`.
+///
+/// `now_ms` is the wall-clock instant to record as `finished_at_ms`.
+/// Production passes `Utc::now().timestamp_millis()`; tests inject
+/// deterministic values.
+pub fn cancel_if_submitted(
+    conn: &Connection,
+    id: &JobId,
+    now_ms: i64,
+) -> Result<Option<JobOutcome>> {
     let row = paavo_db::JobRow::get(conn, id)?;
     if row.state != JobState::Submitted {
         return Err(CoreError::NotCancellable { state: row.state });
@@ -6896,7 +6893,7 @@ pub fn cancel_if_submitted(conn: &Connection, id: &JobId) -> Result<Option<JobOu
         &paavo_db::OutcomeRecord {
             state: JobState::Aborted,
             outcome: outcome.clone(),
-            finished_at_ms: Utc::now().timestamp_millis(),
+            finished_at_ms: now_ms,
         },
     )?;
     Ok(Some(outcome))
@@ -6906,7 +6903,7 @@ pub fn cancel_if_submitted(conn: &Connection, id: &JobId) -> Result<Option<JobOu
 - [ ] **Step 4: Run all paavo-core tests**
 
 Run: `cargo test -p paavo-core`
-Expected: all integration tests pass (enqueue 4 + scheduler priority 4 + scheduler lru 2 + scheduler starvation 1 + quarantine 5 + cancel 2 = 18 passed). Add 1 doctest from lib.rs = 19 total.
+Expected: enqueue 6 + scheduler priority 4 + scheduler lru 3 + scheduler starvation 3 + quarantine 5 + cancel 3 = **24 integration tests**. Plus 1 doctest from lib.rs = **25 total**.
 
 - [ ] **Step 5: Clippy**
 
