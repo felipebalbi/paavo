@@ -86,6 +86,7 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
             hard_max_ms: 900_000,
             tar_blake3: "aaa".into(),
             tar_path: tar_path.display().to_string(),
+            cargo_update_packages: vec![],
         },
         0,
     )
@@ -372,6 +373,7 @@ async fn dispatch_does_not_double_dispatch_same_board() {
             hard_max_ms: 900_000,
             tar_blake3: "aaa".into(),
             tar_path: tar_path.display().to_string(),
+            cargo_update_packages: vec![],
         },
         0,
     )

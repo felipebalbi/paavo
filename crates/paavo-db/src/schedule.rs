@@ -32,8 +32,12 @@ pub struct ScheduleUpdate {
 
 impl ScheduleRow {
     /// Insert or update a schedule row by id. On conflict, `cron` and
-    /// `enabled` are refreshed; `last_triggered_at` and `last_completed_at`
-    /// are preserved (those are owned by `apply_update`).
+    /// `enabled` are refreshed; `last_triggered_at` and
+    /// `last_completed_at` are coalesced — a non-NULL value from the
+    /// upsert overwrites the existing one, a NULL leaves the existing
+    /// value intact. This means the cron driver can push
+    /// `last_triggered_at` on every fire via `upsert` without losing
+    /// the value once `apply_update` writes `last_completed_at`.
     pub fn upsert(conn: &Connection, s: &ScheduleRow) -> Result<()> {
         conn.execute(
             "INSERT INTO schedule
@@ -41,7 +45,9 @@ impl ScheduleRow {
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
                 cron = excluded.cron,
-                enabled = excluded.enabled",
+                enabled = excluded.enabled,
+                last_triggered_at = COALESCE(excluded.last_triggered_at, last_triggered_at),
+                last_completed_at = COALESCE(excluded.last_completed_at, last_completed_at)",
             params![
                 s.id,
                 s.cron,
@@ -53,9 +59,11 @@ impl ScheduleRow {
         Ok(())
     }
 
-    /// Fetch one schedule by id; errors if missing.
+    /// Fetch one schedule by id. Returns `DbError::NotFound` on missing
+    /// so the HTTP layer can map straight to 404 without pattern-
+    /// matching on `rusqlite::Error::QueryReturnedNoRows`.
     pub fn get(conn: &Connection, id: &str) -> Result<ScheduleRow> {
-        conn.query_row(
+        match conn.query_row(
             "SELECT id, cron, enabled, last_triggered_at, last_completed_at
              FROM schedule WHERE id = ?1",
             params![id],
@@ -68,8 +76,14 @@ impl ScheduleRow {
                     last_completed_at: r.get("last_completed_at")?,
                 })
             },
-        )
-        .map_err(Into::into)
+        ) {
+            Ok(row) => Ok(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(crate::error::DbError::NotFound {
+                entity: "schedule",
+                id: id.to_string(),
+            }),
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// Apply a partial update; fields set to `None` are not touched.

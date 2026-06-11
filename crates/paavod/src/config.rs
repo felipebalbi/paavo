@@ -197,6 +197,12 @@ fn default_consecutive_infra_failures() -> u32 {
 pub struct CorpusEntry {
     /// Human-readable name (e.g. `embassy-mcxa-regression`).
     pub name: String,
+    /// Board kind every crate under this corpus targets. Must match a
+    /// `board.kind` registered via `paavo-cli board add`. The cron
+    /// driver uses this directly when building the selector for every
+    /// Scheduled job; the corpus PATH basename is not parsed (spec
+    /// §13 + §7.5).
+    pub kind: String,
     /// Filesystem path holding one or more test crates (each subdir = one
     /// test crate per the spec).
     pub path: std::path::PathBuf,

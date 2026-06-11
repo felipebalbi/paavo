@@ -159,6 +159,7 @@ pub async fn post_jobs(
         tar_blake3: String::new(),
         tar_path: String::new(),
         daemon_ceiling_ms,
+        cargo_update_packages: vec![],
     };
     {
         let inventory = s.inventory_snapshot();
@@ -207,6 +208,7 @@ pub async fn post_jobs(
         tar_blake3: blake,
         tar_path: final_path_str,
         daemon_ceiling_ms,
+        cargo_update_packages: vec![],
     };
     let inserted = {
         let db = s.db.lock();
@@ -441,6 +443,7 @@ fn row_to_view(r: paavo_db::JobRow) -> JobView {
         started_at: r.started_at,
         finished_at: r.finished_at,
         tar_blake3: r.tar_blake3,
+        cargo_update_packages: r.cargo_update_packages,
     }
 }
 

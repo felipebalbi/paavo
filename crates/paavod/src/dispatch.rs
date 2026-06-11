@@ -269,7 +269,13 @@ fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path:
     let plan = BuildPlan {
         crate_dir: crate_root,
         target_dir: sd.cargo_target_dir.clone(),
-        cargo_update_packages: vec![],
+        // Thread the job's `cargo_update_packages` through to the build
+        // sandbox. paavo_build runs `cargo update -p <pkg>` for each
+        // before `cargo build`. HTTP-submitted jobs always carry
+        // `vec![]` (dep graph locked at submit time); the nightly cron
+        // populates it from `[[corpus]].cargo_update` so soak runs
+        // pull fresh embassy revisions (spec §8.1 step 4).
+        cargo_update_packages: job.cargo_update_packages.clone(),
     };
     let res = paavo_build::build_release(&plan).map_err(|e| e.to_string())?;
     let now_ms = Utc::now().timestamp_millis();

@@ -30,6 +30,11 @@ pub struct EnqueueRequest {
     pub tar_path: String,
     /// Daemon ceiling for hard-max; requests above this are rejected.
     pub daemon_ceiling_ms: u64,
+    /// Packages to `cargo update -p ...` before building. HTTP-submitted
+    /// jobs always pass `vec![]`; the nightly cron threads each
+    /// `[[corpus]].cargo_update` through here so soak runs pull fresh
+    /// embassy revisions (spec §8.1 step 4).
+    pub cargo_update_packages: Vec<String>,
 }
 
 /// Pre-validate the parts of an enqueue request that do NOT require
@@ -71,6 +76,7 @@ pub fn enqueue_job(
         hard_max_ms: req.hard_max_ms,
         tar_blake3: req.tar_blake3,
         tar_path: req.tar_path,
+        cargo_update_packages: req.cargo_update_packages,
     };
     paavo_db::JobRow::insert(conn, &new, now_ms)?;
     Ok(req.job_id)

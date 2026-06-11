@@ -35,11 +35,13 @@ consecutive_infra_failures = 3
 
 [[corpus]]
 name = "embassy-mcxa-regression"
-path = "/var/lib/paavo/checkouts/embassy/tests/mcxa2xx"
+kind = "mcxa266"
+path = "/var/lib/paavo/checkouts/embassy/tests/mcxa266"
 cargo_update = ["embassy-mcxa", "embassy-executor"]
 
 [[corpus]]
 name = "paavo-soak-mcxa266"
+kind = "mcxa266"
 path = "/var/lib/paavo/checkouts/paavo/soak-tests/mcxa266"
 cargo_update = []
 "#;
@@ -60,6 +62,8 @@ fn parses_sample_config() {
     assert_eq!(cfg.quarantine.consecutive_infra_failures, 3);
     assert_eq!(cfg.corpus.len(), 2);
     assert_eq!(cfg.corpus[0].name, "embassy-mcxa-regression");
+    assert_eq!(cfg.corpus[0].kind, "mcxa266");
+    assert_eq!(cfg.corpus[1].kind, "mcxa266");
     assert_eq!(
         cfg.corpus[0].cargo_update,
         vec!["embassy-mcxa".to_string(), "embassy-executor".into()]

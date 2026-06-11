@@ -131,10 +131,87 @@ fn second_upsert_preserves_timestamps() {
 fn get_on_missing_id_errors() {
     let db = fresh_db();
     let err = ScheduleRow::get(db.raw_conn(), "nonexistent").unwrap_err();
-    // Right now this surfaces as DbError::Sqlite(QueryReturnedNoRows).
-    // The exact variant is an implementation detail; just confirm we get an error.
-    assert!(
-        matches!(err, paavo_db::DbError::Sqlite(_)),
-        "missing id should produce DbError::Sqlite(QueryReturnedNoRows), got {err:?}"
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "schedule");
+            assert_eq!(id, "nonexistent");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn upsert_coalesces_last_triggered_at_on_conflict() {
+    // Pins the M4.3.c Round 2 fix: a second upsert with a fresh
+    // last_triggered_at must update the column, not silently preserve
+    // the first-fire value. Without COALESCE in the DO UPDATE clause,
+    // the cron driver's "bump triggered on every fire" pattern would
+    // be silently no-op'd, and paavo-web's /schedule would show a
+    // fossil timestamp.
+    let db = fresh_db();
+    ScheduleRow::upsert(
+        db.raw_conn(),
+        &ScheduleRow {
+            id: "nightly".into(),
+            cron: "0 0 19 * * *".into(),
+            enabled: true,
+            last_triggered_at: Some(1_000),
+            last_completed_at: None,
+        },
+    )
+    .unwrap();
+    ScheduleRow::upsert(
+        db.raw_conn(),
+        &ScheduleRow {
+            id: "nightly".into(),
+            cron: "0 0 19 * * *".into(),
+            enabled: true,
+            last_triggered_at: Some(2_000),
+            last_completed_at: None,
+        },
+    )
+    .unwrap();
+    let row = ScheduleRow::get(db.raw_conn(), "nightly").unwrap();
+    assert_eq!(
+        row.last_triggered_at,
+        Some(2_000),
+        "second upsert must overwrite last_triggered_at via COALESCE"
     );
+}
+
+#[test]
+fn upsert_preserves_existing_last_triggered_at_when_new_is_none() {
+    // The COALESCE has to go BOTH ways: a follow-up upsert with
+    // last_triggered_at = None must NOT clobber a previously-set
+    // timestamp. (paavo-web's /schedule would otherwise lose history
+    // any time some other code path called upsert without bothering
+    // to re-populate the timestamps.)
+    let db = fresh_db();
+    ScheduleRow::upsert(
+        db.raw_conn(),
+        &ScheduleRow {
+            id: "nightly".into(),
+            cron: "0 0 19 * * *".into(),
+            enabled: true,
+            last_triggered_at: Some(7_777),
+            last_completed_at: Some(8_888),
+        },
+    )
+    .unwrap();
+    ScheduleRow::upsert(
+        db.raw_conn(),
+        &ScheduleRow {
+            id: "nightly".into(),
+            cron: "30 0 12 * * *".into(),
+            enabled: false,
+            last_triggered_at: None,
+            last_completed_at: None,
+        },
+    )
+    .unwrap();
+    let row = ScheduleRow::get(db.raw_conn(), "nightly").unwrap();
+    assert_eq!(row.cron, "30 0 12 * * *");
+    assert!(!row.enabled);
+    assert_eq!(row.last_triggered_at, Some(7_777));
+    assert_eq!(row.last_completed_at, Some(8_888));
 }

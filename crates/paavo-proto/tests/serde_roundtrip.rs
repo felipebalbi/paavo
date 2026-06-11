@@ -323,6 +323,7 @@ fn job_view_roundtrip() {
         started_at: Some(1_700_000_001_000),
         finished_at: None,
         tar_blake3: "deadbeef".into(),
+        cargo_update_packages: vec![],
     };
     let json = serde_json::to_value(&view).unwrap();
     // Wire shape contract: no tar_path, no elf_path.
@@ -368,6 +369,7 @@ fn job_view_terminal_includes_outcome_and_finished_at() {
         started_at: None,
         finished_at: Some(2),
         tar_blake3: "x".into(),
+        cargo_update_packages: vec![],
     };
     let json = serde_json::to_value(&view).unwrap();
     assert_eq!(json["state"], "aborted");

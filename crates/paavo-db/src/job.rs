@@ -28,6 +28,11 @@ pub struct NewJob {
     pub tar_blake3: String,
     /// On-disk location of the persisted tar.
     pub tar_path: String,
+    /// Packages to `cargo update -p ...` before building. HTTP-submitted
+    /// jobs always pass `vec![]` (dep graph is locked at submit time);
+    /// the nightly cron threads each `[[corpus]].cargo_update` here so
+    /// soak runs pull fresh embassy revisions (spec §8.1 step 4).
+    pub cargo_update_packages: Vec<String>,
 }
 
 /// Captured terminal-state transition payload.
@@ -76,20 +81,25 @@ pub struct JobRow {
     pub tar_path: String,
     /// ELF path once `paavo-build` finishes, otherwise `None`.
     pub elf_path: Option<String>,
+    /// Packages to `cargo update -p ...` before building. Empty for
+    /// HTTP-submitted jobs; populated for Scheduled jobs from
+    /// `[[corpus]].cargo_update`.
+    pub cargo_update_packages: Vec<String>,
 }
 
 impl JobRow {
     /// Insert a new job in `Submitted` state.
     pub fn insert(conn: &Connection, j: &NewJob, now_ms: i64) -> Result<()> {
         let sel_json = serde_json::to_string(&j.board_selector)?;
+        let pkgs_json = serde_json::to_string(&j.cargo_update_packages)?;
         conn.execute(
             "INSERT INTO job (
                 id, priority, submitter, source, board_selector,
                 inactivity_timeout_ms, hard_max_ms, state, outcome_detail,
                 board_id, submitted_at, started_at, finished_at,
-                tar_blake3, tar_path, elf_path
+                tar_blake3, tar_path, elf_path, cargo_update_packages
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'submitted', NULL, NULL,
-                      ?8, NULL, NULL, ?9, ?10, NULL)",
+                      ?8, NULL, NULL, ?9, ?10, NULL, ?11)",
             params![
                 j.id.to_string(),
                 j.priority.weight() as i64,
@@ -101,6 +111,7 @@ impl JobRow {
                 now_ms,
                 j.tar_blake3,
                 j.tar_path,
+                pkgs_json,
             ],
         )?;
         Ok(())
@@ -336,6 +347,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
     let tar_blake3: String = r.get("tar_blake3")?;
     let tar_path: String = r.get("tar_path")?;
     let elf_path: Option<String> = r.get("elf_path")?;
+    let pkgs_json: String = r.get("cargo_update_packages")?;
 
     Ok((|| -> Result<JobRow> {
         let id = JobId::from_str(&id_str).map_err(|_| DbError::UnknownEnum {
@@ -361,6 +373,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             column: "job.hard_max_ms",
             value: "negative or > i64::MAX".into(),
         })?;
+        let cargo_update_packages: Vec<String> = serde_json::from_str(&pkgs_json)?;
         Ok(JobRow {
             id,
             priority,
@@ -378,6 +391,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             tar_blake3,
             tar_path,
             elf_path,
+            cargo_update_packages,
         })
     })())
 }

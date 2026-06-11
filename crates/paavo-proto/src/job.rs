@@ -238,4 +238,10 @@ pub struct JobView {
     /// blake3 of the uploaded crate tar (content-addressed; useful for
     /// build-cache debugging).
     pub tar_blake3: String,
+    /// Packages threaded into `paavo_build::BuildPlan::cargo_update_packages`.
+    /// Empty for HTTP-submitted jobs; populated for Scheduled jobs from
+    /// `[[corpus]].cargo_update`. Exposed on the wire so paavo-cli/web
+    /// can show "this nightly job will pull fresh embassy revisions".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cargo_update_packages: Vec<String>,
 }
