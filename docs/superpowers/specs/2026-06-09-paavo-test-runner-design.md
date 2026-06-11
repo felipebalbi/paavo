@@ -769,7 +769,10 @@ shutdown_grace_s = 60
 
 [scheduler]
 starvation_threshold_s = 21600        # 6 h
-nightly_cron = "0 19 * * *"           # 7pm daily
+# Cron expression: 6-field `sec min hour dom mon dow` (the `cron` crate's
+# native form, also what `tokio-cron-scheduler` parses). Time zone is
+# the daemon process's local TZ. Example below = "every day at 19:00:00".
+nightly_cron = "0 0 19 * * *"
 
 [build_cache]
 max_bytes = 5_368_709_120             # 5 GiB

@@ -7196,10 +7196,13 @@ Spec coverage: §13 (config schema), §14.1 (state dir under `/var/lib/paavo`).
 
 `crates/paavod/tests/config_loading.rs`:
 ```rust
-use paavod::config::{Config, CorpusEntry};
+use paavod::config::Config;
 use std::fs;
 use tempfile::tempdir;
 
+// Cron is 6-field (`sec min hour dom mon dow`) — the `cron` crate's
+// native form, also what `tokio-cron-scheduler` parses. Time zone is
+// the daemon's local TZ. `"0 0 19 * * *"` = "every day at 19:00:00".
 const SAMPLE: &str = r#"
 [server]
 bind = "127.0.0.1:8080"
@@ -7217,7 +7220,7 @@ shutdown_grace_s = 60
 
 [scheduler]
 starvation_threshold_s = 21600
-nightly_cron = "0 19 * * *"
+nightly_cron = "0 0 19 * * *"
 
 [build_cache]
 max_bytes = 5368709120
@@ -7249,7 +7252,7 @@ fn parses_sample_config() {
     assert_eq!(cfg.web.bind, "127.0.0.1:8081");
     assert_eq!(cfg.timeouts.default_inactivity_s, 120);
     assert_eq!(cfg.timeouts.daemon_ceiling_s, 28800);
-    assert_eq!(cfg.scheduler.nightly_cron, "0 19 * * *");
+    assert_eq!(cfg.scheduler.nightly_cron, "0 0 19 * * *");
     assert_eq!(cfg.build_cache.max_bytes, 5_368_709_120);
     assert_eq!(cfg.retention.passed_full_log_days, 30);
     assert_eq!(cfg.quarantine.consecutive_infra_failures, 3);
@@ -7267,11 +7270,25 @@ fn rejects_invalid_cron() {
     let p = dir.path().join("paavo.toml");
     fs::write(
         &p,
-        SAMPLE.replace("0 19 * * *", "not a valid cron expression"),
+        SAMPLE.replace("0 0 19 * * *", "not a valid cron expression"),
     )
     .unwrap();
     let err = Config::load(&p).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("cron"));
+}
+
+#[test]
+fn rejects_five_field_cron() {
+    // 5-field POSIX cron is a common ops-user mistake. Reject it
+    // explicitly with a message that mentions both "cron" and the
+    // 6-field expectation, so the operator can fix it without
+    // having to read the `cron` crate's source.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("paavo.toml");
+    fs::write(&p, SAMPLE.replace("0 0 19 * * *", "0 19 * * *")).unwrap();
+    let err = Config::load(&p).unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("cron"), "error should mention cron: {err}");
 }
 
 #[test]
@@ -7287,7 +7304,7 @@ state_dir = "/var/lib/paavo"
 [web]
 bind = "127.0.0.1:8081"
 [scheduler]
-nightly_cron = "0 19 * * *"
+nightly_cron = "0 0 19 * * *"
 "#,
     )
     .unwrap();
@@ -7296,6 +7313,33 @@ nightly_cron = "0 19 * * *"
     assert_eq!(cfg.retention.passed_full_log_days, 30);
     assert_eq!(cfg.quarantine.consecutive_infra_failures, 3);
     assert!(cfg.corpus.is_empty());
+}
+
+#[test]
+fn missing_file_error_mentions_path() {
+    // Pins the `reading <path>` context wrapped around the io::Error.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("does-not-exist.toml");
+    let err = Config::load(&p).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does-not-exist.toml"),
+        "error should mention the missing path: {msg}"
+    );
+}
+
+#[test]
+fn malformed_toml_error_mentions_paavo_toml() {
+    // Pins the `parsing paavo.toml` context wrapped around the toml::Error.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("paavo.toml");
+    fs::write(&p, "[server\nbind = oops").unwrap();
+    let err = Config::load(&p).unwrap_err();
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("paavo.toml") || msg.contains("parsing"),
+        "error should mention the file or `parsing`: {msg}"
+    );
 }
 ```
 
@@ -7344,8 +7388,8 @@ pub struct Config {
 /// `[server]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// `host:port`. Defaults to `127.0.0.1:8080` if you wire one up, but
-    /// the file is required to declare it explicitly.
+    /// `host:port`. Required — declare explicitly in `paavo.toml`. The
+    /// spec sample uses `127.0.0.1:8080`.
     pub bind: String,
     /// Daemon state dir (sandboxes, sqlite, build cache, etc.).
     pub state_dir: std::path::PathBuf,
@@ -7399,11 +7443,24 @@ fn default_shutdown_grace_s() -> u64 { 60 }
 /// `[scheduler]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
-    /// Cron expression for the nightly run.
+    /// Cron expression. **6-field** `sec min hour dom mon dow` (the
+    /// `cron` crate's native form, also what `tokio-cron-scheduler`
+    /// parses). Time zone is the daemon process's local TZ. Example:
+    /// `"0 0 19 * * *"` = "every day at 19:00:00".
     pub nightly_cron: String,
     /// Promote Scheduled→Interactive after this many seconds queued.
     #[serde(default = "default_starvation_threshold_s")]
     pub starvation_threshold_s: i64,
+}
+
+impl SchedulerConfig {
+    /// Parse `nightly_cron` into a `cron::Schedule`. The downstream
+    /// nightly cron driver in M4.3.c uses this so the same library
+    /// that validates the expression at startup is the one that
+    /// actually fires it.
+    pub fn schedule(&self) -> Result<cron::Schedule, cron::error::Error> {
+        cron::Schedule::from_str(&self.nightly_cron)
+    }
 }
 
 fn default_starvation_threshold_s() -> i64 { 21_600 }
@@ -7485,10 +7542,15 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
-        cron::Schedule::from_str(&self.scheduler.nightly_cron).map_err(|e| {
+    /// Validate a programmatically-built `Config`. Public so callers
+    /// who build a `Config` via struct literal (tests, future
+    /// `paavo-cli config validate`) can re-check the same invariants
+    /// `Config::load` enforces.
+    pub fn validate(&self) -> Result<()> {
+        self.scheduler.schedule().map_err(|e| {
             anyhow!(
-                "scheduler.nightly_cron is not a valid cron expression ({e})"
+                "scheduler.nightly_cron is not a valid cron expression — \
+                 must be 6-field `sec min hour dom mon dow` ({e})"
             )
         })?;
         Ok(())
@@ -7523,7 +7585,8 @@ pub struct StateDir {
 
 impl StateDir {
     /// Compute paths under `root`; does not create them.
-    pub fn from_root(root: &Path) -> Self {
+    pub fn from_root(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
         Self {
             root: root.to_path_buf(),
             sqlite_path: root.join("paavo.sqlite"),
@@ -7535,8 +7598,12 @@ impl StateDir {
         }
     }
 
-    /// Create every directory under `root`. Idempotent.
+    /// Create `root` and every subdirectory under it. Idempotent. Does
+    /// NOT touch `sqlite_path` (created by paavo-db) or `boards_toml`
+    /// (created by paavo-cli). TODO(M4.4): also chmod the root to 0700
+    /// on Unix once paavod's main wires this up at startup.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(&self.uploads_dir)?;
         std::fs::create_dir_all(&self.sandboxes_dir)?;
         std::fs::create_dir_all(&self.cargo_target_dir)?;
@@ -7585,7 +7652,7 @@ path = "src/main.rs"
 - [ ] **Step 4: Run the config test**
 
 Run: `cargo test -p paavod --test config_loading`
-Expected: 3 passed.
+Expected: 6 passed (parses_sample_config, rejects_invalid_cron, rejects_five_field_cron, defaults_used_when_optional_blocks_omitted, missing_file_error_mentions_path, malformed_toml_error_mentions_paavo_toml).
 
 - [ ] **Step 5: Commit**
 
@@ -7872,7 +7939,7 @@ fn make_state() -> AppState {
         web: WebConfig { bind: "127.0.0.1:0".into() },
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
-            nightly_cron: "0 19 * * *".into(),
+            nightly_cron: "0 0 19 * * *".into(),
             starvation_threshold_s: 21_600,
         },
         build_cache: BuildCacheConfig::default(),
@@ -7956,7 +8023,7 @@ fn state() -> AppState {
         server: ServerConfig { bind: "x".into(), state_dir: "x".into() },
         web: WebConfig { bind: "x".into() },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -8198,7 +8265,7 @@ fn state(tmp_root: &std::path::Path) -> AppState {
         server: ServerConfig { bind: "x".into(), state_dir: tmp_root.to_path_buf() },
         web: WebConfig { bind: "x".into() },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -9347,7 +9414,7 @@ async fn dispatch_runs_a_submitted_job_to_completion() {
         server: ServerConfig { bind: "x".into(), state_dir: tmp.path().to_path_buf() },
         web: WebConfig { bind: "x".into() },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -9585,7 +9652,7 @@ async fn corpus_entry_enqueues_one_job_per_crate_subdir() {
         server: ServerConfig { bind: "x".into(), state_dir: state_root.clone() },
         web: WebConfig { bind: "x".into() },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -10608,7 +10675,7 @@ async fn paavo_cli_jobs_lists_seeded_job() {
         server: ServerConfig { bind: "x".into(), state_dir: tmp.path().to_path_buf() },
         web: WebConfig { bind: "x".into() },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
