@@ -13003,10 +13003,10 @@ impl Client {
 ```rust
 //! `paavo-cli run`: tar a crate dir / .rs / .elf and submit. Streams output.
 
-use crate::client::Client;
 use crate::cli::PriorityArg;
+use crate::client::Client;
 use anyhow::{Context, Result};
-use paavo_proto::{BoardSelector, JobSource, JobSpec, Priority};
+use paavo_proto::{BoardSelector, JobSpec, Priority};
 use std::path::Path;
 
 /// Entry point for `paavo-cli run`.
@@ -13019,19 +13019,19 @@ pub async fn run(
     inactivity: Option<&str>,
     priority: PriorityArg,
 ) -> Result<()> {
-    let kind = board_kind
-        .ok_or_else(|| anyhow::anyhow!("--board-kind is required for `run`"))?;
+    let kind = board_kind.ok_or_else(|| anyhow::anyhow!("--board-kind is required for `run`"))?;
     let crate_dir = resolve_crate_dir(path)?;
     let tar_bytes = make_tar(&crate_dir).context("tarring crate dir")?;
-    let blake = paavo_build::tar::tar_blake3(&tar_bytes);
 
+    // JobSpec is the wire shape paavod's PostJobMetadata deserializes.
+    // No `source` (server forces Cli per spec §9.1), no `tar_blake3`
+    // (paavod computes it during streaming).
     let spec = JobSpec {
         priority: match priority {
             PriorityArg::Interactive => Priority::Interactive,
             PriorityArg::Scheduled => Priority::Scheduled,
         },
         submitter: whoami().unwrap_or_else(|| "anon".into()),
-        source: JobSource::Cli,
         board_selector: BoardSelector {
             kind: kind.into(),
             instance: instance.map(String::from),
@@ -13039,7 +13039,6 @@ pub async fn run(
         },
         inactivity_timeout_ms: inactivity.map(parse_duration_ms).transpose()?,
         hard_max_ms: timeout.map(parse_duration_ms).transpose()?,
-        tar_blake3: blake,
     };
 
     let job_id = client.submit_job(&spec, tar_bytes).await?;
@@ -13055,7 +13054,6 @@ fn resolve_crate_dir(path: &Path) -> Result<std::path::PathBuf> {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         match ext {
             "rs" => {
-                // walk up to nearest Cargo.toml.
                 let mut cur = path.parent().unwrap_or(path);
                 loop {
                     if cur.join("Cargo.toml").is_file() {
@@ -13092,11 +13090,13 @@ fn make_tar(dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn whoami() -> Option<String> {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
 }
 
 fn parse_duration_ms(s: &str) -> Result<u64> {
-    // Supports "120s", "30m", "1h".
+    // Supports "120s", "30m", "1h", or a bare number (ms).
     let s = s.trim();
     if let Some(num) = s.strip_suffix('h') {
         return Ok(num.trim().parse::<u64>()? * 3_600_000);
@@ -13111,7 +13111,6 @@ fn parse_duration_ms(s: &str) -> Result<u64> {
 }
 
 async fn stream_logs(client: &Client, job_id: &str) -> Result<()> {
-    use futures::StreamExt;
     let mut resp = client.stream(job_id).await?;
     let mut buf = String::new();
     while let Some(chunk) = resp.chunk().await? {
@@ -13120,35 +13119,57 @@ async fn stream_logs(client: &Client, job_id: &str) -> Result<()> {
             let line = buf[..idx].trim().to_string();
             buf.drain(..=idx);
             if !line.is_empty() {
-                handle_sse_line(&line);
+                handle_ndjson_line(&line);
             }
         }
     }
     Ok(())
 }
 
-fn handle_sse_line(line: &str) {
-    if let Some(data) = line.strip_prefix("data: ") {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-            if v["type"] == "frame" {
-                let msg = v["frame"]["message"].as_str().unwrap_or("");
-                println!("{msg}");
-            } else if v["type"] == "terminal" {
-                let outcome = &v["outcome"];
-                // outcome is either the string "passed" or a single-key object
-                // like {"failed": {...}} / {"timed_out": {...}} / {"aborted": {...}}.
-                let tag = outcome
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| {
-                        outcome
-                            .as_object()
-                            .and_then(|m| m.keys().next().cloned())
-                    })
-                    .unwrap_or_default();
-                println!("--- terminal: {outcome}");
-                std::process::exit(if tag == "passed" { 0 } else { 1 });
-            }
+/// Parse one NDJSON line from `/jobs/:id/stream` (spec §9.2). Frames
+/// print as `<message>`; the terminal line prints a summary and exits
+/// with 0 for Passed, 1 otherwise. `lagged` and `truncated` markers
+/// print to stderr so they don't pollute the test-output capture.
+fn handle_ndjson_line(line: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        eprintln!("paavo-cli: skipping malformed stream line: {line}");
+        return;
+    };
+    match v["type"].as_str() {
+        Some("frame") => {
+            let msg = v["frame"]["message"].as_str().unwrap_or("");
+            println!("{msg}");
+        }
+        Some("terminal") => {
+            let outcome = &v["outcome"];
+            // `outcome` is either the string "passed" or a single-key
+            // object like {"failed": {...}} / {"timed_out": {...}} /
+            // {"aborted": {...}}.
+            let tag = outcome
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| outcome.as_object().and_then(|m| m.keys().next().cloned()))
+                .unwrap_or_default();
+            println!("--- terminal: {outcome}");
+            std::process::exit(if tag == "passed" { 0 } else { 1 });
+        }
+        Some("lagged") => {
+            eprintln!(
+                "paavo-cli: log stream lagged ({} frames missed); refetch /jobs/:id for the full log",
+                v["missed"].as_u64().unwrap_or(0),
+            );
+        }
+        Some("truncated") => {
+            eprintln!(
+                "paavo-cli: log stream truncated: {}",
+                v["reason"].as_str().unwrap_or("<no reason>"),
+            );
+        }
+        Some(other) => {
+            eprintln!("paavo-cli: unknown stream line type: {other}");
+        }
+        None => {
+            eprintln!("paavo-cli: stream line missing `type`: {line}");
         }
     }
 }
@@ -13170,8 +13191,13 @@ pub async fn cancel(client: &Client, job_id: &str) -> Result<()> {
 }
 
 /// `paavo-cli logs <id> [--follow]`.
+///
+/// Parses NDJSON lines per spec §9.2: one JSON object per line, with
+/// `type` in {frame, terminal, lagged, truncated}. Frame messages
+/// print to stdout; the terminal line prints a summary and returns.
+/// Lagged/truncated markers print to stderr so they don't pollute
+/// command-output capture.
 pub async fn logs(client: &Client, job_id: &str, _follow: bool) -> Result<()> {
-    use futures::StreamExt;
     let mut resp = client.stream(job_id).await?;
     let mut buf = String::new();
     while let Some(chunk) = resp.chunk().await? {
@@ -13179,16 +13205,35 @@ pub async fn logs(client: &Client, job_id: &str, _follow: bool) -> Result<()> {
         while let Some(idx) = buf.find('\n') {
             let line = buf[..idx].trim().to_string();
             buf.drain(..=idx);
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(v) = serde_json::from_str::<Value>(data) {
-                    if v["type"] == "frame" {
-                        let msg = v["frame"]["message"].as_str().unwrap_or("");
-                        println!("{msg}");
-                    } else if v["type"] == "terminal" {
-                        println!("--- terminal: {}", v["outcome"]);
-                        return Ok(());
-                    }
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                eprintln!("paavo-cli: skipping malformed stream line: {line}");
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("frame") => {
+                    let msg = v["frame"]["message"].as_str().unwrap_or("");
+                    println!("{msg}");
                 }
+                Some("terminal") => {
+                    println!("--- terminal: {}", v["outcome"]);
+                    return Ok(());
+                }
+                Some("lagged") => {
+                    eprintln!(
+                        "paavo-cli: log stream lagged ({} frames missed)",
+                        v["missed"].as_u64().unwrap_or(0),
+                    );
+                }
+                Some("truncated") => {
+                    eprintln!(
+                        "paavo-cli: log stream truncated: {}",
+                        v["reason"].as_str().unwrap_or("<no reason>"),
+                    );
+                }
+                _ => {}
             }
         }
     }
