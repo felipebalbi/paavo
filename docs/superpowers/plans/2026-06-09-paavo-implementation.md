@@ -7684,44 +7684,62 @@ Spec coverage: §9.1–§9.5.
 
 `crates/paavod/src/app_state.rs`:
 ```rust
-//! Shared axum state: db handle, config, fleet inventory cache, and a
-//! `Runner` trait object for dispatch.
+//! Shared axum state: db handle, config, fleet inventory cache, and the
+//! SIGTERM drain flag.
 //!
-//! `Runner` is abstracted so integration tests can plug in a fake runner.
+//! Concurrency contract:
+//! - `db` uses `parking_lot::Mutex` because every SQLite call is sub-ms
+//!   and the daemon is single-host. Lock duration is bounded; never hold
+//!   the guard across an `.await`. Handlers that need to do async work
+//!   after a read should copy the rows out, drop the guard, then await.
+//!   `await_holding_lock` would warn about this if we ever drift.
+//! - `inventory` is a write-through cache of the `boards` table. It MUST
+//!   be hydrated once at startup by `paavod::main` (see Task 4.4) before
+//!   the HTTP server starts accepting requests — otherwise the daemon
+//!   will reject every selector after a restart until the operator does
+//!   a redundant `POST /boards`. Handlers that mutate boards refresh
+//!   the cache under the same lock.
+//! - `drain` is a one-shot flag (false → true). M4.3.d wires the SIGTERM
+//!   handler that calls `set_draining`.
 
-use parking_lot::Mutex;
+#![deny(clippy::await_holding_lock)]
+
 use paavo_proto::BoardSpec;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Drain mode for SIGTERM handling.
+/// Drain mode for SIGTERM handling. One-way flag (false → true).
 #[derive(Debug, Default, Clone)]
 pub struct DrainState {
-    /// True once SIGTERM was observed.
-    pub draining: Arc<std::sync::atomic::AtomicBool>,
+    inner: Arc<AtomicBool>,
 }
 
 impl DrainState {
     /// Returns true while the daemon is draining for shutdown.
     pub fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+        // Acquire pairs with Release in `set_draining`; both writers
+        // and readers see a consistent transition.
+        self.inner.load(Ordering::Acquire)
     }
-    /// Mark drain mode.
+    /// Mark drain mode. Idempotent.
     pub fn set_draining(&self) {
-        self.draining
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.store(true, Ordering::Release);
     }
 }
 
 /// Shared axum state.
 #[derive(Clone)]
 pub struct AppState {
-    /// Wrapped DB. Cloned per-handler via `lock()`.
+    /// Daemon SQLite handle. Locked per-handler via `lock()`; serialised
+    /// access — see the concurrency contract in the module docstring.
     pub db: Arc<Mutex<paavo_db::Db>>,
-    /// Loaded config.
+    /// Loaded config (immutable post-load).
     pub config: Arc<crate::config::Config>,
-    /// In-memory inventory snapshot, refreshed on each board op.
+    /// In-memory inventory snapshot. Hydrated by `paavod::main` at
+    /// startup; refreshed by every successful `boards` write.
     pub inventory: Arc<Mutex<Vec<BoardSpec>>>,
-    /// Drain flag.
+    /// One-shot SIGTERM drain flag.
     pub drain: DrainState,
 }
 
@@ -7738,6 +7756,11 @@ impl AppState {
 `crates/paavod/src/routes/health.rs`:
 ```rust
 //! GET /health and GET /ready.
+//!
+//! Per spec §9.5: `/health` is liveness — always 200 with a small JSON
+//! body, even while draining. `/ready` is readiness — 503 while draining,
+//! 200 otherwise. Liveness probes (systemd Watchdog, k8s) must not kill
+//! the daemon mid-drain.
 
 use crate::app_state::AppState;
 use axum::extract::State;
@@ -7751,39 +7774,36 @@ use serde::Serialize;
 pub struct HealthBody {
     /// Always `"paavod"`.
     pub service: &'static str,
-    /// True while not draining (used by `/ready`).
+    /// True while not draining. Used by both `/health` and `/ready`,
+    /// but only `/ready` flips its HTTP status based on it.
     pub ready: bool,
     /// Crate version.
     pub version: &'static str,
 }
 
-/// Liveness — always 200 with a JSON body.
-pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
-    let body = HealthBody {
+fn body(ready: bool) -> HealthBody {
+    HealthBody {
         service: "paavod",
-        ready: !s.drain.is_draining(),
+        ready,
         version: env!("CARGO_PKG_VERSION"),
-    };
-    (StatusCode::OK, Json(body))
+    }
 }
 
-/// Readiness — 503 while draining.
+/// Liveness — always 200, even while draining. Body reports the drain
+/// state so monitoring can observe it without flipping the probe.
+pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(body(!s.drain.is_draining())))
+}
+
+/// Readiness — 503 while draining, 200 otherwise.
 pub async fn ready(State(s): State<AppState>) -> impl IntoResponse {
-    if s.drain.is_draining() {
-        let body = HealthBody {
-            service: "paavod",
-            ready: false,
-            version: env!("CARGO_PKG_VERSION"),
-        };
-        (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+    let draining = s.drain.is_draining();
+    let status = if draining {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
-        let body = HealthBody {
-            service: "paavod",
-            ready: true,
-            version: env!("CARGO_PKG_VERSION"),
-        };
-        (StatusCode::OK, Json(body))
-    }
+        StatusCode::OK
+    };
+    (status, Json(body(!draining)))
 }
 ```
 
@@ -7800,16 +7820,26 @@ pub mod jobs;
 
 `crates/paavod/src/routes/jobs.rs` (stubs):
 ```rust
-//! /jobs/* handlers. Filled in by 4.2.b.
+//! /jobs/* handlers. Filled in by 4.2.b/c.
 
 use crate::app_state::AppState;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-/// POST /jobs — placeholder.
-pub async fn post_jobs(_state: State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "POST /jobs not yet wired")
+/// Stub that respects spec §6.3 ("drain returns 503 for new jobs") even
+/// though the real handler isn't here yet. Locks in the invariant.
+fn drain_then(state: &AppState, what: &'static str) -> (StatusCode, &'static str) {
+    if state.drain.is_draining() {
+        (StatusCode::SERVICE_UNAVAILABLE, "paavod is draining")
+    } else {
+        (StatusCode::NOT_IMPLEMENTED, what)
+    }
+}
+
+/// POST /jobs — placeholder. Returns 503 while draining (spec §6.3).
+pub async fn post_jobs(State(s): State<AppState>) -> impl IntoResponse {
+    drain_then(&s, "POST /jobs not yet wired")
 }
 
 /// GET /jobs — placeholder.
@@ -7824,18 +7854,24 @@ pub async fn get_job(_state: State<AppState>) -> impl IntoResponse {
 
 /// POST /jobs/:id/cancel — placeholder.
 pub async fn cancel_job(_state: State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "POST /jobs/:id/cancel not yet wired")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "POST /jobs/:id/cancel not yet wired",
+    )
 }
 
 /// GET /jobs/:id/stream — placeholder.
 pub async fn stream_job(_state: State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "GET /jobs/:id/stream not yet wired")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "GET /jobs/:id/stream not yet wired",
+    )
 }
 ```
 
 `crates/paavod/src/routes/boards.rs` (stubs):
 ```rust
-//! /boards/* handlers. Filled in by 4.2.c.
+//! /boards/* handlers. Filled in by 4.2.b.
 
 use crate::app_state::AppState;
 use axum::extract::State;
@@ -7854,12 +7890,18 @@ pub async fn add_board(_state: State<AppState>) -> impl IntoResponse {
 
 /// POST /boards/:id/quarantine — placeholder.
 pub async fn quarantine_board(_state: State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "POST /boards/:id/quarantine not yet wired")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "POST /boards/:id/quarantine not yet wired",
+    )
 }
 
 /// POST /boards/:id/unquarantine — placeholder.
 pub async fn unquarantine_board(_state: State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "POST /boards/:id/unquarantine not yet wired")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "POST /boards/:id/unquarantine not yet wired",
+    )
 }
 ```
 
@@ -7920,29 +7962,36 @@ parking_lot = { workspace = true }
 ```rust
 use axum::body::to_bytes;
 use axum::http::Request;
-use parking_lot::Mutex;
+use paavo_db::Db;
 use paavod::app::build_router;
 use paavod::app_state::{AppState, DrainState};
 use paavod::config::{
-    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig,
-    ServerConfig, TimeoutsConfig, WebConfig,
+    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
+    TimeoutsConfig, WebConfig,
 };
-use paavo_db::Db;
+use parking_lot::Mutex;
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn make_state() -> AppState {
+    // Cross-platform: derive every path from the same tempdir so the
+    // test never embeds a Unix-only `/tmp/...` literal. The dir is
+    // leaked per workspace convention — see
+    // `crates/paavo-core/tests/common/mod.rs::fresh_db`.
     let dir = tempdir().unwrap();
-    let db = Db::open(dir.path().join("paavo.sqlite")).unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let db = Db::open(state_dir.join("paavo.sqlite")).unwrap();
     std::mem::forget(dir);
     let cfg = Config {
         server: ServerConfig {
             bind: "127.0.0.1:0".into(),
-            state_dir: "/tmp/paavo-test".into(),
+            state_dir,
         },
-        web: WebConfig { bind: "127.0.0.1:0".into() },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
@@ -7961,37 +8010,105 @@ fn make_state() -> AppState {
     }
 }
 
-#[tokio::test]
-async fn health_is_200_with_body() {
-    let app = build_router(make_state());
+async fn get(state: AppState, uri: &str) -> (axum::http::StatusCode, Value) {
+    let app = build_router(state);
     let resp = app
-        .oneshot(Request::builder().uri("/health").body(axum::body::Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 2048).await.unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["service"], "paavod");
-    assert_eq!(v["ready"], true);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, body)
+}
+
+#[tokio::test]
+async fn health_is_200_with_body() {
+    let (status, body) = get(make_state(), "/health").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["service"], "paavod");
+    assert_eq!(body["ready"], true);
+}
+
+#[tokio::test]
+async fn health_stays_200_while_draining() {
+    // Spec §9.5: `/health` is liveness — must return 200 even while
+    // draining, otherwise systemd / k8s probes kill us mid-drain. The
+    // body MUST report `ready: false` so monitoring can still observe
+    // the drain.
+    let state = make_state();
+    state.drain.set_draining();
+    let (status, body) = get(state, "/health").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["service"], "paavod");
+    assert_eq!(body["ready"], false);
+}
+
+#[tokio::test]
+async fn ready_is_200_when_not_draining() {
+    let (status, body) = get(make_state(), "/ready").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["ready"], true);
 }
 
 #[tokio::test]
 async fn ready_flips_to_503_when_draining() {
     let state = make_state();
     state.drain.set_draining();
+    let (status, body) = get(state, "/ready").await;
+    assert_eq!(status, 503);
+    assert_eq!(body["service"], "paavod");
+    assert_eq!(body["ready"], false);
+}
+
+#[tokio::test]
+async fn post_jobs_returns_503_while_draining() {
+    // Spec §6.3: drain returns 503 for new jobs. The stub locks this
+    // in so the invariant survives until M4.2.b fills the real handler.
+    let state = make_state();
+    state.drain.set_draining();
     let app = build_router(state);
     let resp = app
-        .oneshot(Request::builder().uri("/ready").body(axum::body::Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn post_jobs_returns_501_when_not_draining() {
+    // While not draining the stub returns 501 — locks in that the
+    // drain check doesn't accidentally short-circuit the no-drain path.
+    let app = build_router(make_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
 }
 ```
 
 - [ ] **Step 5: Run the health test**
 
 Run: `cargo test -p paavod --test api_health`
-Expected: 2 passed.
+Expected: 6 passed (`health_is_200_with_body`, `health_stays_200_while_draining`, `ready_is_200_when_not_draining`, `ready_flips_to_503_when_draining`, `post_jobs_returns_503_while_draining`, `post_jobs_returns_501_when_not_draining`).
 
 - [ ] **Step 6: Commit**
 
