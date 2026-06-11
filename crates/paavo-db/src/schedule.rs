@@ -67,15 +67,7 @@ impl ScheduleRow {
             "SELECT id, cron, enabled, last_triggered_at, last_completed_at
              FROM schedule WHERE id = ?1",
             params![id],
-            |r| {
-                Ok(ScheduleRow {
-                    id: r.get("id")?,
-                    cron: r.get("cron")?,
-                    enabled: r.get::<_, i64>("enabled")? == 1,
-                    last_triggered_at: r.get("last_triggered_at")?,
-                    last_completed_at: r.get("last_completed_at")?,
-                })
-            },
+            row_to_schedule,
         ) {
             Ok(row) => Ok(row),
             Err(rusqlite::Error::QueryReturnedNoRows) => Err(crate::error::DbError::NotFound {
@@ -84,6 +76,20 @@ impl ScheduleRow {
             }),
             Err(other) => Err(other.into()),
         }
+    }
+
+    /// List every schedule row, ordered by `id` ascending. Powers
+    /// paavo-web's `/schedule` page, which renders the registered cron
+    /// entries plus their last-trigger / last-complete timestamps.
+    pub fn list_all(conn: &Connection) -> Result<Vec<ScheduleRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, cron, enabled, last_triggered_at, last_completed_at
+             FROM schedule ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_schedule)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Apply a partial update; fields set to `None` are not touched.
@@ -102,4 +108,18 @@ impl ScheduleRow {
         }
         Ok(())
     }
+}
+
+/// Decode one row from a `SELECT id, cron, enabled, last_triggered_at,
+/// last_completed_at FROM schedule` query. Shared by `ScheduleRow::get`
+/// and `ScheduleRow::list_all` so a future column addition is a
+/// single-site edit (same pattern as `BoardRow::from_row`).
+fn row_to_schedule(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+    Ok(ScheduleRow {
+        id: r.get("id")?,
+        cron: r.get("cron")?,
+        enabled: r.get::<_, i64>("enabled")? == 1,
+        last_triggered_at: r.get("last_triggered_at")?,
+        last_completed_at: r.get("last_completed_at")?,
+    })
 }

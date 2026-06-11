@@ -215,3 +215,33 @@ fn upsert_preserves_existing_last_triggered_at_when_new_is_none() {
     assert_eq!(row.last_triggered_at, Some(7_777));
     assert_eq!(row.last_completed_at, Some(8_888));
 }
+
+#[test]
+fn list_all_empty_db_returns_empty_vec() {
+    let db = fresh_db();
+    let rows = ScheduleRow::list_all(db.raw_conn()).unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn list_all_returns_rows_ordered_by_id_ascending() {
+    let db = fresh_db();
+    // Insert out of alphabetical order so the ORDER BY actually matters.
+    for id in ["weekly", "nightly", "hourly"] {
+        ScheduleRow::upsert(
+            db.raw_conn(),
+            &ScheduleRow {
+                id: id.into(),
+                cron: "0 0 * * *".into(),
+                enabled: true,
+                last_triggered_at: None,
+                last_completed_at: None,
+            },
+        )
+        .unwrap();
+    }
+    let rows = ScheduleRow::list_all(db.raw_conn()).unwrap();
+    assert_eq!(rows.len(), 3);
+    let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["hourly", "nightly", "weekly"]);
+}

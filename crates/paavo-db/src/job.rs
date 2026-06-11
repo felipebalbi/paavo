@@ -184,6 +184,28 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// Returns the `limit` most recently submitted jobs across **all
+    /// states**, newest first. Powers the web viewer's recent-jobs lists
+    /// (dashboard + jobs index), which need a mixed-state feed rather
+    /// than the state-filtered slice that `list_by_state` produces.
+    ///
+    /// Ties on `submitted_at` (same millisecond) are broken by `id DESC`
+    /// — ULID ids embed a monotonic millisecond timestamp, so this keeps
+    /// the ordering deterministic even when two jobs land in the same
+    /// `submitted_at` tick.
+    pub fn list_recent(conn: &Connection, limit: u32) -> Result<Vec<Self>> {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM job
+             ORDER BY submitted_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// `Submitted → Building`, recording the chosen board and start time.
     /// Errors if the job is not in `Submitted` state (0 rows updated).
     pub fn transition_to_building(

@@ -212,6 +212,52 @@ fn delete_cascades_to_log_frames() {
 }
 
 #[test]
+fn list_recent_returns_jobs_newest_first_across_all_states() {
+    let db = fresh_db();
+    insert_default_board(&db);
+    let now = Utc::now().timestamp_millis();
+
+    // Three jobs spanning Submitted, Building, and Passed — list_recent
+    // must include all three regardless of state, newest first.
+    let a = JobId::new();
+    let b = JobId::new();
+    let c = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(a), now).unwrap();
+    JobRow::insert(db.raw_conn(), &sample_new_job(b), now + 10).unwrap();
+    JobRow::insert(db.raw_conn(), &sample_new_job(c), now + 20).unwrap();
+
+    JobRow::transition_to_building(db.raw_conn(), &b, "mcxa266-01", now + 11).unwrap();
+    JobRow::transition_to_running(db.raw_conn(), &b, "/cache/b.elf").unwrap();
+    JobRow::finalize(
+        db.raw_conn(),
+        &b,
+        &OutcomeRecord {
+            state: JobState::Passed,
+            outcome: JobOutcome::Passed,
+            finished_at_ms: now + 12,
+        },
+    )
+    .unwrap();
+
+    let recent = JobRow::list_recent(db.raw_conn(), 10).unwrap();
+    assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0].id, c, "newest first");
+    assert_eq!(recent[1].id, b);
+    assert_eq!(recent[2].id, a, "oldest last");
+}
+
+#[test]
+fn list_recent_respects_limit() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    for i in 0..5 {
+        JobRow::insert(db.raw_conn(), &sample_new_job(JobId::new()), now + i).unwrap();
+    }
+    let recent = JobRow::list_recent(db.raw_conn(), 2).unwrap();
+    assert_eq!(recent.len(), 2, "limit clamps the result count");
+}
+
+#[test]
 fn get_unknown_id_returns_not_found() {
     // Pins that JobRow::get maps QueryReturnedNoRows → DbError::NotFound
     // so the HTTP layer can do `match err { NotFound => 404 }` without

@@ -14045,6 +14045,9 @@ Spec coverage: §11 (5 read-only pages). v1 renders plain HTML server-side via a
 ### Task 5.1: paavo-web — RO db handle + axum mount + 5 pages
 
 **Files:**
+- Modify: `crates/paavo-db/src/job.rs` (add `JobRow::list_recent`)
+- Modify: `crates/paavo-db/src/schedule.rs` (add `ScheduleRow::list_all`)
+- Test: extend `crates/paavo-db/tests/job_ops.rs` and `crates/paavo-db/tests/schedule_ops.rs`
 - Create: `crates/paavo-web/src/lib.rs`
 - Create: `crates/paavo-web/src/main.rs` (replace skeleton)
 - Create: `crates/paavo-web/src/app.rs`
@@ -14058,6 +14061,176 @@ Spec coverage: §11 (5 read-only pages). v1 renders plain HTML server-side via a
 - Create: `crates/paavo-web/src/pages/schedule.rs`
 - Test: `crates/paavo-web/tests/smoke.rs`
 
+**Decomposition note:** Page rendering uses raw `format!`-based HTML
+concatenation rather than a templating engine (askama, minijinja). v1
+has 5 pages and the spec says they're "informational, RO" — a template
+engine costs build complexity without saving meaningful lines. **HTML
+safety contract:** every user-supplied string interpolated into HTML
+(`b.spec.id`, `b.spec.kind`, `j.submitter`, `outcome` JSON,
+`f.message`, `b.quarantine_reason`) MUST flow through
+`pages::html_escape`. Stable-typed values that cannot contain HTML
+metacharacters (`JobId` = ULID Crockford-base32, `i64` timestamps,
+`{:?}` of public enums) bypass the escape because the type system
+already constrains the byte range. Reviewers: confirm by reading every
+`format!` in `crates/paavo-web/src/pages/*.rs` and grepping for any
+raw `{` interpolation of a user string.
+
+- [ ] **Step 0a: Add `JobRow::list_recent` to paavo-db**
+
+Append to `impl JobRow` in `crates/paavo-db/src/job.rs`:
+```rust
+/// Returns the `limit` most recently submitted jobs across all
+/// states, newest first. Used by paavo-web's dashboard and `/jobs`
+/// pages. Stable ordering: `submitted_at DESC, id DESC` so equal
+/// submission times still produce a deterministic page (ULIDs are
+/// monotonic but tests sometimes share a clock tick).
+pub fn list_recent(conn: &Connection, limit: u32) -> Result<Vec<Self>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM job
+         ORDER BY submitted_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+```
+
+Append to `crates/paavo-db/tests/job_ops.rs`:
+```rust
+#[test]
+fn list_recent_orders_by_submitted_at_desc() {
+    let (_tmp, db) = open();
+    let mut ids: Vec<JobId> = (0..3)
+        .map(|i| {
+            let id = JobId::new();
+            JobRow::insert(
+                db.raw_conn(),
+                &NewJob {
+                    id,
+                    priority: Priority::Interactive,
+                    submitter: "felipe".into(),
+                    source: JobSource::Cli,
+                    board_selector: BoardSelector {
+                        kind: "mcxa266".into(),
+                        instance: None,
+                        wiring_profile: None,
+                    },
+                    inactivity_timeout_ms: 60_000,
+                    hard_max_ms: 600_000,
+                    tar_blake3: format!("t{i}"),
+                    tar_path: format!("/tmp/{i}.tar"),
+                    cargo_update_packages: vec![],
+                },
+                100 + i64::from(i), // ascending submitted_at
+            )
+            .unwrap();
+            id
+        })
+        .collect();
+    ids.reverse(); // newest first
+    let rows = JobRow::list_recent(db.raw_conn(), 10).unwrap();
+    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), ids);
+}
+
+#[test]
+fn list_recent_respects_limit() {
+    let (_tmp, db) = open();
+    for i in 0..5 {
+        JobRow::insert(
+            db.raw_conn(),
+            &NewJob {
+                id: JobId::new(),
+                priority: Priority::Interactive,
+                submitter: "felipe".into(),
+                source: JobSource::Cli,
+                board_selector: BoardSelector {
+                    kind: "mcxa266".into(),
+                    instance: None,
+                    wiring_profile: None,
+                },
+                inactivity_timeout_ms: 60_000,
+                hard_max_ms: 600_000,
+                tar_blake3: format!("t{i}"),
+                tar_path: format!("/tmp/{i}.tar"),
+                cargo_update_packages: vec![],
+            },
+            i,
+        )
+        .unwrap();
+    }
+    let rows = JobRow::list_recent(db.raw_conn(), 2).unwrap();
+    assert_eq!(rows.len(), 2);
+}
+```
+
+Run: `cargo test -p paavo-db --test job_ops -- list_recent`
+Expected: 2 passed.
+
+- [ ] **Step 0b: Add `ScheduleRow::list_all` to paavo-db**
+
+Append to `impl ScheduleRow` in `crates/paavo-db/src/schedule.rs`:
+```rust
+/// List all schedules ordered by id ascending. Used by paavo-web's
+/// `/schedule` page to render the cron table.
+pub fn list_all(conn: &Connection) -> Result<Vec<ScheduleRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, cron, enabled, last_triggered_at, last_completed_at
+         FROM schedule ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ScheduleRow {
+                id: r.get("id")?,
+                cron: r.get("cron")?,
+                enabled: r.get::<_, i64>("enabled")? == 1,
+                last_triggered_at: r.get("last_triggered_at")?,
+                last_completed_at: r.get("last_completed_at")?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+```
+
+Append to `crates/paavo-db/tests/schedule_ops.rs`:
+```rust
+#[test]
+fn list_all_returns_rows_in_id_order() {
+    let (_tmp, db) = open();
+    ScheduleRow::upsert(db.raw_conn(), &ScheduleRow {
+        id: "weekly".into(),
+        cron: "0 0 0 * * 0".into(),
+        enabled: true,
+        last_triggered_at: None,
+        last_completed_at: None,
+    }).unwrap();
+    ScheduleRow::upsert(db.raw_conn(), &ScheduleRow {
+        id: "nightly".into(),
+        cron: "0 0 19 * * *".into(),
+        enabled: true,
+        last_triggered_at: None,
+        last_completed_at: None,
+    }).unwrap();
+    let rows = ScheduleRow::list_all(db.raw_conn()).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, "nightly"); // alphabetical
+    assert_eq!(rows[1].id, "weekly");
+}
+
+#[test]
+fn list_all_empty_returns_empty_vec() {
+    let (_tmp, db) = open();
+    let rows = ScheduleRow::list_all(db.raw_conn()).unwrap();
+    assert_eq!(rows.len(), 0);
+}
+```
+
+Run: `cargo test -p paavo-db --test schedule_ops -- list_all`
+Expected: 2 passed.
+
 - [ ] **Step 1: Update paavo-web Cargo.toml**
 
 Replace `crates/paavo-web/Cargo.toml` with:
@@ -14069,7 +14242,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-rust-version.workspace = true
 description = "paavo read-only web viewer."
 
 [lib]
@@ -14102,6 +14274,10 @@ rusqlite    = { workspace = true }
 tempfile = { workspace = true }
 tower    = { workspace = true }
 ```
+(Note: `rust-version.workspace = true` is intentionally omitted —
+the workspace `Cargo.toml` does not define a workspace-level
+`rust-version`, so the inherit would fail. Same as paavod and
+paavo-cli.)
 
 - [ ] **Step 2: Implement config, db, app, and 5 pages**
 
@@ -14164,13 +14340,17 @@ impl RootConfig {
 `crates/paavo-web/src/db.rs`:
 ```rust
 //! Read-only DB handle + minimal typed queries used by the pages.
+//!
+//! All decode logic lives in paavo-db's `from_row` family — this
+//! module is a thin façade so the web layer never duplicates row
+//! decoding or column lists.
 
-use paavo_db::{BoardRow, Db, JobRow};
+use paavo_db::{BoardRow, Db, JobRow, LogFrameDb, ScheduleRow};
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Read-only DB.
+/// Read-only DB façade. Cloneable so axum can put it in router state.
 #[derive(Clone)]
 pub struct WebDb {
     inner: Arc<Mutex<Db>>,
@@ -14184,27 +14364,14 @@ impl WebDb {
         })
     }
 
-    /// All boards.
+    /// All boards, ordered by id.
     pub fn all_boards(&self) -> paavo_db::Result<Vec<BoardRow>> {
         BoardRow::list_all(self.inner.lock().raw_conn())
     }
 
-    /// `limit` most recent jobs across all states.
+    /// Most recent `limit` jobs across all states.
     pub fn recent_jobs(&self, limit: u32) -> paavo_db::Result<Vec<JobRow>> {
-        let db = self.inner.lock();
-        let mut stmt = db.raw_conn().prepare(
-            "SELECT id, priority, submitter, source, board_selector,
-                    inactivity_timeout_ms, hard_max_ms, state, outcome_detail,
-                    board_id, submitted_at, started_at, finished_at,
-                    tar_blake3, tar_path, elf_path
-             FROM job ORDER BY submitted_at DESC LIMIT ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![limit as i64])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(decode_job_row(r)?);
-        }
-        Ok(out)
+        JobRow::list_recent(self.inner.lock().raw_conn(), limit)
     }
 
     /// One job by id.
@@ -14212,71 +14379,19 @@ impl WebDb {
         JobRow::find(self.inner.lock().raw_conn(), id)
     }
 
-    /// Up to `limit` log frames for a job.
+    /// Up to `limit` log frames for a job, oldest first.
     pub fn job_logs(
         &self,
         id: &paavo_proto::JobId,
         limit: u32,
     ) -> paavo_db::Result<Vec<paavo_proto::LogFrame>> {
-        use paavo_db::LogFrameDb;
         paavo_proto::LogFrame::list(self.inner.lock().raw_conn(), id, 0, limit)
     }
-}
 
-fn decode_job_row(r: &rusqlite::Row<'_>) -> paavo_db::Result<JobRow> {
-    use paavo_proto::*;
-    use std::str::FromStr;
-    let id_str: String = r.get("id")?;
-    let priority_i: i64 = r.get("priority")?;
-    let priority = if priority_i == 0 { Priority::Interactive } else { Priority::Scheduled };
-    let submitter: String = r.get("submitter")?;
-    let source = if r.get::<_, String>("source")? == "scheduler" { JobSource::Scheduler } else { JobSource::Cli };
-    let sel_json: String = r.get("board_selector")?;
-    let sel: BoardSelector = serde_json::from_str(&sel_json)?;
-    let inactivity: i64 = r.get("inactivity_timeout_ms")?;
-    let hardmax: i64 = r.get("hard_max_ms")?;
-    let state = match r.get::<_, String>("state")?.as_str() {
-        "submitted" => JobState::Submitted,
-        "building" => JobState::Building,
-        "running" => JobState::Running,
-        "passed" => JobState::Passed,
-        "failed" => JobState::Failed,
-        "timedout" => JobState::TimedOut,
-        "aborted" => JobState::Aborted,
-        _ => JobState::Failed,
-    };
-    let outcome_json: Option<String> = r.get("outcome_detail")?;
-    let outcome = outcome_json
-        .map(|j| serde_json::from_str::<JobOutcome>(&j))
-        .transpose()?;
-    let board_id: Option<String> = r.get("board_id")?;
-    let submitted_at: i64 = r.get("submitted_at")?;
-    let started_at: Option<i64> = r.get("started_at")?;
-    let finished_at: Option<i64> = r.get("finished_at")?;
-    let tar_blake3: String = r.get("tar_blake3")?;
-    let tar_path: String = r.get("tar_path")?;
-    let elf_path: Option<String> = r.get("elf_path")?;
-    Ok(JobRow {
-        id: JobId::from_str(&id_str).map_err(|_| paavo_db::DbError::UnknownEnum {
-            column: "job.id",
-            value: id_str,
-        })?,
-        priority,
-        submitter,
-        source,
-        board_selector: sel,
-        inactivity_timeout_ms: inactivity as u64,
-        hard_max_ms: hardmax as u64,
-        state,
-        outcome,
-        board_id,
-        submitted_at,
-        started_at,
-        finished_at,
-        tar_blake3,
-        tar_path,
-        elf_path,
-    })
+    /// All schedule rows.
+    pub fn all_schedules(&self) -> paavo_db::Result<Vec<ScheduleRow>> {
+        ScheduleRow::list_all(self.inner.lock().raw_conn())
+    }
 }
 ```
 
@@ -14347,7 +14462,21 @@ pub fn html_shell(title: &str, body: String) -> Html<String> {
 }
 
 pub(crate) fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    // Full HTML escape: covers element text AND attribute values
+    // (single + double quotes). All five characters per OWASP XSS
+    // Prevention Cheat Sheet's "Rule #1".
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Map a `JobState` to its UnoCSS color class. Used by every page that
@@ -14602,10 +14731,8 @@ use axum::extract::State;
 use axum::response::Html;
 
 /// Render.
-pub async fn render(State(_db): State<WebDb>) -> Html<String> {
-    // paavo-db doesn't expose a schedule.list_all helper yet; once paavod's
-    // cron has fired at least once, M4.3.c writes a row that we can render
-    // here. For now, emit a placeholder row.
+pub async fn render(State(db): State<WebDb>) -> Html<String> {
+    let rows = db.all_schedules().unwrap_or_default();
     let mut body = String::from(
         r#"<h1 class="text-2xl font-semibold mb-4">schedule</h1>
 <table class="w-full text-sm"><thead><tr>
@@ -14616,9 +14743,29 @@ pub async fn render(State(_db): State<WebDb>) -> Html<String> {
 <th class="text-left font-semibold text-zinc-600 py-1.5 border-b border-zinc-300">last completed</th>
 </tr></thead><tbody>"#,
     );
-    body.push_str(
-        r#"<tr><td colspan="5" class="py-3 text-zinc-500 italic">schedule table contents render via paavod's cron after first firing</td></tr>"#,
-    );
+    if rows.is_empty() {
+        body.push_str(
+            r#"<tr><td colspan="5" class="py-3 text-zinc-500 italic">no schedules registered yet — paavod's nightly cron writes a row on first fire</td></tr>"#,
+        );
+    } else {
+        for s in &rows {
+            body.push_str(&format!(
+                r#"<tr>
+<td class="py-1.5 border-b border-zinc-200">{id}</td>
+<td class="py-1.5 border-b border-zinc-200"><code class="bg-zinc-100 px-1 rounded">{cron}</code></td>
+<td class="py-1.5 border-b border-zinc-200 {ec}">{en}</td>
+<td class="py-1.5 border-b border-zinc-200 text-zinc-500">{lt}</td>
+<td class="py-1.5 border-b border-zinc-200 text-zinc-500">{lc}</td>
+</tr>"#,
+                id = super::html_escape(&s.id),
+                cron = super::html_escape(&s.cron),
+                ec = if s.enabled { "text-emerald-700" } else { "text-zinc-500" },
+                en = if s.enabled { "enabled" } else { "disabled" },
+                lt = s.last_triggered_at.map(|t| t.to_string()).unwrap_or_else(|| "—".into()),
+                lc = s.last_completed_at.map(|t| t.to_string()).unwrap_or_else(|| "—".into()),
+            ));
+        }
+    }
     body.push_str("</tbody></table>");
     super::html_shell("schedule", body)
 }
@@ -14658,51 +14805,176 @@ async fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 3: Smoke test**
+- [ ] **Step 3: Smoke test (all 5 pages)**
 
 `crates/paavo-web/tests/smoke.rs`:
 ```rust
-use axum::body::to_bytes;
+use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use paavo_db::Db;
 use paavo_web::db::WebDb;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-#[tokio::test]
-async fn dashboard_renders_on_empty_db() {
+/// Helper: open a fresh empty DB and build a router around it.
+fn fresh_app() -> (tempfile::TempDir, axum::Router) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("paavo.sqlite");
-    let _ = Db::open(&path).unwrap();
+    let _ = Db::open(&path).unwrap(); // run migrations
     let db = WebDb::open(&path).unwrap();
     let app = paavo_web::app::build_router(db);
+    (dir, app)
+}
+
+async fn fetch(app: axum::Router, uri: &str) -> (axum::http::StatusCode, String) {
     let resp = app
         .oneshot(
             Request::builder()
-                .uri("/")
-                .body(axum::body::Body::empty())
+                .uri(uri)
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-    let body = std::str::from_utf8(&bytes).unwrap();
-    assert!(body.contains("Board fleet"), "{body}");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn dashboard_renders_on_empty_db() {
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("Board fleet"), "got: {body}");
+    assert!(body.contains("Recent jobs"), "got: {body}");
+}
+
+#[tokio::test]
+async fn jobs_list_renders_on_empty_db() {
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/jobs").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("jobs"), "got: {body}");
+}
+
+#[tokio::test]
+async fn job_detail_404ish_on_invalid_id() {
+    // Page returns 200 with a "not found" body for missing/invalid ids,
+    // not a 404 status — operators following a link from a stale log
+    // shouldn't see an unstyled error page.
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/jobs/not-a-ulid").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("invalid id") || body.contains("not found"), "got: {body}");
+}
+
+#[tokio::test]
+async fn boards_renders_on_empty_db() {
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/boards").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("boards"), "got: {body}");
+}
+
+#[tokio::test]
+async fn schedule_renders_on_empty_db() {
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/schedule").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("schedule"), "got: {body}");
+    assert!(body.contains("no schedules registered yet"), "got: {body}");
+}
+
+#[tokio::test]
+async fn nav_present_on_every_page() {
+    // The sticky nav is shared by html_shell; smoke check the four nav
+    // anchors are present on every page render.
+    let (_d, app) = fresh_app();
+    for uri in ["/", "/jobs", "/boards", "/schedule"] {
+        let (status, body) = fetch(app.clone(), uri).await;
+        assert_eq!(status, 200, "uri={uri}");
+        for anchor in [r#"href="/""#, r#"href="/jobs""#, r#"href="/boards""#, r#"href="/schedule""#] {
+            assert!(body.contains(anchor), "uri={uri} missing nav anchor {anchor}; body: {body}");
+        }
+    }
 }
 ```
 
 - [ ] **Step 4: Run**
 
 Run: `cargo test -p paavo-web`
-Expected: 1 passed.
+Expected: 6 passed (dashboard, jobs_list, job_detail, boards, schedule, nav).
 
 - [ ] **Step 5: Commit**
 
 ```pwsh
-git -C D:\workspace\paavo add crates/paavo-web
+git -C D:\workspace\paavo add `
+    crates/paavo-db/src/job.rs `
+    crates/paavo-db/src/schedule.rs `
+    crates/paavo-db/tests/job_ops.rs `
+    crates/paavo-db/tests/schedule_ops.rs `
+    crates/paavo-web
 git -C D:\workspace\paavo commit -m "feat(web): RO sqlite viewer — dashboard / jobs / boards / schedule pages"
 ```
+
+**Round 2 amendment (post-implementation):** Spec + code-quality
+reviewers flagged five real defects; folded into the same commit:
+
+1. **Unused production deps trimmed.** Original `Cargo.toml` had
+   `tower`, `tower-http`, `rusqlite`, `chrono` in `[dependencies]`
+   but none were imported anywhere under `src/`. `tower` was
+   correctly re-listed under `[dev-dependencies]` (for
+   `ServiceExt::oneshot` in the smoke test). The other three were
+   dead weight. Dropped — `cargo udeps` / supply-chain audits no
+   longer get noise.
+
+2. **`job_detail` log limit unified.** Code originally fetched 5000
+   frames from sqlite (`db.job_logs(&id, 5000)`) then capped render
+   at 2000 (`logs.iter().take(2000)`) — 2.5× I/O and allocation for
+   no user-visible benefit, and a magic-number trap. Hoisted to
+   `const LOG_PAGE_LIMIT: u32 = 2000;` at the top of `job_detail.rs`
+   and threaded through both call sites.
+
+3. **Smoke `job_detail` assertion tightened + split into two tests.**
+   The original `body.contains("invalid id") || body.contains("not found")`
+   would silently pass under a refactor that collapsed both branches
+   into one wording. Now `job_detail_invalid_id_renders_invalid_id_body`
+   asserts the literal "invalid id" string for `/jobs/not-a-ulid`,
+   and a new sibling test `job_detail_well_formed_but_missing_id_renders_not_found`
+   uses the canonical ulid-spec example `01ARZ3NDEKTSV4RRFFQ69G5FAV`
+   to lock in the "not found" branch.
+
+4. **`nav_present_on_every_page` extended to cover `/jobs/:id`.**
+   Original loop iterated only the four nav targets. Both job-detail
+   error branches go through `html_shell`, so a future refactor that
+   returned a raw `Html<String>` from one of them would lose the nav
+   silently. Loop now includes both
+   `/jobs/not-a-ulid` and `/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV`.
+
+5. **`ScheduleRow::list_all` decoder deduplicated.** The closure that
+   decodes a `schedule` row was duplicated between `::get` and
+   `::list_all`. Extracted to a free `row_to_schedule(r: &Row)` at
+   module scope, mirroring `BoardRow::from_row` / `JobRow::from_row`.
+   Now a future column addition is a single-site edit. `db.rs`
+   module doc claim ("all decode logic lives in paavo-db's
+   `from_row` family") is now true rather than aspirational.
+
+Also folded: dropped unused `pub const CRATE_NAME` from `lib.rs`
+(quality nit); added a module-doc paragraph to `db.rs` explaining the
+deliberate choice to invoke sync rusqlite calls directly inside async
+handlers (no `spawn_blocking`) — sub-ms WAL+RO reads beat task-spawn
+overhead for this workload.
+
+Skipped (cosmetic, not real defects): page-style const consolidation,
+let-else refactor in `job_detail`, schedule.rs CRLF noise, default
+`--config` Windows variant, `html_shell` defensive `title` escape (no
+dynamic caller exists).
+
+Round 2 test counts (delta from round 1): paavo-web smoke 6 → 7
+(split invalid-id test), paavo-db schedule_ops unchanged (8), all
+other crates unchanged. Workspace `cargo test` still green; clippy +
+fmt still clean.
 
 ---
 
