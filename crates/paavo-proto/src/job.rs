@@ -172,15 +172,20 @@ impl JobOutcome {
 }
 
 /// The request side of a job, as serialised in the `POST /jobs` multipart
-/// JSON part.
+/// HTTP submit metadata. This is the JSON shape paavo-cli (and any
+/// other HTTP client) sends as the `metadata` part of `POST /jobs`.
+/// paavod deserializes it with `#[serde(deny_unknown_fields)]`, so:
+/// - `source` is NOT here — every HTTP submit is recorded as
+///   `JobSource::Cli` (the scheduler reaches `paavo_core::enqueue_job`
+///   directly without going through HTTP).
+/// - `tar_blake3` is NOT here — paavod computes it from the uploaded
+///   tar bytes during streaming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSpec {
     /// Scheduler priority.
     pub priority: Priority,
     /// Free-form submitter id (no auth).
     pub submitter: String,
-    /// Where the request came from.
-    pub source: JobSource,
     /// Board match rules.
     pub board_selector: BoardSelector,
     /// Per-job inactivity override. `None` means use the ELF's
@@ -191,8 +196,6 @@ pub struct JobSpec {
     /// the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_max_ms: Option<u64>,
-    /// blake3 of the uploaded crate tar, used as build-cache key.
-    pub tar_blake3: String,
 }
 
 /// JSON shape returned by `GET /jobs` and `GET /jobs/:id`. Mirrors the

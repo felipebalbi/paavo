@@ -1,6 +1,6 @@
 use paavo_proto::{
-    BoardHealth, BoardSelector, BoardSpec, JobId, JobOutcome, JobSource, JobSpec, JobState,
-    LogFrame, LogLevel, Priority, TerminalOutcome, TimeoutReason,
+    BoardHealth, BoardSelector, BoardSpec, JobId, JobOutcome, JobSpec, JobState, LogFrame,
+    LogLevel, Priority, TerminalOutcome, TimeoutReason,
 };
 
 #[test]
@@ -105,7 +105,6 @@ fn job_spec_roundtrip() {
     let spec = JobSpec {
         priority: Priority::Interactive,
         submitter: "felipe".into(),
-        source: JobSource::Cli,
         board_selector: BoardSelector {
             kind: "mcxa266".into(),
             instance: None,
@@ -113,11 +112,39 @@ fn job_spec_roundtrip() {
         },
         inactivity_timeout_ms: Some(120_000),
         hard_max_ms: Some(900_000),
-        tar_blake3: "deadbeef".into(),
     };
     let s = serde_json::to_string(&spec).unwrap();
     let parsed: JobSpec = serde_json::from_str(&s).unwrap();
     assert_eq!(spec, parsed);
+}
+
+#[test]
+fn job_spec_wire_shape_omits_source_and_tar_blake3() {
+    // Spec section 9.1: `source` is server-forced to Cli; tar_blake3
+    // is server-computed from the uploaded bytes. paavod's deserializer
+    // uses deny_unknown_fields, so any client that includes these
+    // fields will get 400. Pin the contract here so a future field-
+    // rename can't silently break paavo-cli.
+    let spec = JobSpec {
+        priority: Priority::Interactive,
+        submitter: "felipe".into(),
+        board_selector: BoardSelector {
+            kind: "mcxa266".into(),
+            instance: None,
+            wiring_profile: None,
+        },
+        inactivity_timeout_ms: None,
+        hard_max_ms: None,
+    };
+    let j = serde_json::to_value(&spec).unwrap();
+    assert!(j.get("source").is_none(), "JobSpec must not expose source");
+    assert!(
+        j.get("tar_blake3").is_none(),
+        "JobSpec must not expose tar_blake3"
+    );
+    // Optional None fields are omitted via skip_serializing_if.
+    assert!(j.get("inactivity_timeout_ms").is_none());
+    assert!(j.get("hard_max_ms").is_none());
 }
 
 #[test]
