@@ -10,6 +10,7 @@
 /// Crate name, used by a smoke doctest.
 pub const CRATE_NAME: &str = "paavo-core";
 
+mod cancel;
 mod enqueue;
 mod error;
 mod quarantine;
@@ -17,6 +18,7 @@ mod runner;
 mod scheduler;
 mod selector;
 
+pub use cancel::cancel_if_submitted;
 pub use enqueue::{enqueue_job, EnqueueRequest};
 pub use error::{CoreError, Result};
 pub use quarantine::{apply_outcome_to_board, auto_quarantine_reason, QuarantinePolicy};
