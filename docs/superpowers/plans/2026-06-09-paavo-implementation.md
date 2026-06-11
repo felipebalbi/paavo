@@ -12378,6 +12378,9 @@ git -C D:\workspace\paavo commit -m "feat(paavod): SIGTERM drain with grace time
 
 ### Task 4.4: paavod — main()
 
+Wires every piece M4.1-M4.3 produced into the daemon's `#[tokio::main]`
+entry point.
+
 - [ ] **Step 1: Wire main**
 
 `crates/paavod/src/main.rs`:
@@ -12386,15 +12389,17 @@ git -C D:\workspace\paavo commit -m "feat(paavod): SIGTERM drain with grace time
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use parking_lot::Mutex;
+use paavo_proto::{JobId, JobOutcome};
 use paavod::app::build_router;
 use paavod::app_state::{AppState, DrainState};
 use paavod::cancellation::CancellationRegistry;
 use paavod::config::Config;
 use paavod::job_logs::JobLogsBroker;
 use paavod::state_dir::StateDir;
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "paavod", about = "paavo daemon")]
@@ -12407,8 +12412,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let args = Args::parse();
@@ -12422,7 +12429,10 @@ async fn main() -> Result<()> {
     let db = paavo_db::Db::open(&sd.sqlite_path)
         .with_context(|| format!("opening sqlite at {}", sd.sqlite_path.display()))?;
 
-    // Load boards.toml if present.
+    // Sync boards.toml into the `board` table if present, then load the
+    // inventory snapshot AppState caches. `inventory` MUST be populated
+    // BEFORE we start serving HTTP — otherwise selector validation in
+    // POST /jobs sees an empty fleet and rejects everything.
     let inventory = load_inventory(&db, &sd.boards_toml)?;
 
     let state = AppState {
@@ -12434,40 +12444,84 @@ async fn main() -> Result<()> {
         job_logs: JobLogsBroker::new(),
     };
 
-    // Runner: paavo-runner's real BoardWorker backed by paavo-probe's
-    // RealSession. We wrap it in a tiny adapter that implements paavo-core's
-    // `Runner` trait.
-    let runner: Arc<dyn paavo_core::Runner> = Arc::new(RealRunner {
-        state: state.clone(),
-    });
+    // Runner selection: production uses RealRunner (M6.4 wires probe-rs).
+    // Dev / CI can set PAAVO_FAKE_RUNNER=1 to use a FakeRunner that
+    // always returns Passed — enables the M4.5.b end-to-end CLI test
+    // to drive a real paavod without hardware.
+    let runner: Arc<dyn paavo_core::Runner> = if std::env::var("PAAVO_FAKE_RUNNER").is_ok() {
+        tracing::warn!(
+            "PAAVO_FAKE_RUNNER=1: using FakeRunner; every job returns Passed",
+        );
+        Arc::new(FakeRunner)
+    } else {
+        Arc::new(RealRunner)
+    };
 
-    let _dispatch = paavod::dispatch::spawn(state.clone(), runner);
-    let _cron = paavod::cron::start(state.clone()).await?;
+    let dispatch_handle = paavod::dispatch::spawn(state.clone(), runner);
+    let cron = paavod::cron::start(state.clone()).await?;
 
-    let listener = tokio::net::TcpListener::bind(&config.server.bind).await?;
-    tracing::info!(bind = %config.server.bind, "paavod listening");
+    let bind = config.server.bind.clone();
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("binding to {bind}"))?;
+    tracing::info!(bind = %bind, "paavod listening");
 
-    let state_for_shutdown = state.clone();
-    axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(paavod::shutdown::await_signal_then_drain(state_for_shutdown))
-        .await?;
+    // Graceful-shutdown future: when SIGTERM/Ctrl-C arrives, flip the
+    // drain flag synchronously (so any HTTP request that races between
+    // signal arrival and axum's drain still sees `state.drain.is_draining()`
+    // and returns 503). Axum will then stop accepting new connections
+    // and finish in-flight requests.
+    let state_for_axum = state.clone();
+    let shutdown_future = async move {
+        paavod::shutdown::wait_for_signal().await;
+        state_for_axum.drain.set_draining();
+        tracing::info!("drain: flipped state.drain; axum will finish in-flight requests");
+    };
+    axum::serve(listener, build_router(state.clone()))
+        .with_graceful_shutdown(shutdown_future)
+        .await
+        .context("axum serve loop returned an error")?;
 
+    // Axum has stopped accepting connections and finished in-flight
+    // requests. Now drain dispatch workers + stop the cron scheduler.
+    let grace = Duration::from_secs(state.config.timeouts.shutdown_grace_s);
+    paavod::shutdown::drain_with_grace(state.clone(), cron, grace).await;
+
+    // Wait briefly for the dispatch loop to notice drain && active==0
+    // and return. Detach if it doesn't return within 5s — the runtime
+    // dropping will reclaim the task on process exit.
+    let _ = tokio::time::timeout(Duration::from_secs(5), dispatch_handle).await;
+    tracing::info!("paavod: clean shutdown complete");
     Ok(())
 }
 
-fn load_inventory(db: &paavo_db::Db, boards_toml: &std::path::Path) -> Result<Vec<paavo_proto::BoardSpec>> {
-    // boards.toml is optional; if present, sync rows into the DB first.
+/// Sync `boards.toml` (if present) into the `board` table and return
+/// the resulting inventory snapshot. `boards.toml` is treated as the
+/// declarative source of truth — paavo-cli writes it; paavod only
+/// reads. New entries get inserted; existing entries are left alone
+/// (operator might have quarantined a board via paavo-cli).
+fn load_inventory(
+    db: &paavo_db::Db,
+    boards_toml: &std::path::Path,
+) -> Result<Vec<paavo_proto::BoardSpec>> {
     if boards_toml.is_file() {
         #[derive(serde::Deserialize)]
         struct Boards {
             #[serde(default)]
             board: Vec<paavo_proto::BoardSpec>,
         }
-        let raw = std::fs::read_to_string(boards_toml)?;
-        let b: Boards = toml::from_str(&raw)?;
-        for spec in &b.board {
+        let raw = std::fs::read_to_string(boards_toml)
+            .with_context(|| format!("reading {}", boards_toml.display()))?;
+        let parsed: Boards =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", boards_toml.display()))?;
+        for spec in &parsed.board {
             if paavo_db::BoardRow::find(db.raw_conn(), &spec.id)?.is_none() {
-                paavo_db::BoardRow::insert(db.raw_conn(), spec, chrono::Utc::now().timestamp_millis())?;
+                paavo_db::BoardRow::insert(
+                    db.raw_conn(),
+                    spec,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .with_context(|| format!("inserting board {}", spec.id))?;
             }
         }
     }
@@ -12477,25 +12531,36 @@ fn load_inventory(db: &paavo_db::Db, boards_toml: &std::path::Path) -> Result<Ve
         .collect())
 }
 
-/// Real-runner adapter. In v1 this spins up a paavo-runner BoardWorker per
-/// job with a `paavo-probe::RealSession`. The hardware-only wiring lives in
-/// Milestone 6.4; for now this returns an `InfraErr` outcome that surfaces
-/// a clear message in the API while keeping the daemon functional for
-/// non-hardware integration tests.
-struct RealRunner {
-    state: AppState,
-}
+/// Real-runner adapter. Wires paavo-runner's BoardWorker with a
+/// paavo-probe RealSession in M6.4. For now this returns InfraErr so
+/// the API is honest about what's wired and what isn't — operators
+/// running paavod without M6.4 see a clear failure message instead
+/// of jobs hanging in Running forever.
+struct RealRunner;
 
 impl paavo_core::Runner for RealRunner {
-    fn run(&self, job_id: paavo_proto::JobId, board_id: &str) -> paavo_core::RunOutcome {
-        let _ = (&self.state, job_id, board_id);
+    fn run(&self, _job_id: JobId, _board_id: &str) -> paavo_core::RunOutcome {
         paavo_core::RunOutcome {
-            outcome: paavo_proto::JobOutcome::Failed(paavo_proto::TerminalOutcome::InfraErr {
+            outcome: JobOutcome::Failed(paavo_proto::TerminalOutcome::InfraErr {
                 stage: "real_runner".into(),
                 message: "RealRunner is wired in Milestone 6.4; \
                           set PAAVO_FAKE_RUNNER=1 in dev to use the fake outcome runner"
                     .into(),
             }),
+            probe_released_cleanly: true,
+        }
+    }
+}
+
+/// Dev/CI runner that always returns Passed. Selected via
+/// PAAVO_FAKE_RUNNER=1. The M4.5.b end-to-end CLI test exercises
+/// paavod through this so it can run without hardware probes.
+struct FakeRunner;
+
+impl paavo_core::Runner for FakeRunner {
+    fn run(&self, _job_id: JobId, _board_id: &str) -> paavo_core::RunOutcome {
+        paavo_core::RunOutcome {
+            outcome: JobOutcome::Passed,
             probe_released_cleanly: true,
         }
     }
@@ -12510,9 +12575,37 @@ Expected: succeeds.
 - [ ] **Step 3: Run the full workspace tests**
 
 Run: `cargo test --workspace`
-Expected: green (all tests across every crate).
+Expected: green.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Smoke-test the binary**
+
+```pwsh
+# Write a minimal config + state dir.
+$tmp = New-Item -ItemType Directory -Path "$env:TEMP\paavod-smoke-$(Get-Random)"
+@"
+[server]
+bind = "127.0.0.1:0"
+state_dir = "$($tmp.FullName.Replace('\','/'))"
+
+[web]
+bind = "127.0.0.1:0"
+
+[scheduler]
+nightly_cron = "0 0 3 * * *"
+"@ | Set-Content -NoNewline "$($tmp.FullName)\paavo.toml"
+
+# Spawn paavod in the background with the fake runner, wait briefly,
+# then send Ctrl-C. Should clean-exit within shutdown_grace_s seconds.
+$env:PAAVO_FAKE_RUNNER = "1"
+cargo run -p paavod -- --config "$($tmp.FullName)\paavo.toml"
+```
+
+(Step 4 is operational-confidence only — the real coverage is
+M4.5.b's end-to-end test, which spawns paavod inside the test
+process and drives it via reqwest. Skip Step 4 if you trust the
+unit-test coverage from M4.1-M4.3.)
+
+- [ ] **Step 5: Commit**
 
 ```pwsh
 git -C D:\workspace\paavo add crates/paavod
