@@ -36,6 +36,7 @@ tracing-subscriber = { workspace = true }
 chrono      = { workspace = true }
 futures     = { workspace = true }
 bytes       = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }

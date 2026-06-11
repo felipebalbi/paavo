@@ -2345,6 +2345,7 @@ dependencies = [
  "paavo-core",
  "paavo-db",
  "paavo-proto",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
