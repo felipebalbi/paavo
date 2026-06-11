@@ -33,6 +33,7 @@ paavo-build  = { path = "crates/paavo-build" }
 paavo-probe  = { path = "crates/paavo-probe" }
 paavo-runner = { path = "crates/paavo-runner" }
 paavo-core   = { path = "crates/paavo-core" }
+paavod       = { path = "crates/paavod" }
 
 # Serialization / data
 serde       = { version = "1", features = ["derive"] }

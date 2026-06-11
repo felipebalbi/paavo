@@ -13398,9 +13398,12 @@ paavod = { path = "crates/paavod" }
 paavod      = { workspace = true }
 paavo-db    = { workspace = true }
 parking_lot = { workspace = true }
+axum        = { workspace = true }
 tokio       = { workspace = true }
 ```
-(`assert_cmd`, `predicates`, `tempfile` are already dev-deps.)
+(`assert_cmd`, `predicates`, `tempfile` are already dev-deps. `axum`
+is needed because the test calls `axum::serve(listener, app)` directly
+on the listener bound to an ephemeral port.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -13424,7 +13427,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paavo_cli_jobs_lists_seeded_job() {
     let tmp = tempdir().unwrap();
     let sd = paavod::state_dir::StateDir::from_root(tmp.path());
@@ -13515,6 +13518,23 @@ Expected: both green.
 git -C D:\workspace\paavo add Cargo.toml crates/paavo-cli
 git -C D:\workspace\paavo commit -m "test(cli): end-to-end paavo-cli jobs against in-process paavod"
 ```
+
+**Round 2 amendment (post-implementation):** First test run hung
+indefinitely. Root cause: `#[tokio::test]` defaults to a
+`current_thread` runtime. The test thread blocks in
+`AssertCommand::cargo_bin("paavo-cli").assert()`, which spawns
+`paavo-cli` as a subprocess. The subprocess immediately tries to talk
+to paavod's `axum::serve` task on the same runtime — but the runtime
+has no other thread to drive that task, so the request never gets
+served and the subprocess hangs on `reqwest::get`. Fix: pin the test
+to a multi-threaded runtime with
+`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` so
+`axum::serve` runs on a worker thread while the test thread is blocked
+in the subprocess. Cargo build lock was NOT the cause — initial
+hypothesis was wrong. Confirmed by running `cargo test --no-run`
+separately (build completes), then `cargo test ... -- --nocapture`
+(finishes in 0.10s). Plan updated above to encode the correct
+attribute.
 
 ---
 

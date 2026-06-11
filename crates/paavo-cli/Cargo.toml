@@ -30,3 +30,7 @@ walkdir     = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile   = { workspace = true }
+paavod      = { workspace = true }
+paavo-db    = { workspace = true }
+parking_lot = { workspace = true }
+axum        = { workspace = true }
