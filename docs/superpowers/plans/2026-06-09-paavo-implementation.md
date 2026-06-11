@@ -11569,12 +11569,24 @@ job_logs 3. paavo-db gains 1 test (exclusivity).
 
 #### 4.3.c: Nightly cron driver
 
+**Setup before TDD:** add the `tar` dep that `make_tar` needs.
+`crates/paavod/Cargo.toml` `[dependencies]`:
+```toml
+tar = { workspace = true }
+```
+(`tokio-cron-scheduler`, `cron`, `anyhow`, `paavo-build` are already deps.)
+
 - [ ] **Step 1: Implement cron**
 
 `crates/paavod/src/cron.rs`:
 ```rust
 //! Nightly cron driver: when `scheduler.nightly_cron` fires, walk every
 //! `[[corpus]]` entry, tar each subdir, and submit it as a Scheduled job.
+//!
+//! Drain interaction: when `state.drain.is_draining()`, the corpus run
+//! short-circuits (logs + returns). The cron timer keeps firing — but
+//! once paavod is draining, no new work goes in. M4.3.d's SIGTERM
+//! handler also stops the scheduler.
 
 use crate::app_state::AppState;
 use crate::config::CorpusEntry;
@@ -11585,8 +11597,8 @@ use paavo_proto::{BoardSelector, JobId, JobSource, Priority};
 use std::path::Path;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
-/// Wire up and start the cron job. Returns the scheduler so the caller can
-/// shut it down on SIGTERM.
+/// Wire up and start the cron job. Returns the scheduler so the caller
+/// can shut it down on SIGTERM.
 pub async fn start(state: AppState) -> anyhow::Result<JobScheduler> {
     let sched = JobScheduler::new().await?;
     let cron_expr = state.config.scheduler.nightly_cron.clone();
@@ -11595,7 +11607,7 @@ pub async fn start(state: AppState) -> anyhow::Result<JobScheduler> {
         let state = state_for_job.clone();
         Box::pin(async move {
             if let Err(e) = run_nightly_corpus(&state).await {
-                tracing::error!(error=?e, "nightly cron run failed");
+                tracing::error!(error = ?e, "nightly cron run failed");
             }
         })
     })?;
@@ -11605,33 +11617,43 @@ pub async fn start(state: AppState) -> anyhow::Result<JobScheduler> {
 }
 
 async fn run_nightly_corpus(state: &AppState) -> anyhow::Result<()> {
+    if state.drain.is_draining() {
+        tracing::info!("nightly cron: draining — skipping corpus run");
+        return Ok(());
+    }
     let now_ms = Utc::now().timestamp_millis();
-    paavo_db::ScheduleRow::upsert(
-        &state.db.lock().raw_conn(),
-        &paavo_db::ScheduleRow {
-            id: "nightly".into(),
-            cron: state.config.scheduler.nightly_cron.clone(),
-            enabled: true,
-            last_triggered_at: Some(now_ms),
-            last_completed_at: None,
-        },
-    )?;
+    {
+        let db = state.db.lock();
+        paavo_db::ScheduleRow::upsert(
+            db.raw_conn(),
+            &paavo_db::ScheduleRow {
+                id: "nightly".into(),
+                cron: state.config.scheduler.nightly_cron.clone(),
+                enabled: true,
+                last_triggered_at: Some(now_ms),
+                last_completed_at: None,
+            },
+        )?;
+    }
 
     let corpus = state.config.corpus.clone();
     for entry in &corpus {
         if let Err(e) = enqueue_corpus_entry(state, entry).await {
-            tracing::error!(corpus=%entry.name, error=?e, "corpus enqueue failed");
+            tracing::error!(corpus = %entry.name, error = ?e, "corpus enqueue failed");
         }
     }
 
-    paavo_db::ScheduleRow::apply_update(
-        &state.db.lock().raw_conn(),
-        "nightly",
-        &paavo_db::ScheduleUpdate {
-            last_triggered_at: None,
-            last_completed_at: Some(Utc::now().timestamp_millis()),
-        },
-    )?;
+    {
+        let db = state.db.lock();
+        paavo_db::ScheduleRow::apply_update(
+            db.raw_conn(),
+            "nightly",
+            &paavo_db::ScheduleUpdate {
+                last_triggered_at: None,
+                last_completed_at: Some(Utc::now().timestamp_millis()),
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -11649,17 +11671,20 @@ async fn enqueue_corpus_entry(state: &AppState, entry: &CorpusEntry) -> anyhow::
         let tar_bytes = make_tar(&crate_dir)?;
         let sd = StateDir::from_root(&state.config.server.state_dir);
         sd.ensure_dirs()?;
-        let blake = paavo_build::tar::tar_blake3(&tar_bytes);
+        let blake = paavo_build::tar::blake3_hex(&tar_bytes);
         let tar_path = sd.uploads_dir.join(format!("{blake}.tar"));
         if !tar_path.is_file() {
             std::fs::write(&tar_path, &tar_bytes)?;
         }
-        // Infer board kind from path: convention says `soak-tests/<kind>/...`.
-        let kind = crate_dir
-            .parent()
-            .and_then(|p| p.file_name())
+        // Infer board kind from the corpus path: convention is
+        // `<corpus_root>/<kind>/<test-crate>/`. The entry's `path` is
+        // `<corpus_root>/<kind>`, so the parent directory of the
+        // entry path's children gives us `<kind>`.
+        let kind = entry
+            .path
+            .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow::anyhow!("cannot infer board kind from {crate_dir:?}"))?;
+            .ok_or_else(|| anyhow::anyhow!("cannot infer board kind from {:?}", entry.path))?;
         let req = EnqueueRequest {
             job_id: JobId::new(),
             priority: Priority::Scheduled,
@@ -11677,8 +11702,19 @@ async fn enqueue_corpus_entry(state: &AppState, entry: &CorpusEntry) -> anyhow::
             daemon_ceiling_ms: state.config.timeouts.daemon_ceiling_s * 1_000,
         };
         let inventory = state.inventory_snapshot();
-        let db = state.db.lock();
-        let _ = enqueue_job(db.raw_conn(), &inventory, req);
+        let now_ms = Utc::now().timestamp_millis();
+        let result = {
+            let db = state.db.lock();
+            enqueue_job(db.raw_conn(), &inventory, req, now_ms)
+        };
+        if let Err(e) = result {
+            tracing::error!(
+                corpus = %entry.name,
+                crate_dir = %crate_dir.display(),
+                error = ?e,
+                "cron: enqueue_job rejected corpus job",
+            );
+        }
     }
     Ok(())
 }
@@ -11687,52 +11723,69 @@ fn make_tar(crate_dir: &Path) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut tarb = tar::Builder::new(&mut buf);
-        tarb.append_dir_all(
-            crate_dir.file_name().unwrap_or_default(),
-            crate_dir,
-        )?;
+        tarb.append_dir_all(crate_dir.file_name().unwrap_or_default(), crate_dir)?;
         tarb.finish()?;
     }
     Ok(buf)
 }
+
+/// Test hook: run the corpus enqueue logic exactly once without
+/// scheduling.
+#[doc(hidden)]
+pub async fn __test_run_once(state: &AppState) -> anyhow::Result<()> {
+    run_nightly_corpus(state).await
+}
 ```
 
-Add `pub mod cron;` to lib.rs. The cron module is intentionally lightly-tested in the workspace (no good way to fast-forward `tokio-cron-scheduler` without a real wallclock); the integration test in M6.4 (HW smoke) is where we exercise it end-to-end. Workspace test for the *enqueue* part:
+Add `pub mod cron;` to `crates/paavod/src/lib.rs`.
+
+The cron module is intentionally lightly-tested in the workspace (no
+good way to fast-forward `tokio-cron-scheduler` without a real
+wallclock); the integration test in M6.4 (HW smoke) is where we
+exercise it end-to-end. Workspace test for the *enqueue* part:
 
 `crates/paavod/tests/cron_enqueue.rs`:
 ```rust
-//! Tests that the corpus enqueue helper inserts Scheduled jobs and infers
-//! `board_kind` from the parent directory name.
+//! Tests that the corpus enqueue helper inserts Scheduled jobs and
+//! infers `board_kind` from the corpus entry's path basename.
 
-use parking_lot::Mutex;
+use paavo_db::Db;
+use paavo_proto::{BoardHealth, BoardSpec, JobSource, ProbeSelector};
 use paavod::app_state::{AppState, DrainState};
 use paavod::cancellation::CancellationRegistry;
-use paavod::config::*;
+use paavod::config::{
+    BuildCacheConfig, Config, CorpusEntry, QuarantineConfig, RetentionConfig, SchedulerConfig,
+    ServerConfig, TimeoutsConfig, WebConfig,
+};
 use paavod::job_logs::JobLogsBroker;
-use paavo_proto::{BoardHealth, BoardSpec, JobSource, ProbeSelector};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
-#[tokio::test]
-async fn corpus_entry_enqueues_one_job_per_crate_subdir() {
-    let tmp = tempfile::tempdir().unwrap();
-    let corpus_root = tmp.path().join("mcxa266");
-    std::fs::create_dir_all(corpus_root.join("test-a/src")).unwrap();
-    std::fs::write(corpus_root.join("test-a/Cargo.toml"), "[package]\nname=\"a\"\nversion=\"0\"\n").unwrap();
-    std::fs::write(corpus_root.join("test-a/src/main.rs"), "fn main() {}").unwrap();
-    std::fs::create_dir_all(corpus_root.join("test-b/src")).unwrap();
-    std::fs::write(corpus_root.join("test-b/Cargo.toml"), "[package]\nname=\"b\"\nversion=\"0\"\n").unwrap();
-    std::fs::write(corpus_root.join("test-b/src/main.rs"), "fn main() {}").unwrap();
+fn write_test_crate(dir: &std::path::Path, name: &str) {
+    let crate_dir = dir.join(name);
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!("[package]\nname=\"{name}\"\nversion=\"0\"\n"),
+    )
+    .unwrap();
+    std::fs::write(crate_dir.join("src/main.rs"), "fn main() {}").unwrap();
+}
 
-    let state_root = tmp.path().join("state");
-    let sd = paavod::state_dir::StateDir::from_root(&state_root);
+fn make_state(corpus: Vec<CorpusEntry>, state_root: &std::path::Path) -> AppState {
+    let sd = paavod::state_dir::StateDir::from_root(state_root);
     sd.ensure_dirs().unwrap();
-    let db = paavo_db::Db::open(&sd.sqlite_path).unwrap();
+    let db = Db::open(&sd.sqlite_path).unwrap();
     paavo_db::BoardRow::insert(
         db.raw_conn(),
         &BoardSpec {
             id: "mcxa266-01".into(),
             kind: "mcxa266".into(),
-            probe_selector: ProbeSelector { vid: "x".into(), pid: "x".into(), serial: "x".into() },
+            probe_selector: ProbeSelector {
+                vid: "x".into(),
+                pid: "x".into(),
+                serial: "x".into(),
+            },
             chip_name: "x".into(),
             target_name: "x".into(),
             wiring_profile: None,
@@ -11741,56 +11794,162 @@ async fn corpus_entry_enqueues_one_job_per_crate_subdir() {
         0,
     )
     .unwrap();
-    let inventory = vec![paavo_db::BoardRow::get(db.raw_conn(), "mcxa266-01").unwrap().spec];
-
+    let inventory = paavo_db::BoardRow::list_all(db.raw_conn())
+        .unwrap()
+        .into_iter()
+        .map(|r| r.spec)
+        .collect::<Vec<_>>();
     let cfg = Arc::new(Config {
-        server: ServerConfig { bind: "x".into(), state_dir: state_root.clone() },
-        web: WebConfig { bind: "x".into() },
+        server: ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            state_dir: state_root.to_path_buf(),
+            max_upload_bytes: 256 * 1024 * 1024,
+        },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig {
+            nightly_cron: "0 0 19 * * *".into(),
+            starvation_threshold_s: 21_600,
+        },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
-        corpus: vec![CorpusEntry {
-            name: "test-corpus".into(),
-            path: corpus_root,
-            cargo_update: vec![],
-        }],
+        corpus,
     });
-    let state = AppState {
+    AppState {
         db: Arc::new(Mutex::new(db)),
-        config: cfg.clone(),
+        config: cfg,
         inventory: Arc::new(Mutex::new(inventory)),
         drain: DrainState::default(),
         cancellation: CancellationRegistry::default(),
         job_logs: JobLogsBroker::new(),
-    };
+    }
+}
+
+#[tokio::test]
+async fn corpus_entry_enqueues_one_job_per_crate_subdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus_root = tmp.path().join("mcxa266");
+    write_test_crate(&corpus_root, "test-a");
+    write_test_crate(&corpus_root, "test-b");
+
+    let state = make_state(
+        vec![CorpusEntry {
+            name: "test-corpus".into(),
+            path: corpus_root,
+            cargo_update: vec![],
+        }],
+        &tmp.path().join("state"),
+    );
 
     paavod::cron::__test_run_once(&state).await.unwrap();
     let rows = paavo_db::JobRow::list_by_state(
-        &state.db.lock().raw_conn(),
+        state.db.lock().raw_conn(),
         paavo_proto::JobState::Submitted,
         50,
     )
     .unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.source == JobSource::Scheduler));
+    assert!(rows.iter().all(|r| r.board_selector.kind == "mcxa266"));
+    assert!(
+        rows.iter()
+            .all(|r| r.submitter.starts_with("nightly:test-corpus"))
+    );
 }
-```
 
-Add a test hook in `crates/paavod/src/cron.rs`:
-```rust
-/// Test hook: run the corpus enqueue logic exactly once without scheduling.
-#[doc(hidden)]
-pub async fn __test_run_once(state: &AppState) -> anyhow::Result<()> {
-    run_nightly_corpus(state).await
+#[tokio::test]
+async fn corpus_run_skips_non_dir_entries_and_dirs_without_cargo_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus_root = tmp.path().join("mcxa266");
+    std::fs::create_dir_all(&corpus_root).unwrap();
+    // A loose file (not a dir) — skipped.
+    std::fs::write(corpus_root.join("notes.txt"), "ignored").unwrap();
+    // A dir with no Cargo.toml — skipped.
+    std::fs::create_dir_all(corpus_root.join("docs/chapters")).unwrap();
+    // A real test crate — enqueued.
+    write_test_crate(&corpus_root, "test-a");
+
+    let state = make_state(
+        vec![CorpusEntry {
+            name: "test-corpus".into(),
+            path: corpus_root,
+            cargo_update: vec![],
+        }],
+        &tmp.path().join("state"),
+    );
+
+    paavod::cron::__test_run_once(&state).await.unwrap();
+    let rows = paavo_db::JobRow::list_by_state(
+        state.db.lock().raw_conn(),
+        paavo_proto::JobState::Submitted,
+        50,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn corpus_run_no_ops_during_drain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus_root = tmp.path().join("mcxa266");
+    write_test_crate(&corpus_root, "test-a");
+
+    let state = make_state(
+        vec![CorpusEntry {
+            name: "test-corpus".into(),
+            path: corpus_root,
+            cargo_update: vec![],
+        }],
+        &tmp.path().join("state"),
+    );
+    state.drain.set_draining();
+    paavod::cron::__test_run_once(&state).await.unwrap();
+    let rows = paavo_db::JobRow::list_by_state(
+        state.db.lock().raw_conn(),
+        paavo_proto::JobState::Submitted,
+        50,
+    )
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        0,
+        "drain must suppress new Scheduled enqueues"
+    );
+}
+
+#[tokio::test]
+async fn corpus_run_updates_schedule_row_with_trigger_and_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus_root = tmp.path().join("mcxa266");
+    write_test_crate(&corpus_root, "test-a");
+
+    let state = make_state(
+        vec![CorpusEntry {
+            name: "test-corpus".into(),
+            path: corpus_root,
+            cargo_update: vec![],
+        }],
+        &tmp.path().join("state"),
+    );
+    paavod::cron::__test_run_once(&state).await.unwrap();
+    let row = paavo_db::ScheduleRow::get(state.db.lock().raw_conn(), "nightly").unwrap();
+    assert!(row.enabled);
+    assert!(row.last_triggered_at.is_some());
+    assert!(row.last_completed_at.is_some());
+    // upsert wrote the cron expression we configured.
+    assert_eq!(row.cron, "0 0 19 * * *");
 }
 ```
 
 - [ ] **Step 2: Run**
 
 Run: `cargo test -p paavod --test cron_enqueue`
-Expected: 1 passed.
+Expected: 4 passed.
+
+Also run `cargo test --workspace`, clippy + fmt gates.
 
 - [ ] **Step 3: Commit**
 
