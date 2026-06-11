@@ -79,3 +79,27 @@ impl BoardSelector {
         true
     }
 }
+
+/// JSON shape returned by `GET /boards` and `GET /boards/:id`. Wraps a
+/// `BoardSpec` with the operational fields the spec §9.4 promises:
+/// last-used timestamp, quarantine reason, the infra-failure counter
+/// that drives auto-quarantine, and the registration timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardView {
+    /// Inlined spec fields (`#[serde(flatten)]` so the wire shape is
+    /// flat: `{ "id": ..., "kind": ..., ..., "last_used_at": ..., ... }`).
+    #[serde(flatten)]
+    pub spec: BoardSpec,
+    /// Free-form reason recorded when `spec.health == Quarantined`.
+    /// `None` when the board is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// Counts toward the auto-quarantine threshold
+    /// (`quarantine.consecutive_infra_failures`).
+    pub consecutive_infra_failures: u32,
+    /// Epoch ms of the most recent successful dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    /// Epoch ms when this board was first registered.
+    pub created_at: i64,
+}

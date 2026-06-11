@@ -2,7 +2,7 @@
 
 use crate::error::{DbError, Result};
 use paavo_proto::{BoardHealth, BoardSelector, BoardSpec, ProbeSelector};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, Error as RusqliteError, ErrorCode, OptionalExtension, Row};
 
 /// One row from the `board` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,10 +22,11 @@ pub struct BoardRow {
 
 impl BoardRow {
     /// Insert a new board. Initial counters/values: 0 infra failures, no
-    /// last_used_at, no quarantine reason.
+    /// last_used_at, no quarantine reason. Returns
+    /// `DbError::AlreadyExists` if the primary key already exists.
     pub fn insert(conn: &Connection, spec: &BoardSpec, now_ms: i64) -> Result<()> {
         let probe_json = serde_json::to_string(&spec.probe_selector)?;
-        conn.execute(
+        let result = conn.execute(
             "INSERT INTO board (
                 id, kind, probe_selector, chip_name, target_name,
                 wiring_profile, health, quarantine_reason,
@@ -41,8 +42,17 @@ impl BoardRow {
                 health_to_str(spec.health),
                 now_ms,
             ],
-        )?;
-        Ok(())
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(RusqliteError::SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
+                Err(DbError::AlreadyExists {
+                    entity: "board",
+                    id: spec.id.clone(),
+                })
+            }
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// Fetch a single board by id. Errors if missing.
@@ -104,54 +114,73 @@ impl BoardRow {
         }
     }
 
-    /// Update `last_used_at` to `now_ms`.
+    /// Update `last_used_at` to `now_ms`. Returns `DbError::NotFound`
+    /// if `id` does not exist.
     pub fn touch_last_used(conn: &Connection, id: &str, now_ms: i64) -> Result<()> {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE board SET last_used_at = ?1 WHERE id = ?2",
             params![now_ms, id],
         )?;
-        Ok(())
+        require_one_row(n, id)
     }
 
-    /// Increment `consecutive_infra_failures` by 1.
+    /// Increment `consecutive_infra_failures` by 1. Returns
+    /// `DbError::NotFound` if `id` does not exist.
     pub fn bump_infra_failure(conn: &Connection, id: &str) -> Result<()> {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE board SET consecutive_infra_failures =
              consecutive_infra_failures + 1 WHERE id = ?1",
             params![id],
         )?;
-        Ok(())
+        require_one_row(n, id)
     }
 
     /// Reset `consecutive_infra_failures` to 0. Called after a job whose
     /// outcome does not count toward infra failure (per
-    /// `JobOutcome::counts_toward_infra_failure`).
+    /// `JobOutcome::counts_toward_infra_failure`). Returns
+    /// `DbError::NotFound` if `id` does not exist.
     pub fn reset_infra_failures(conn: &Connection, id: &str) -> Result<()> {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE board SET consecutive_infra_failures = 0 WHERE id = ?1",
             params![id],
         )?;
-        Ok(())
+        require_one_row(n, id)
     }
 
-    /// Flip board to `quarantined` and record a reason.
+    /// Flip board to `quarantined` and record a reason. Returns
+    /// `DbError::NotFound` if `id` does not exist.
     pub fn quarantine(conn: &Connection, id: &str, reason: &str) -> Result<()> {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE board SET health = 'quarantined', quarantine_reason = ?1
              WHERE id = ?2",
             params![reason, id],
         )?;
-        Ok(())
+        require_one_row(n, id)
     }
 
     /// Flip board back to `healthy`, clear quarantine reason and reset the
-    /// infra failure counter.
+    /// infra failure counter. Returns `DbError::NotFound` if `id` does
+    /// not exist.
     pub fn unquarantine(conn: &Connection, id: &str) -> Result<()> {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE board SET health = 'healthy', quarantine_reason = NULL,
              consecutive_infra_failures = 0 WHERE id = ?1",
             params![id],
         )?;
+        require_one_row(n, id)
+    }
+}
+
+/// Map a `rusqlite::execute` rows-affected count to `Ok(())` or
+/// `Err(DbError::NotFound { entity: "board", id })`. Used by every
+/// single-row board mutator to turn silent no-ops into typed errors.
+fn require_one_row(n: usize, id: &str) -> Result<()> {
+    if n == 0 {
+        Err(DbError::NotFound {
+            entity: "board",
+            id: id.to_string(),
+        })
+    } else {
         Ok(())
     }
 }

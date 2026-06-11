@@ -215,3 +215,59 @@ fn find_healthy_for_selector_filters_by_instance_and_wiring_profile() {
     let rows2 = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel2).unwrap();
     assert!(rows2.is_empty());
 }
+
+#[test]
+fn insert_duplicate_id_returns_already_exists() {
+    let db = fresh_db();
+    let now = chrono::Utc::now().timestamp_millis();
+    BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
+    let err = BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap_err();
+    match err {
+        paavo_db::DbError::AlreadyExists { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "mcxa266-01");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+#[test]
+fn quarantine_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::quarantine(db.raw_conn(), "ghost", "reason").unwrap_err();
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "ghost");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn unquarantine_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::unquarantine(db.raw_conn(), "ghost").unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}
+
+#[test]
+fn touch_last_used_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::touch_last_used(db.raw_conn(), "ghost", 1).unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}
+
+#[test]
+fn bump_infra_failure_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::bump_infra_failure(db.raw_conn(), "ghost").unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}
+
+#[test]
+fn reset_infra_failures_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::reset_infra_failures(db.raw_conn(), "ghost").unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}

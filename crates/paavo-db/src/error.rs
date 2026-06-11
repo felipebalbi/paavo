@@ -5,7 +5,8 @@ use thiserror::Error;
 /// Errors returned by paavo-db operations.
 #[derive(Debug, Error)]
 pub enum DbError {
-    /// Underlying SQLite error.
+    /// Underlying SQLite error (catch-all for low-level rusqlite failures
+    /// we don't yet pattern-match into a typed variant).
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// Migration application failed.
@@ -21,6 +22,24 @@ pub enum DbError {
         column: &'static str,
         /// Value pulled from the row.
         value: String,
+    },
+    /// A typed entity was looked up or mutated by id but did not exist.
+    /// Surfaces to HTTP as `404 Not Found`.
+    #[error("{entity} not found: {id}")]
+    NotFound {
+        /// Logical entity name (e.g. `"board"`, `"job"`).
+        entity: &'static str,
+        /// Id we looked for.
+        id: String,
+    },
+    /// A typed entity was inserted but its primary key already exists.
+    /// Surfaces to HTTP as `409 Conflict`.
+    #[error("{entity} already exists: {id}")]
+    AlreadyExists {
+        /// Logical entity name.
+        entity: &'static str,
+        /// The duplicate id.
+        id: String,
     },
 }
 
