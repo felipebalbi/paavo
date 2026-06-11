@@ -7313,6 +7313,7 @@ Expected: FAIL — `paavod::config::Config` doesn't exist.
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
+use std::str::FromStr;
 
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
@@ -7353,7 +7354,7 @@ pub struct ServerConfig {
 /// `[web]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebConfig {
-    /// `host:port` for the Leptos web UI.
+    /// `host:port` for the read-only web UI (axum + vanilla JS + UnoCSS CDN).
     pub bind: String,
 }
 
@@ -7493,8 +7494,6 @@ impl Config {
         Ok(())
     }
 }
-
-use std::str::FromStr;
 ```
 
 `crates/paavod/src/state_dir.rs`:
@@ -7581,7 +7580,7 @@ path = "src/lib.rs"
 name = "paavod"
 path = "src/main.rs"
 ```
-(Keep the existing dependency block underneath.)
+(Keep the existing dependency block underneath, and add `cron = { workspace = true }` to it — required by `Config::validate`.)
 
 - [ ] **Step 4: Run the config test**
 
