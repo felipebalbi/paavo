@@ -614,11 +614,32 @@ JSON request/response except where noted.
 
 ### 9.4 Board management
 
-- `GET /boards` — current fleet, health, last-used.
-- `POST /boards` — add board (used by `paavo-cli board add`). Validates
-  probe_selector resolves to a connected probe before accepting.
-- `POST /boards/:id/quarantine` — manual quarantine.
-- `POST /boards/:id/unquarantine` — clear quarantine, reset failure counter.
+- `GET /boards` — return the current fleet as a JSON array of `BoardView`
+  objects. Each entry exposes the static board spec (id, kind, probe
+  selector, chip, target, wiring profile, health) plus the operational
+  fields: `quarantine_reason` (Option), `consecutive_infra_failures`
+  (the auto-quarantine counter), `last_used_at` (epoch ms of most
+  recent dispatch, Option), `created_at` (epoch ms of registration).
+  Rows are ordered by `id` ascending so the CLI and web UI render a
+  stable fleet listing.
+- `POST /boards` — add a board (used by `paavo-cli board add`). Body is
+  a `BoardSpec`; the daemon rejects any `health != "healthy"` with
+  `400 Bad Request` because the quarantine flow requires a `reason`,
+  which `BoardSpec` does not carry. Duplicate `id` returns `409
+  Conflict`. (v1 does NOT probe-validate the selector against a
+  physically connected probe — deferred; flagged as a follow-up so
+  ops can register boards out-of-band of probe presence.)
+- `POST /boards/:id/quarantine` — manual quarantine. JSON body
+  `{"reason": "..."}` is required and rejected with `400` if missing
+  or whitespace-only. Unknown id returns `404`.
+- `POST /boards/:id/unquarantine` — clear quarantine and reset the
+  consecutive-infra-failure counter to 0. Unknown id returns `404`.
+- All four endpoints continue to serve while paavod is draining
+  (§6.3 drain semantics gate `POST /jobs` only — operators must be
+  able to quarantine a misbehaving board during shutdown).
+- Error envelope is `text/plain` in v1 — a JSON envelope (`{"error":
+  "...", ...}`) is a planned follow-up; the wire shape on success is
+  already JSON.
 
 ### 9.5 Health
 

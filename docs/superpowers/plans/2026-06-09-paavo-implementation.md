@@ -8121,7 +8121,274 @@ git -C D:\workspace\paavo commit -m "feat(paavod): axum router shell + AppState 
 
 #### 4.2.b: Board management routes
 
-- [ ] **Step 1: Write the failing boards test**
+Spec coverage: §9.4. After the first round of review this sub-task grew
+to also include the supporting work in `paavo-db` (typed `NotFound` /
+`AlreadyExists` variants) and `paavo-proto` (a `BoardView` JSON shape
+that exposes the operational fields §9.4 promises — last-used,
+quarantine reason, etc.). Reasoning: the HTTP handlers can only return
+correct status codes if the DB surfaces typed errors, and the operator
+UI can only render meaningful state if the JSON wire shape includes
+the fields. Both are prerequisites; bundling them keeps the milestone
+atomic.
+
+**Files (this sub-task touches three crates):**
+- Modify: `crates/paavo-db/src/error.rs` (add `NotFound`, `AlreadyExists`)
+- Modify: `crates/paavo-db/src/board.rs` (return typed variants)
+- Test: extend `crates/paavo-db/tests/board_ops.rs`
+- Create: `crates/paavo-proto/src/board.rs` (add `BoardView`)
+- Test: extend `crates/paavo-proto/tests/` (or rely on use sites)
+- Modify: `crates/paavod/src/routes/boards.rs` (real handlers + typed mapping + validation)
+- Modify: `crates/paavod/Cargo.toml` (add `tracing` if not already — it is)
+- Create: `crates/paavod/tests/api_boards.rs`
+
+- [ ] **Step 1: Add typed `NotFound` and `AlreadyExists` variants to `paavo-db`**
+
+Replace `crates/paavo-db/src/error.rs`:
+```rust
+//! Error type for paavo-db.
+
+use thiserror::Error;
+
+/// Errors returned by paavo-db operations.
+#[derive(Debug, Error)]
+pub enum DbError {
+    /// Underlying SQLite error (catch-all for low-level rusqlite failures
+    /// we don't yet pattern-match into a typed variant).
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// Migration application failed.
+    #[error("migration: {0}")]
+    Migration(#[from] refinery::Error),
+    /// JSON column failed to (de)serialize.
+    #[error("json column: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Row found but a CHECK-constrained string value was unrecognized.
+    #[error("unknown enum variant for column {column}: {value}")]
+    UnknownEnum {
+        /// SQL column name.
+        column: &'static str,
+        /// Value pulled from the row.
+        value: String,
+    },
+    /// A typed entity was looked up or mutated by id but did not exist.
+    /// Surfaces to HTTP as `404 Not Found`.
+    #[error("{entity} not found: {id}")]
+    NotFound {
+        /// Logical entity name (e.g. `"board"`, `"job"`).
+        entity: &'static str,
+        /// Id we looked for.
+        id: String,
+    },
+    /// A typed entity was inserted but its primary key already exists.
+    /// Surfaces to HTTP as `409 Conflict`.
+    #[error("{entity} already exists: {id}")]
+    AlreadyExists {
+        /// Logical entity name.
+        entity: &'static str,
+        /// The duplicate id.
+        id: String,
+    },
+}
+
+/// `Result` alias used throughout paavo-db.
+pub type Result<T, E = DbError> = std::result::Result<T, E>;
+```
+
+In `crates/paavo-db/src/board.rs`:
+
+- `BoardRow::insert` must detect `SqliteFailure(code, _)` where
+  `code.code == ErrorCode::ConstraintViolation` and convert to
+  `DbError::AlreadyExists { entity: "board", id: spec.id.clone() }`. Keep
+  every other rusqlite error wrapped in `DbError::Sqlite` (free via `?`).
+- `BoardRow::quarantine` and `BoardRow::unquarantine` must inspect the
+  rows-affected count from `conn.execute(...)`. If zero, return
+  `Err(DbError::NotFound { entity: "board", id: id.to_string() })`.
+- The same treatment for `touch_last_used`, `bump_infra_failure`,
+  `reset_infra_failures` — any single-row mutation that silently no-ops
+  on a missing id is a footgun. Add the check + return `NotFound`.
+
+Concrete pattern (use for all four mutators):
+```rust
+let n = conn.execute("UPDATE board SET … WHERE id = ?1", params![…, id])?;
+if n == 0 {
+    return Err(DbError::NotFound {
+        entity: "board",
+        id: id.to_string(),
+    });
+}
+Ok(())
+```
+
+Concrete pattern for `insert`:
+```rust
+use rusqlite::{Error as RusqliteError, ErrorCode};
+match conn.execute("INSERT INTO board (…) VALUES (…)", params![…]) {
+    Ok(_) => Ok(()),
+    Err(RusqliteError::SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
+        Err(DbError::AlreadyExists {
+            entity: "board",
+            id: spec.id.clone(),
+        })
+    }
+    Err(other) => Err(other.into()),
+}
+```
+
+Extend `crates/paavo-db/tests/board_ops.rs` with:
+
+```rust
+#[test]
+fn insert_duplicate_id_returns_already_exists() {
+    let db = fresh_db();
+    let now = chrono::Utc::now().timestamp_millis();
+    BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
+    let err = BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap_err();
+    match err {
+        paavo_db::DbError::AlreadyExists { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "mcxa266-01");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+#[test]
+fn quarantine_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::quarantine(db.raw_conn(), "ghost", "reason").unwrap_err();
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "ghost");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn unquarantine_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::unquarantine(db.raw_conn(), "ghost").unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}
+
+#[test]
+fn touch_last_used_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::touch_last_used(db.raw_conn(), "ghost", 1).unwrap_err();
+    assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
+}
+```
+
+Run: `cargo test -p paavo-db`. Expected: existing 39 tests still pass plus 4 new ones.
+
+- [ ] **Step 2: Add `BoardView` JSON shape to `paavo-proto`**
+
+Spec §9.4 calls for `GET /boards` to expose "current fleet, health,
+last-used". `BoardSpec` covers the first two but omits operational
+fields (`last_used_at`, `quarantine_reason`, `consecutive_infra_failures`,
+`created_at`). Add a richer view type in `paavo-proto` so paavod and
+paavo-cli can deserialize the same shape.
+
+In `crates/paavo-proto/src/board.rs`, append:
+```rust
+/// JSON shape returned by `GET /boards` and `GET /boards/:id`. Wraps a
+/// `BoardSpec` with the operational fields the spec §9.4 promises:
+/// last-used timestamp, quarantine reason, the infra-failure counter
+/// that drives auto-quarantine, and the registration timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardView {
+    /// Inlined spec fields (`#[serde(flatten)]` so the wire shape is
+    /// flat: `{ "id": ..., "kind": ..., ..., "last_used_at": ..., ... }`).
+    #[serde(flatten)]
+    pub spec: BoardSpec,
+    /// Free-form reason recorded when `spec.health == Quarantined`.
+    /// `None` when the board is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// Counts toward the auto-quarantine threshold
+    /// (`quarantine.consecutive_infra_failures`).
+    pub consecutive_infra_failures: u32,
+    /// Epoch ms of the most recent successful dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    /// Epoch ms when this board was first registered.
+    pub created_at: i64,
+}
+```
+
+(Re-export at `crates/paavo-proto/src/lib.rs`: add `BoardView` to the
+existing `pub use board::{…};` line.)
+
+Round-trip the new shape with a quick test in
+`crates/paavo-proto/tests/board_view.rs`:
+```rust
+use paavo_proto::{BoardHealth, BoardSpec, BoardView, ProbeSelector};
+
+#[test]
+fn board_view_round_trips_through_json() {
+    let view = BoardView {
+        spec: BoardSpec {
+            id: "x".into(),
+            kind: "mcxa266".into(),
+            probe_selector: ProbeSelector {
+                vid: "1366".into(),
+                pid: "1015".into(),
+                serial: "ABC".into(),
+            },
+            chip_name: "X".into(),
+            target_name: "T".into(),
+            wiring_profile: Some("default".into()),
+            health: BoardHealth::Quarantined,
+        },
+        quarantine_reason: Some("flaky".into()),
+        consecutive_infra_failures: 3,
+        last_used_at: Some(42),
+        created_at: 7,
+    };
+    let j = serde_json::to_value(&view).unwrap();
+    // Flatten: `id` is at the top level alongside `quarantine_reason`.
+    assert_eq!(j["id"], "x");
+    assert_eq!(j["quarantine_reason"], "flaky");
+    assert_eq!(j["consecutive_infra_failures"], 3);
+    assert_eq!(j["last_used_at"], 42);
+    assert_eq!(j["created_at"], 7);
+
+    let back: BoardView = serde_json::from_value(j).unwrap();
+    assert_eq!(back, view);
+}
+
+#[test]
+fn board_view_omits_none_quarantine_reason() {
+    let view = BoardView {
+        spec: BoardSpec {
+            id: "x".into(),
+            kind: "mcxa266".into(),
+            probe_selector: ProbeSelector {
+                vid: "1".into(),
+                pid: "2".into(),
+                serial: "S".into(),
+            },
+            chip_name: "X".into(),
+            target_name: "T".into(),
+            wiring_profile: None,
+            health: BoardHealth::Healthy,
+        },
+        quarantine_reason: None,
+        consecutive_infra_failures: 0,
+        last_used_at: None,
+        created_at: 0,
+    };
+    let j = serde_json::to_value(&view).unwrap();
+    assert!(j.get("quarantine_reason").is_none());
+    assert!(j.get("last_used_at").is_none());
+    assert!(j.get("wiring_profile").is_none());
+}
+```
+
+Run: `cargo test -p paavo-proto`. Expected: existing tests pass + 2 new.
+
+- [ ] **Step 3: Write the failing paavod boards test**
 
 `crates/paavod/tests/api_boards.rs`:
 ```rust
@@ -8187,19 +8454,37 @@ fn sample_board_json() -> Value {
     })
 }
 
+async fn post_json(app: axum::Router, uri: &str, body: Value) -> axum::http::Response<axum::body::Body> {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(bytes))
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+async fn post_empty(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+async fn read_json(resp: axum::http::Response<axum::body::Body>) -> Value {
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 #[tokio::test]
-async fn post_boards_then_get_boards() {
+async fn post_boards_then_get_boards_returns_full_view() {
     let s = state();
     let app = build_router(s.clone());
 
-    let body = serde_json::to_vec(&sample_board_json()).unwrap();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/boards")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(body))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
+    let resp = post_json(app.clone(), "/boards", sample_board_json()).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let req = Request::builder()
@@ -8208,50 +8493,108 @@ async fn post_boards_then_get_boards() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
-    let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let v = read_json(resp).await;
     assert_eq!(v.as_array().unwrap().len(), 1);
+    // GET /boards returns BoardView, not BoardSpec. The view exposes
+    // the operational fields §9.4 promises.
     assert_eq!(v[0]["id"], "mcxa266-01");
+    assert_eq!(v[0]["consecutive_infra_failures"], 0);
+    assert!(v[0]["created_at"].as_i64().unwrap() > 0);
+    // No quarantine, so no reason field.
+    assert!(v[0].get("quarantine_reason").is_none());
+    // last_used_at is None on a freshly added board.
+    assert!(v[0].get("last_used_at").is_none());
 
-    // Inventory snapshot should now contain the board.
     let inv = s.inventory_snapshot();
     assert_eq!(inv.len(), 1);
     assert_eq!(inv[0].id, "mcxa266-01");
 }
 
 #[tokio::test]
-async fn post_boards_rejects_duplicate_id() {
-    // Locks in that paavo-db's PK constraint surfaces as a 500. The
-    // exact status can be refined to 409 later, but the test pins that
-    // we don't accept the same board twice silently.
+async fn get_boards_orders_by_id_ascending() {
+    // Locks in the contract that paavo-db's `list_all` ORDER BY id ASC
+    // is preserved through the HTTP layer. paavo-cli renders fleets
+    // in this order.
     let s = state();
     let app = build_router(s.clone());
 
-    let body = serde_json::to_vec(&sample_board_json()).unwrap();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/boards")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(body.clone()))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let mut a = sample_board_json();
+    a["id"] = json!("mcxa266-02");
+    a["probe_selector"]["serial"] = json!("BBB");
+    let mut b = sample_board_json();
+    b["id"] = json!("mcxa266-01");
+    b["probe_selector"]["serial"] = json!("AAA");
+    assert_eq!(post_json(app.clone(), "/boards", a).await.status(), StatusCode::CREATED);
+    assert_eq!(post_json(app.clone(), "/boards", b).await.status(), StatusCode::CREATED);
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/boards")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(body))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_ne!(resp.status(), StatusCode::CREATED);
-    assert!(resp.status().is_server_error() || resp.status().is_client_error());
+    let req = Request::builder().uri("/boards").body(axum::body::Body::empty()).unwrap();
+    let v = read_json(app.oneshot(req).await.unwrap()).await;
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], "mcxa266-01");
+    assert_eq!(arr[1]["id"], "mcxa266-02");
 }
 
 #[tokio::test]
-async fn quarantine_and_unquarantine_flip_health() {
+async fn post_boards_rejects_duplicate_id_with_409() {
     let s = state();
-    // Seed directly via db.
+    let app = build_router(s.clone());
+
+    let resp = post_json(app.clone(), "/boards", sample_board_json()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = post_json(app, "/boards", sample_board_json()).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn post_boards_rejects_non_healthy_with_400() {
+    // §9.4: initial registration must be `Healthy`; the quarantine flow
+    // requires a `reason`. Accepting `health: "quarantined"` here would
+    // let a client create a quarantined board with `quarantine_reason
+    // = NULL`, violating the data invariant.
+    let s = state();
+    let app = build_router(s.clone());
+
+    let mut body = sample_board_json();
+    body["health"] = json!("quarantined");
+    let resp = post_json(app, "/boards", body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn quarantine_unknown_board_returns_404() {
+    let s = state();
+    let app = build_router(s.clone());
+    let resp = post_json(app, "/boards/ghost/quarantine", json!({"reason": "x"})).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unquarantine_unknown_board_returns_404() {
+    let s = state();
+    let app = build_router(s.clone());
+    let resp = post_empty(app, "/boards/ghost/unquarantine").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn quarantine_rejects_empty_reason_with_400() {
+    let s = state();
+    let app = build_router(s.clone());
+    assert_eq!(
+        post_json(app.clone(), "/boards", sample_board_json()).await.status(),
+        StatusCode::CREATED,
+    );
+    let resp = post_json(app, "/boards/mcxa266-01/quarantine", json!({"reason": "   "})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn quarantine_and_unquarantine_flip_health_and_cache() {
+    let s = state();
+    // Seed directly via db so the test pins the cache-refresh contract
+    // independently of `add_board`.
     paavo_db::BoardRow::insert(
         s.db.lock().raw_conn(),
         &BoardSpec {
@@ -8278,91 +8621,99 @@ async fn quarantine_and_unquarantine_flip_health() {
 
     let app = build_router(s.clone());
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/boards/b/quarantine")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::to_vec(&json!({"reason":"x"})).unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
+    let resp = post_json(
+        app.clone(),
+        "/boards/b/quarantine",
+        json!({"reason": "broken header"}),
+    )
+    .await;
     assert_eq!(resp.status(), 204);
-
     let row = paavo_db::BoardRow::get(s.db.lock().raw_conn(), "b").unwrap();
     assert_eq!(row.spec.health, BoardHealth::Quarantined);
-
-    // Inventory cache must reflect the quarantine.
+    assert_eq!(row.quarantine_reason.as_deref(), Some("broken header"));
     assert_eq!(s.inventory_snapshot()[0].health, BoardHealth::Quarantined);
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/boards/b/unquarantine")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = post_empty(app, "/boards/b/unquarantine").await;
     assert_eq!(resp.status(), 204);
     let row = paavo_db::BoardRow::get(s.db.lock().raw_conn(), "b").unwrap();
     assert_eq!(row.spec.health, BoardHealth::Healthy);
-    // And so must the cache.
+    assert!(row.quarantine_reason.is_none());
     assert_eq!(s.inventory_snapshot()[0].health, BoardHealth::Healthy);
 }
 ```
 
-- [ ] **Step 2: Implement board routes**
+- [ ] **Step 4: Implement board routes with typed mapping + validation + atomic refresh**
 
 Replace `crates/paavod/src/routes/boards.rs`:
 ```rust
 //! /boards/* handlers.
 //!
-//! Concurrency note: every write path takes `s.db.lock()` for the
-//! mutation in a scoped block, drops the guard, then calls
-//! `refresh_inventory(&s)` which re-acquires the DB lock to read and
-//! the inventory lock to write. Lock order is always db → inventory;
-//! callers that hold the inventory lock must NOT then ask for the DB
-//! lock. The window between "drop db lock" and "refresh_inventory
-//! reacquires it" is acceptable: at worst we capture a slightly newer
-//! snapshot. There is only one process writing the boards table.
+//! Lock ordering: every mutating handler takes `s.db.lock()` for the
+//! mutation, drops the guard, then calls `refresh_inventory(&s)` which
+//! locks `s.db` and `s.inventory` together (db → inventory) to
+//! atomically read the table and replace the cache. Holding both
+//! together inside `refresh_inventory` means two concurrent writers
+//! cannot interleave their reads/writes and leave a stale snapshot.
+//!
+//! If `refresh_inventory` fails after a successful mutation, the cache
+//! is briefly stale but the DB is the source of truth and the next
+//! successful write (or paavod's startup hydration) will reconverge.
+//! We therefore log + warn on refresh failure but still report the
+//! mutation as successful — never return 500 to a caller whose write
+//! actually committed.
 
 use crate::app_state::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
-use paavo_proto::BoardSpec;
+use paavo_db::DbError;
+use paavo_proto::{BoardHealth, BoardSpec, BoardView};
 use serde::Deserialize;
+use tracing::{error, warn};
 
-/// Shorthand result type for handlers that bubble paavo-db errors back
-/// as 500 + a text/plain message. JSON error envelopes are a future
-/// upgrade (tracked in the 4.2.b retrospective).
+/// Shorthand for handler results. Errors carry an HTTP status + a
+/// stable text/plain message. A richer JSON envelope is a future
+/// upgrade (tracked separately).
 type HandlerResult<T> = Result<T, (StatusCode, String)>;
 
-/// GET /boards.
-pub async fn list_boards(State(s): State<AppState>) -> HandlerResult<Json<Vec<BoardSpec>>> {
-    let rows = paavo_db::BoardRow::list_all(s.db.lock().raw_conn()).map_err(internal)?;
-    let specs: Vec<BoardSpec> = rows.into_iter().map(|r| r.spec).collect();
-    Ok(Json(specs))
+/// GET /boards. Returns `Vec<BoardView>` so callers see the same
+/// operational fields the spec promises (last-used, quarantine reason,
+/// infra-failure counter, created-at).
+pub async fn list_boards(State(s): State<AppState>) -> HandlerResult<Json<Vec<BoardView>>> {
+    let rows = paavo_db::BoardRow::list_all(s.db.lock().raw_conn()).map_err(db_to_http)?;
+    let views: Vec<BoardView> = rows.into_iter().map(row_to_view).collect();
+    Ok(Json(views))
 }
 
-/// POST /boards.
+/// POST /boards. Body is a `BoardSpec`; `health` must be `Healthy` —
+/// quarantine flows through the dedicated endpoint so `quarantine_reason`
+/// can never be `NULL` for a quarantined row.
 pub async fn add_board(
     State(s): State<AppState>,
     Json(spec): Json<BoardSpec>,
 ) -> HandlerResult<StatusCode> {
+    if spec.health != BoardHealth::Healthy {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "board must be registered as `healthy`; use POST \
+             /boards/:id/quarantine to quarantine after creation"
+                .into(),
+        ));
+    }
+    let now_ms = Utc::now().timestamp_millis();
     {
         let db = s.db.lock();
-        paavo_db::BoardRow::insert(db.raw_conn(), &spec, Utc::now().timestamp_millis())
-            .map_err(internal)?;
+        paavo_db::BoardRow::insert(db.raw_conn(), &spec, now_ms).map_err(db_to_http)?;
     }
-    refresh_inventory(&s).map_err(internal)?;
+    refresh_inventory_lossy(&s);
     Ok(StatusCode::CREATED)
 }
 
 /// Body for `POST /boards/:id/quarantine`.
 #[derive(Deserialize)]
 pub struct QuarantineBody {
-    /// Human-readable reason.
+    /// Human-readable reason. Whitespace-only is rejected.
     pub reason: String,
 }
 
@@ -8372,11 +8723,18 @@ pub async fn quarantine_board(
     Path(id): Path<String>,
     Json(body): Json<QuarantineBody>,
 ) -> HandlerResult<StatusCode> {
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`reason` is required and must not be whitespace-only".into(),
+        ));
+    }
     {
         let db = s.db.lock();
-        paavo_db::BoardRow::quarantine(db.raw_conn(), &id, &body.reason).map_err(internal)?;
+        paavo_db::BoardRow::quarantine(db.raw_conn(), &id, reason).map_err(db_to_http)?;
     }
-    refresh_inventory(&s).map_err(internal)?;
+    refresh_inventory_lossy(&s);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8387,44 +8745,82 @@ pub async fn unquarantine_board(
 ) -> HandlerResult<StatusCode> {
     {
         let db = s.db.lock();
-        paavo_db::BoardRow::unquarantine(db.raw_conn(), &id).map_err(internal)?;
+        paavo_db::BoardRow::unquarantine(db.raw_conn(), &id).map_err(db_to_http)?;
     }
-    refresh_inventory(&s).map_err(internal)?;
+    refresh_inventory_lossy(&s);
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Re-read the `boards` table and replace the cached inventory. Must
-/// be called by every handler that mutates boards so the cache never
-/// drifts. `paavod::main` calls this once at startup to hydrate the
-/// initial snapshot.
-pub fn refresh_inventory(s: &AppState) -> paavo_db::Result<()> {
-    let rows = paavo_db::BoardRow::list_all(s.db.lock().raw_conn())?;
-    let specs: Vec<BoardSpec> = rows.into_iter().map(|r| r.spec).collect();
-    *s.inventory.lock() = specs;
+/// Re-read the `boards` table and replace the cached inventory. Takes
+/// both locks (db then inventory) so the read+write is atomic with
+/// respect to other writers. Called by `paavod::main` at startup to
+/// hydrate the initial snapshot — that's why this is `pub(crate)`.
+pub(crate) fn refresh_inventory(s: &AppState) -> paavo_db::Result<()> {
+    let db = s.db.lock();
+    let rows = paavo_db::BoardRow::list_all(db.raw_conn())?;
+    let mut inv = s.inventory.lock();
+    *inv = rows.into_iter().map(|r| r.spec).collect();
     Ok(())
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+/// Refresh the inventory but never fail the caller's request. If the
+/// refresh fails the DB still holds the truth; the cache will
+/// reconverge on the next successful mutation or on paavod restart.
+fn refresh_inventory_lossy(s: &AppState) {
+    if let Err(e) = refresh_inventory(s) {
+        warn!(error = %e, "inventory cache refresh failed; DB is still authoritative");
+    }
 }
 
-// The IntoResponse impl makes a one-line handler signature like
-// `Result<Json<T>, (StatusCode, String)>` viable: axum 0.7 implements
-// IntoResponse for `Result<R, E>` where both `R: IntoResponse` and
-// `E: IntoResponse`, and the tuple `(StatusCode, String)` is itself an
-// IntoResponse. No extra glue needed.
+fn row_to_view(r: paavo_db::BoardRow) -> BoardView {
+    BoardView {
+        spec: r.spec,
+        quarantine_reason: r.quarantine_reason,
+        consecutive_infra_failures: r.consecutive_infra_failures,
+        last_used_at: r.last_used_at,
+        created_at: r.created_at,
+    }
+}
+
+/// Map a `DbError` to an HTTP status + message. Typed variants
+/// (`NotFound`, `AlreadyExists`) get 404/409 with their own messages;
+/// everything else becomes 500 with the `Display` text (info-leak
+/// risk on `Sqlite(...)` is acceptable for an internal lab tool but
+/// we log the full error so it's not silently lost).
+fn db_to_http(err: DbError) -> (StatusCode, String) {
+    match err {
+        DbError::NotFound { entity, id } => (
+            StatusCode::NOT_FOUND,
+            format!("{entity} not found: {id}"),
+        ),
+        DbError::AlreadyExists { entity, id } => (
+            StatusCode::CONFLICT,
+            format!("{entity} already exists: {id}"),
+        ),
+        other => {
+            error!(error = ?other, "unexpected db error");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{other}"))
+        }
+    }
+}
 ```
 
-- [ ] **Step 3: Run the boards test**
+- [ ] **Step 5: Run the boards test**
 
 Run: `cargo test -p paavod --test api_boards`
-Expected: 3 passed (`post_boards_then_get_boards`, `post_boards_rejects_duplicate_id`, `quarantine_and_unquarantine_flip_health`).
+Expected: 8 passed (`post_boards_then_get_boards_returns_full_view`,
+`get_boards_orders_by_id_ascending`, `post_boards_rejects_duplicate_id_with_409`,
+`post_boards_rejects_non_healthy_with_400`, `quarantine_unknown_board_returns_404`,
+`unquarantine_unknown_board_returns_404`, `quarantine_rejects_empty_reason_with_400`,
+`quarantine_and_unquarantine_flip_health_and_cache`).
 
-- [ ] **Step 4: Commit**
+Also: `cargo test --workspace` to make sure nothing else broke.
+
+- [ ] **Step 6: Commit**
 
 ```pwsh
-git -C D:\workspace\paavo add crates/paavod
-git -C D:\workspace\paavo commit -m "feat(paavod): board management routes (list/add/quarantine/unquarantine)"
+git -C D:\workspace\paavo add crates/paavo-db crates/paavo-proto crates/paavod
+git -C D:\workspace\paavo commit -m "feat(paavod): board management routes with typed errors and full view"
 ```
 
 ---
