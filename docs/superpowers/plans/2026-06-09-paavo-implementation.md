@@ -6383,6 +6383,8 @@ git -C D:\workspace\paavo commit -m "test(core): enqueue path — selector + cei
 
 #### 3.2.c: Scheduler priority + LRU + starvation tests
 
+> **Note on the harness:** the test snippets below show per-file `enqueue_at` / `enqueue` helpers for clarity. The actual committed code (and the recommended pattern for 3.2.d/e) uses a single shared helper `common::enqueue_with(db, submitted_at_ms, |req| { ... })` that takes a closure to override fields on `default_enqueue_request("mcxa266")`. See `crates/paavo-core/tests/common/mod.rs` for the signature. The plan code below works either way; prefer the shared helper for new tests.
+
 - [ ] **Step 1: Priority test**
 
 `crates/paavo-core/tests/scheduler_priority.rs`:
