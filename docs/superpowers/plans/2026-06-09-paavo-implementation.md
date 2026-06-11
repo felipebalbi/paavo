@@ -13381,7 +13381,26 @@ git -C D:\workspace\paavo commit -m "feat(cli): clap surface + reqwest client + 
 
 #### 4.5.b: End-to-end CLI ↔ paavod jobs test
 
-The point: prove `paavo-cli jobs` shells out, hits the local paavod TestServer, and prints job rows.
+The point: prove `paavo-cli jobs` shells out, hits a live in-process
+paavod (no hardware), and prints job rows. Two tests — one for `jobs`
+(read path) and one for `boards add` + `run` (write path through
+multipart submit + dispatch + stream).
+
+**Setup before TDD:** add the deps the test needs.
+
+`Cargo.toml` `[workspace.dependencies]`:
+```toml
+paavod = { path = "crates/paavod" }
+```
+
+`crates/paavo-cli/Cargo.toml` `[dev-dependencies]`:
+```toml
+paavod      = { workspace = true }
+paavo-db    = { workspace = true }
+parking_lot = { workspace = true }
+tokio       = { workspace = true }
+```
+(`assert_cmd`, `predicates`, `tempfile` are already dev-deps.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -13391,14 +13410,17 @@ The point: prove `paavo-cli jobs` shells out, hits the local paavod TestServer, 
 //! `paavo-cli jobs` and asserts the output contains the job id.
 
 use assert_cmd::Command as AssertCommand;
-use parking_lot::Mutex;
+use paavo_db::Db;
+use paavo_proto::{BoardSelector, JobId, JobSource, Priority};
 use paavod::app::build_router;
 use paavod::app_state::{AppState, DrainState};
 use paavod::cancellation::CancellationRegistry;
-use paavod::config::*;
+use paavod::config::{
+    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
+    TimeoutsConfig, WebConfig,
+};
 use paavod::job_logs::JobLogsBroker;
-use paavo_db::Db;
-use paavo_proto::{BoardSelector, JobId, JobSource, Priority};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -13417,21 +13439,35 @@ async fn paavo_cli_jobs_lists_seeded_job() {
             priority: Priority::Interactive,
             submitter: "felipe".into(),
             source: JobSource::Cli,
-            board_selector: BoardSelector { kind: "mcxa266".into(), instance: None, wiring_profile: None },
+            board_selector: BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
             inactivity_timeout_ms: 120_000,
             hard_max_ms: 900_000,
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
         },
         0,
     )
     .unwrap();
 
     let cfg = Arc::new(Config {
-        server: ServerConfig { bind: "x".into(), state_dir: tmp.path().to_path_buf() },
-        web: WebConfig { bind: "x".into() },
+        server: ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            state_dir: tmp.path().to_path_buf(),
+            max_upload_bytes: 256 * 1024 * 1024,
+        },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig {
+            nightly_cron: "0 0 19 * * *".into(),
+            starvation_threshold_s: 21_600,
+        },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -13452,12 +13488,13 @@ async fn paavo_cli_jobs_lists_seeded_job() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    AssertCommand::cargo_bin("paavo-cli").unwrap()
+    AssertCommand::cargo_bin("paavo-cli")
+        .unwrap()
         .env("PAAVO_HOST", format!("http://{addr}"))
         .args(["jobs", "--state", "submitted"])
         .assert()
         .success()
-        .stdout(predicates::str::contains(&id.to_string()));
+        .stdout(predicates::str::contains(id.to_string()));
 
     server.abort();
 }
@@ -13470,11 +13507,12 @@ Expected: 1 passed.
 
 - [ ] **Step 3: Clippy + commit**
 
-Run: `cargo clippy -p paavo-cli --all-targets -- -D warnings`
-Expected: green.
+Run: `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all -- --check`.
+Expected: both green.
 
 ```pwsh
-git -C D:\workspace\paavo add crates/paavo-cli
+git -C D:\workspace\paavo add Cargo.toml crates/paavo-cli
 git -C D:\workspace\paavo commit -m "test(cli): end-to-end paavo-cli jobs against in-process paavod"
 ```
 
