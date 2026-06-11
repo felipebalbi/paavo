@@ -8127,26 +8127,41 @@ git -C D:\workspace\paavo commit -m "feat(paavod): axum router shell + AppState 
 ```rust
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
-use parking_lot::Mutex;
-use paavod::app::build_router;
-use paavod::app_state::{AppState, DrainState};
-use paavod::config::*;
 use paavo_db::Db;
 use paavo_proto::{BoardHealth, BoardSpec, ProbeSelector};
+use paavod::app::build_router;
+use paavod::app_state::{AppState, DrainState};
+use paavod::config::{
+    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
+    TimeoutsConfig, WebConfig,
+};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn state() -> AppState {
+    // Cross-platform: derive every path from the same tempdir; leak the
+    // dir per the workspace convention in
+    // `crates/paavo-core/tests/common/mod.rs::fresh_db`.
     let dir = tempdir().unwrap();
-    let db = Db::open(dir.path().join("paavo.sqlite")).unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let db = Db::open(state_dir.join("paavo.sqlite")).unwrap();
     std::mem::forget(dir);
     let cfg = Config {
-        server: ServerConfig { bind: "x".into(), state_dir: "x".into() },
-        web: WebConfig { bind: "x".into() },
+        server: ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            state_dir,
+        },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig {
+            nightly_cron: "0 0 19 * * *".into(),
+            starvation_threshold_s: 21_600,
+        },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -8160,7 +8175,7 @@ fn state() -> AppState {
     }
 }
 
-fn sample_board_json() -> serde_json::Value {
+fn sample_board_json() -> Value {
     json!({
         "id": "mcxa266-01",
         "kind": "mcxa266",
@@ -8205,15 +8220,48 @@ async fn post_boards_then_get_boards() {
 }
 
 #[tokio::test]
+async fn post_boards_rejects_duplicate_id() {
+    // Locks in that paavo-db's PK constraint surfaces as a 500. The
+    // exact status can be refined to 409 later, but the test pins that
+    // we don't accept the same board twice silently.
+    let s = state();
+    let app = build_router(s.clone());
+
+    let body = serde_json::to_vec(&sample_board_json()).unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/boards")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/boards")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::CREATED);
+    assert!(resp.status().is_server_error() || resp.status().is_client_error());
+}
+
+#[tokio::test]
 async fn quarantine_and_unquarantine_flip_health() {
     let s = state();
     // Seed directly via db.
     paavo_db::BoardRow::insert(
-        &s.db.lock().raw_conn(),
+        s.db.lock().raw_conn(),
         &BoardSpec {
             id: "b".into(),
             kind: "mcxa266".into(),
-            probe_selector: ProbeSelector { vid: "x".into(), pid: "x".into(), serial: "x".into() },
+            probe_selector: ProbeSelector {
+                vid: "x".into(),
+                pid: "x".into(),
+                serial: "x".into(),
+            },
             chip_name: "x".into(),
             target_name: "x".into(),
             wiring_profile: None,
@@ -8222,7 +8270,7 @@ async fn quarantine_and_unquarantine_flip_health() {
         0,
     )
     .unwrap();
-    *s.inventory.lock() = paavo_db::BoardRow::list_all(&s.db.lock().raw_conn())
+    *s.inventory.lock() = paavo_db::BoardRow::list_all(s.db.lock().raw_conn())
         .unwrap()
         .into_iter()
         .map(|r| r.spec)
@@ -8234,13 +8282,18 @@ async fn quarantine_and_unquarantine_flip_health() {
         .method("POST")
         .uri("/boards/b/quarantine")
         .header("content-type", "application/json")
-        .body(axum::body::Body::from(serde_json::to_vec(&json!({"reason":"x"})).unwrap()))
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&json!({"reason":"x"})).unwrap(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 204);
 
-    let row = paavo_db::BoardRow::get(&s.db.lock().raw_conn(), "b").unwrap();
+    let row = paavo_db::BoardRow::get(s.db.lock().raw_conn(), "b").unwrap();
     assert_eq!(row.spec.health, BoardHealth::Quarantined);
+
+    // Inventory cache must reflect the quarantine.
+    assert_eq!(s.inventory_snapshot()[0].health, BoardHealth::Quarantined);
 
     let req = Request::builder()
         .method("POST")
@@ -8249,8 +8302,10 @@ async fn quarantine_and_unquarantine_flip_health() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 204);
-    let row = paavo_db::BoardRow::get(&s.db.lock().raw_conn(), "b").unwrap();
+    let row = paavo_db::BoardRow::get(s.db.lock().raw_conn(), "b").unwrap();
     assert_eq!(row.spec.health, BoardHealth::Healthy);
+    // And so must the cache.
+    assert_eq!(s.inventory_snapshot()[0].health, BoardHealth::Healthy);
 }
 ```
 
@@ -8259,6 +8314,15 @@ async fn quarantine_and_unquarantine_flip_health() {
 Replace `crates/paavod/src/routes/boards.rs`:
 ```rust
 //! /boards/* handlers.
+//!
+//! Concurrency note: every write path takes `s.db.lock()` for the
+//! mutation in a scoped block, drops the guard, then calls
+//! `refresh_inventory(&s)` which re-acquires the DB lock to read and
+//! the inventory lock to write. Lock order is always db → inventory;
+//! callers that hold the inventory lock must NOT then ask for the DB
+//! lock. The window between "drop db lock" and "refresh_inventory
+//! reacquires it" is acceptable: at worst we capture a slightly newer
+//! snapshot. There is only one process writing the boards table.
 
 use crate::app_state::AppState;
 use axum::extract::{Path, State};
@@ -8269,75 +8333,92 @@ use chrono::Utc;
 use paavo_proto::BoardSpec;
 use serde::Deserialize;
 
+/// Shorthand result type for handlers that bubble paavo-db errors back
+/// as 500 + a text/plain message. JSON error envelopes are a future
+/// upgrade (tracked in the 4.2.b retrospective).
+type HandlerResult<T> = Result<T, (StatusCode, String)>;
+
 /// GET /boards.
-pub async fn list_boards(State(s): State<AppState>) -> impl IntoResponse {
-    let rows = paavo_db::BoardRow::list_all(&s.db.lock().raw_conn()).map_err(internal)?;
-    let body: Vec<BoardSpec> = rows.into_iter().map(|r| r.spec).collect();
-    Ok::<_, (StatusCode, String)>(Json(body))
+pub async fn list_boards(State(s): State<AppState>) -> HandlerResult<Json<Vec<BoardSpec>>> {
+    let rows = paavo_db::BoardRow::list_all(s.db.lock().raw_conn()).map_err(internal)?;
+    let specs: Vec<BoardSpec> = rows.into_iter().map(|r| r.spec).collect();
+    Ok(Json(specs))
 }
 
 /// POST /boards.
 pub async fn add_board(
     State(s): State<AppState>,
     Json(spec): Json<BoardSpec>,
-) -> impl IntoResponse {
+) -> HandlerResult<StatusCode> {
     {
         let db = s.db.lock();
         paavo_db::BoardRow::insert(db.raw_conn(), &spec, Utc::now().timestamp_millis())
             .map_err(internal)?;
     }
     refresh_inventory(&s).map_err(internal)?;
-    Ok::<_, (StatusCode, String)>(StatusCode::CREATED)
+    Ok(StatusCode::CREATED)
 }
 
-/// POST /boards/:id/quarantine.
+/// Body for `POST /boards/:id/quarantine`.
 #[derive(Deserialize)]
 pub struct QuarantineBody {
     /// Human-readable reason.
     pub reason: String,
 }
 
+/// POST /boards/:id/quarantine.
 pub async fn quarantine_board(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<QuarantineBody>,
-) -> impl IntoResponse {
+) -> HandlerResult<StatusCode> {
     {
         let db = s.db.lock();
         paavo_db::BoardRow::quarantine(db.raw_conn(), &id, &body.reason).map_err(internal)?;
     }
     refresh_inventory(&s).map_err(internal)?;
-    Ok::<_, (StatusCode, String)>(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /boards/:id/unquarantine.
 pub async fn unquarantine_board(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+) -> HandlerResult<StatusCode> {
     {
         let db = s.db.lock();
         paavo_db::BoardRow::unquarantine(db.raw_conn(), &id).map_err(internal)?;
     }
     refresh_inventory(&s).map_err(internal)?;
-    Ok::<_, (StatusCode, String)>(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }
 
-fn refresh_inventory(s: &AppState) -> paavo_db::Result<()> {
-    let rows = paavo_db::BoardRow::list_all(&s.db.lock().raw_conn())?;
-    *s.inventory.lock() = rows.into_iter().map(|r| r.spec).collect();
+/// Re-read the `boards` table and replace the cached inventory. Must
+/// be called by every handler that mutates boards so the cache never
+/// drifts. `paavod::main` calls this once at startup to hydrate the
+/// initial snapshot.
+pub fn refresh_inventory(s: &AppState) -> paavo_db::Result<()> {
+    let rows = paavo_db::BoardRow::list_all(s.db.lock().raw_conn())?;
+    let specs: Vec<BoardSpec> = rows.into_iter().map(|r| r.spec).collect();
+    *s.inventory.lock() = specs;
     Ok(())
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
 }
+
+// The IntoResponse impl makes a one-line handler signature like
+// `Result<Json<T>, (StatusCode, String)>` viable: axum 0.7 implements
+// IntoResponse for `Result<R, E>` where both `R: IntoResponse` and
+// `E: IntoResponse`, and the tuple `(StatusCode, String)` is itself an
+// IntoResponse. No extra glue needed.
 ```
 
 - [ ] **Step 3: Run the boards test**
 
 Run: `cargo test -p paavod --test api_boards`
-Expected: 2 passed.
+Expected: 3 passed (`post_boards_then_get_boards`, `post_boards_rejects_duplicate_id`, `quarantine_and_unquarantine_flip_health`).
 
 - [ ] **Step 4: Commit**
 
