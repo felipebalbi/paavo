@@ -59,6 +59,11 @@ pub struct AppState {
     /// while a job is Building or Running. See
     /// `crate::job_logs::JobLogsBroker`.
     pub job_logs: crate::job_logs::JobLogsBroker,
+    /// Per-job cancel-signal registry; the dispatch loop registers
+    /// at job start, the cancel handler signals through it for
+    /// `Building` / `Running` jobs, and `paavod::main` calls
+    /// `signal_all(DaemonShutdown)` during SIGTERM drain.
+    pub cancellation: crate::cancellation::CancellationRegistry,
 }
 
 impl AppState {

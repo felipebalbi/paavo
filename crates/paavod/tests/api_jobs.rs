@@ -62,6 +62,7 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
         inventory: Arc::new(Mutex::new(inv)),
         drain: DrainState::default(),
         job_logs: paavod::job_logs::JobLogsBroker::new(),
+        cancellation: paavod::cancellation::CancellationRegistry::default(),
     }
 }
 
@@ -575,7 +576,8 @@ async fn cancel_job_rejects_invalid_id_with_400() {
 async fn cancel_terminal_job_returns_409() {
     // Pins spec §5.4: terminal jobs are not cancellable. First cancel
     // succeeds (Submitted → Aborted), second returns 409 because the
-    // row is already terminal.
+    // row is already terminal AND the cancellation registry has no
+    // entry to signal (so the registry-fallback path also fails).
     let tmp = tempdir().unwrap();
     let s = state(tmp.path());
     let id = paavo_proto::JobId::new();
@@ -1023,4 +1025,88 @@ async fn stream_pages_historical_above_chunk_size() {
     assert_eq!(last_frame["frame"]["message"], "frame-1499");
     let term: Value = serde_json::from_str(lines[1500]).unwrap();
     assert_eq!(term["type"], "terminal");
+}
+
+#[tokio::test]
+async fn cancel_running_job_with_registered_signal_returns_204() {
+    use crossbeam_channel::unbounded;
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1).unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let (tx, rx) = unbounded::<paavo_runner::RunCommand>();
+    s.cancellation.register(id, tx);
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(rx.recv().unwrap(), paavo_runner::RunCommand::Cancel);
+}
+
+#[tokio::test]
+async fn cancel_running_job_without_registered_signal_returns_409() {
+    // Job is Running in the DB but the registry has no sender (worker
+    // died, registry entry already unregistered, dispatch loop not
+    // running yet, etc.). The cancel handler falls through to 409.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1).unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 409);
 }

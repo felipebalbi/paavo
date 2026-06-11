@@ -20,6 +20,8 @@ paavo-proto = { workspace = true }
 paavo-db    = { workspace = true }
 paavo-core  = { workspace = true }
 paavo-build = { workspace = true }
+paavo-runner = { workspace = true }
+crossbeam-channel = { workspace = true }
 axum        = { workspace = true }
 tokio       = { workspace = true }
 tower       = { workspace = true }

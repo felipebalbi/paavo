@@ -395,11 +395,23 @@ pub async fn cancel_job(
     };
     match res {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(paavo_core::CoreError::NotCancellable { state }) => (
-            StatusCode::CONFLICT,
-            format!("not cancellable in state {state:?}"),
-        )
-            .into_response(),
+        Err(paavo_core::CoreError::NotCancellable { state }) => {
+            // Building / Running: try to deliver a Cancel signal to the
+            // worker via the registry. If a live sender exists the
+            // worker takes care of the transition (per §5.4); 204.
+            // Otherwise (terminal row, worker already exited, dispatch
+            // loop not running) the registry has nothing to signal and
+            // we return 409 — "not cancellable in state X".
+            if s.cancellation.signal(&id, paavo_runner::RunCommand::Cancel) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    format!("not cancellable in state {state:?}"),
+                )
+                    .into_response()
+            }
+        }
         Err(paavo_core::CoreError::Db(paavo_db::DbError::NotFound { .. })) => {
             (StatusCode::NOT_FOUND, "no such job").into_response()
         }
