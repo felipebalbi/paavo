@@ -19,6 +19,7 @@ path = "src/main.rs"
 paavo-proto = { workspace = true }
 paavo-db    = { workspace = true }
 paavo-core  = { workspace = true }
+paavo-build = { workspace = true }
 axum        = { workspace = true }
 tokio       = { workspace = true }
 tower       = { workspace = true }
@@ -37,6 +38,7 @@ chrono      = { workspace = true }
 futures     = { workspace = true }
 bytes       = { workspace = true }
 parking_lot = { workspace = true }
+blake3      = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }

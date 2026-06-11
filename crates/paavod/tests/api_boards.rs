@@ -26,6 +26,7 @@ fn state() -> AppState {
         server: ServerConfig {
             bind: "127.0.0.1:0".into(),
             state_dir,
+            max_upload_bytes: 256 * 1024 * 1024,
         },
         web: WebConfig {
             bind: "127.0.0.1:0".into(),

@@ -39,6 +39,14 @@ pub struct ServerConfig {
     pub bind: String,
     /// Daemon state dir (sandboxes, sqlite, build cache, etc.).
     pub state_dir: std::path::PathBuf,
+    /// Per-request multipart body cap for `POST /jobs` (bytes).
+    /// Default 256 MiB. Raise for fleets with large vendored deps.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: usize,
+}
+
+fn default_max_upload_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 /// `[web]`.

@@ -21,7 +21,7 @@ mod selector;
 
 pub use build_cache::{cache_lookup, cache_store, evict_lru, CacheLookup};
 pub use cancel::cancel_if_submitted;
-pub use enqueue::{enqueue_job, EnqueueRequest};
+pub use enqueue::{enqueue_job, validate_enqueue, EnqueueRequest};
 pub use error::{CoreError, Result};
 pub use quarantine::{apply_outcome_to_board, auto_quarantine_reason, QuarantinePolicy};
 pub use runner::{RunOutcome, Runner};

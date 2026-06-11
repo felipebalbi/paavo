@@ -26,6 +26,7 @@ fn make_state() -> AppState {
         server: ServerConfig {
             bind: "127.0.0.1:0".into(),
             state_dir,
+            max_upload_bytes: 256 * 1024 * 1024,
         },
         web: WebConfig {
             bind: "127.0.0.1:0".into(),
@@ -102,42 +103,4 @@ async fn ready_flips_to_503_when_draining() {
     assert_eq!(status, 503);
     assert_eq!(body["service"], "paavod");
     assert_eq!(body["ready"], false);
-}
-
-#[tokio::test]
-async fn post_jobs_returns_503_while_draining() {
-    // Spec §6.3: drain returns 503 for new jobs. The stub locks this
-    // in so the invariant survives until M4.2.b fills the real handler.
-    let state = make_state();
-    state.drain.set_draining();
-    let app = build_router(state);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/jobs")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-}
-
-#[tokio::test]
-async fn post_jobs_returns_501_when_not_draining() {
-    // While not draining the stub returns 501 — locks in that the
-    // drain check doesn't accidentally short-circuit the no-drain path.
-    let app = build_router(make_state());
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/jobs")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 501);
 }

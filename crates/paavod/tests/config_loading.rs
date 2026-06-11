@@ -143,3 +143,23 @@ fn malformed_toml_error_mentions_paavo_toml() {
         "error should mention the file or `parsing`: {msg}"
     );
 }
+
+#[test]
+fn server_max_upload_bytes_defaults_to_256_mib() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("paavo.toml");
+    // SAMPLE omits `max_upload_bytes` — default must apply.
+    fs::write(&p, SAMPLE).unwrap();
+    let cfg = Config::load(&p).unwrap();
+    assert_eq!(cfg.server.max_upload_bytes, 256 * 1024 * 1024);
+}
+
+#[test]
+fn server_max_upload_bytes_can_be_overridden() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("paavo.toml");
+    let toml = SAMPLE.replace("[web]", "max_upload_bytes = 1048576\n\n[web]");
+    fs::write(&p, toml).unwrap();
+    let cfg = Config::load(&p).unwrap();
+    assert_eq!(cfg.server.max_upload_bytes, 1_048_576);
+}

@@ -32,6 +32,25 @@ pub struct EnqueueRequest {
     pub daemon_ceiling_ms: u64,
 }
 
+/// Pre-validate the parts of an enqueue request that do NOT require
+/// touching the DB. Used by the HTTP layer to fail fast BEFORE
+/// persisting the uploaded tar so rejected submits leave no orphan
+/// files on disk. `enqueue_job` re-runs the same checks under the DB
+/// lock for the authoritative decision; this helper is purely an
+/// optimization for the rejection path.
+pub fn validate_enqueue(req: &EnqueueRequest, inventory: &[BoardSpec]) -> Result<()> {
+    if req.hard_max_ms > req.daemon_ceiling_ms {
+        return Err(CoreError::OverCeiling {
+            requested: req.hard_max_ms,
+            ceiling: req.daemon_ceiling_ms,
+        });
+    }
+    if !selector_matches_any(&req.board_selector, inventory) {
+        return Err(CoreError::SelectorNeverMatches(req.board_selector.clone()));
+    }
+    Ok(())
+}
+
 /// Validate + persist a new job. `now_ms` is the wall-clock instant
 /// recorded as the job's `submitted_at` — production passes
 /// `Utc::now().timestamp_millis()`, tests inject deterministic values.
@@ -41,15 +60,7 @@ pub fn enqueue_job(
     req: EnqueueRequest,
     now_ms: i64,
 ) -> Result<JobId> {
-    if req.hard_max_ms > req.daemon_ceiling_ms {
-        return Err(CoreError::OverCeiling {
-            requested: req.hard_max_ms,
-            ceiling: req.daemon_ceiling_ms,
-        });
-    }
-    if !selector_matches_any(&req.board_selector, inventory) {
-        return Err(CoreError::SelectorNeverMatches(req.board_selector));
-    }
+    validate_enqueue(&req, inventory)?;
     let new = paavo_db::NewJob {
         id: req.job_id,
         priority: req.priority,

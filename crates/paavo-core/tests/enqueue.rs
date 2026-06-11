@@ -138,3 +138,27 @@ fn rejects_selector_with_mismatched_wiring_profile() {
         "{err}"
     );
 }
+
+#[test]
+fn validate_enqueue_rejects_over_ceiling_without_db() {
+    // Pure no-DB check — the HTTP layer calls this BEFORE persisting
+    // the tar so over-ceiling submits leave no orphan files.
+    let mut req = default_enqueue_request("mcxa266");
+    req.hard_max_ms = req.daemon_ceiling_ms + 1;
+    // Inventory contains the board so the selector check would pass —
+    // we want to prove the ceiling check fires independently.
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+    let inventory = list_inventory_specs(&db);
+    let err = paavo_core::validate_enqueue(&req, &inventory).unwrap_err();
+    assert!(matches!(err, CoreError::OverCeiling { .. }), "{err}");
+}
+
+#[test]
+fn validate_enqueue_rejects_unmatched_selector_without_db() {
+    // Empty inventory — selector cannot match anything.
+    let req = default_enqueue_request("mcxa266");
+    let inventory: Vec<paavo_proto::BoardSpec> = vec![];
+    let err = paavo_core::validate_enqueue(&req, &inventory).unwrap_err();
+    assert!(matches!(err, CoreError::SelectorNeverMatches(_)), "{err}");
+}
