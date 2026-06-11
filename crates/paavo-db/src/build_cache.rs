@@ -104,6 +104,16 @@ impl BuildCacheEntry {
         Ok(BuildCacheStats { total_bytes, count })
     }
 
+    /// Delete a single cache entry by tar_blake3. No-op if no row matches.
+    /// Returns `Ok(true)` if a row was deleted, `Ok(false)` if not.
+    pub fn delete(conn: &Connection, tar_blake3: &str) -> Result<bool> {
+        let n = conn.execute(
+            "DELETE FROM build_cache WHERE tar_blake3 = ?1",
+            rusqlite::params![tar_blake3],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Drop the least-recently-used entries until total bytes ≤ `max_bytes`,
     /// returning the evicted entries in eviction order (oldest first).
     ///

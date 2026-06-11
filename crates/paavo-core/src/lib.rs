@@ -10,6 +10,7 @@
 /// Crate name, used by a smoke doctest.
 pub const CRATE_NAME: &str = "paavo-core";
 
+mod build_cache;
 mod cancel;
 mod enqueue;
 mod error;
@@ -18,6 +19,7 @@ mod runner;
 mod scheduler;
 mod selector;
 
+pub use build_cache::{cache_lookup, cache_store, evict_lru, CacheLookup};
 pub use cancel::cancel_if_submitted;
 pub use enqueue::{enqueue_job, EnqueueRequest};
 pub use error::{CoreError, Result};

@@ -11,6 +11,10 @@ pub enum CoreError {
     /// paavo-build error.
     #[error("build: {0}")]
     Build(#[from] paavo_build::BuildError),
+    /// I/O failure outside paavo-build (e.g. stat'ing an ELF file in the
+    /// build-cache helpers).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     /// Selector matched no possible board in the inventory (per spec §5.5,
     /// rejected at enqueue time, not silently queued).
     #[error("selector matches no board in inventory: {0:?}")]
