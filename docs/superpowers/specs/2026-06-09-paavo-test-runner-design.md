@@ -634,22 +634,38 @@ JSON request/response except where noted.
 `GET /jobs/:id/stream`
 
 - Long-lived NDJSON response (`Content-Type: application/x-ndjson`).
-  Each line is one JSON object, parseable independently. Three line
+  Each line is one JSON object, parseable independently. Four line
   types:
   - `{"type":"frame","frame":{<LogFrame>}}` — one log frame. `frame.seq`
     is monotonic per job; clients can dedup if the historical/live
     boundary races.
-  - `{"type":"terminal","outcome":{<JobOutcome>}}` — exactly once,
-    immediately before the stream closes.
+  - `{"type":"terminal","outcome":{<JobOutcome>}}` — exactly once on
+    the happy path, immediately before the stream closes.
   - `{"type":"lagged","missed":<u64>}` — informational: the live
     broadcast channel dropped `missed` frames because the client
     couldn't keep up. Client should re-fetch from the historical
     endpoint to recover. (`broadcast::RecvError::Lagged` surfaces here.)
+  - `{"type":"truncated","reason":"..."}` — degraded close marker.
+    Emitted when the stream ends without a `terminal` line (worker
+    died without finalizing, lagged eviction ate the Terminal event,
+    or DB error while paging historical frames). The client should
+    treat this as an unknown-outcome close and re-query via
+    `GET /jobs/:id` for the authoritative state.
+- The "full historical log" is delivered in 1000-frame pages — there
+  is no v1 cap. A DB error while paging surfaces as a `truncated`
+  line, not a silent empty body.
 - If the job is already terminal when the call arrives the response is
-  the full historical log followed by the terminal line, then closes.
-- 400 if `:id` is not a valid ULID. 404 if no such job. Otherwise 200.
+  the historical pages followed by the terminal line, then closes.
+- 400 if `:id` is not a valid ULID. 404 if no such job. 500 if the
+  DB has terminal state with NULL outcome (corrupted row). Otherwise
+  200.
 - Serves during drain (operators monitoring shutdown need access to
   the live log of an in-flight job).
+- Lifecycle: the handler reads the row FIRST and only subscribes to
+  the live broker if the job exists AND is non-terminal. This
+  prevents an unauthenticated DoS where `GET /jobs/<random-ulid>/stream`
+  in a loop would otherwise materialize one broker entry per request
+  and never reclaim it.
 
 ### 9.3 Job query
 

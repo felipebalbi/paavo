@@ -10571,6 +10571,58 @@ git -C D:\workspace\paavo add crates/paavod Cargo.toml Cargo.lock
 git -C D:\workspace\paavo commit -m "feat(paavod): /jobs/:id/stream NDJSON live + historical log stream"
 ```
 
+**Round 2 amendments** (from spec + quality review of the as-shipped
+implementation):
+
+1. **No Sender leak on unknown-id / terminal-job paths.** The plan's
+   "subscribe FIRST" ordering is correct for the read-side race but
+   leaks one broker entry per `GET /jobs/<random-ulid>/stream`
+   request (Sender materialized via `entry().or_insert_with`, never
+   reclaimed because the worker doesn't come back to call
+   `finalize()`). Remote DoS vector. **Fix:** read the row FIRST.
+   Only subscribe if the job exists AND is non-terminal. Re-check the
+   row after subscribe to catch the narrow race; if the re-check
+   shows terminal, drop `rx` and `finalize(id)` before returning.
+   Two new tests pin the invariant via `broker.active_channels()`.
+
+2. **Defensive close on lost-Terminal.** The plan's live loop closes
+   silently if rx ends without a Terminal event (worker bug; or
+   `Lagged` evicted the Terminal before our subscriber read it).
+   Spec §9.2 requires exactly one terminal line. **Fix:** when the
+   live loop falls through without `saw_terminal`, re-read the row.
+   If terminal in DB, emit `terminal` from the persisted outcome.
+   Else emit a fourth line type `{"type":"truncated","reason":"..."}`
+   so the client knows the stream ended unexpectedly.
+
+3. **Page historical in chunks (no 10 000 cap).** Hard-coded
+   `LogFrame::list(..., 0, 10_000)` silently truncates jobs with
+   more than 10k frames. **Fix:** page in 1000-frame chunks via a
+   loop until the page returns fewer than the page size, streaming
+   each chunk as NDJSON lines. New test pins that 1500 frames all
+   make it through.
+
+4. **Surface DB errors instead of `unwrap_or_default()`.** The plan
+   silently swallowed `LogFrame::list` errors. **Fix:** the paging
+   loop logs + emits a `truncated` line on Err so the client never
+   receives a silent empty body for a corrupted DB.
+
+5. **Reject `terminal + NULL outcome` as 500.** Plan fabricated
+   `Aborted{by:User}`, which is a lie about persisted state. **Fix:**
+   when `is_terminal()` but `outcome` is None, log + return 500.
+   New test forces this state via direct SQL UPDATE and pins the
+   500.
+
+6. **Spec §9.2 amended** to document the fourth `truncated` line
+   type and the historical paging contract (no truncation; client
+   may observe `truncated` markers in degraded paths).
+
+7. **Live test no longer flaky.** Replaces fixed `tokio::time::sleep`
+   with a poll on `broker.active_channels()` so the publisher waits
+   for the handler to subscribe before publishing.
+
+Final shipped count: paavod tests api_jobs 32 (28 + 4 round-2), api_health 4,
+api_boards 8, config_loading 8, job_logs 3.
+
 ---
 
 ### Task 4.3: paavod — worker pool + dispatch loop + nightly cron + SIGTERM drain
