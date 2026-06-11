@@ -12059,48 +12059,315 @@ across the workspace updated to include `cargo_update_packages: vec![]`.
 
 #### 4.3.d: SIGTERM drain
 
+Splits into two pieces so the drain logic is testable without
+actually delivering a signal:
+- `wait_for_signal()` — async fn that completes on SIGTERM/Ctrl-C.
+  Wired by `paavod::main` (M4.4).
+- `drain_with_grace(state, cron, grace)` — owns the drain sequence:
+  flip the drain flag, poll until every in-flight worker is gone
+  (early-exit), if grace expires force `DaemonShutdown` to all
+  remaining workers, then shut the cron scheduler down. Pure async
+  logic — directly testable.
+
 - [ ] **Step 1: Implement**
 
 `crates/paavod/src/shutdown.rs`:
 ```rust
-//! SIGTERM drain: flip `drain` flag, signal all running jobs with
-//! `DaemonShutdown` after the grace period, return when dispatch loop and
-//! cron have stopped.
+//! SIGTERM drain. Two pieces:
+//!
+//! 1. `wait_for_signal()` — async; resolves on SIGTERM (unix) or
+//!    Ctrl-C (any platform). Wired into `paavod::main`'s
+//!    `axum::serve(...).with_graceful_shutdown(...)` call.
+//! 2. `drain_with_grace(state, cron, grace)` — pure async logic
+//!    that:
+//!    a. flips `state.drain`. From this point: `POST /jobs` returns
+//!       503, the dispatch loop stops picking new work, the cron's
+//!       per-fire body short-circuits.
+//!    b. polls `state.cancellation.active()` every 100ms; if it hits
+//!       0 inside `grace`, return early (clean shutdown).
+//!    c. if `grace` expires with workers still in flight, call
+//!       `state.cancellation.signal_all(RunCommand::DaemonShutdown)`
+//!       so the watchdog inside each worker can convert to
+//!       `Aborted{DaemonShutdown}` (spec §5.4).
+//!    d. await `cron.shutdown()` so the scheduler task stops.
+//!
+//! The second piece is what tests exercise directly — signal delivery
+//! itself is platform-specific (`tokio::signal::unix::SignalKind`) and
+//! awkward to integration-test reliably.
 
 use crate::app_state::AppState;
+use crate::cron::CronHandle;
 use paavo_runner::RunCommand;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
-/// Run shutdown drain. Caller obtains the future and awaits it during
-/// `axum::serve(...).with_graceful_shutdown(future)`.
-pub async fn await_signal_then_drain(state: AppState) {
-    wait_for_signal().await;
-    tracing::info!("drain: SIGTERM/Ctrl-C received");
+/// Await SIGTERM (unix) or Ctrl-C (any platform). Returns when the
+/// first such signal arrives.
+pub async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "drain: failed to install SIGTERM handler; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "drain: failed to install SIGINT handler; falling back to SIGTERM only");
+                let _ = term.recv().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => tracing::info!("drain: SIGTERM received"),
+            _ = int.recv() => tracing::info!("drain: SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::info!("drain: Ctrl-C received"),
+            Err(e) => tracing::error!(error = %e, "drain: ctrl_c handler failed"),
+        }
+    }
+}
+
+/// Drain the daemon: stop accepting new work, wait for in-flight
+/// workers to finish (up to `grace`), then force-cancel + stop the
+/// cron scheduler. The HTTP server's graceful-shutdown future should
+/// fire alongside this so axum stops accepting connections at the
+/// same time `state.drain` flips.
+///
+/// Polls every 100ms. Returns early when the cancellation registry
+/// empties before `grace` elapses — a clean shutdown is common.
+pub async fn drain_with_grace(state: AppState, cron: CronHandle, grace: Duration) {
     state.drain.set_draining();
-    let grace = Duration::from_secs(state.config.timeouts.shutdown_grace_s);
-    sleep(grace).await;
-    tracing::info!("drain: grace expired, signaling DaemonShutdown to all in-flight jobs");
-    state.cancellation.signal_all(RunCommand::DaemonShutdown);
-}
-
-#[cfg(unix)]
-async fn wait_for_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("term");
-    let mut int = signal(SignalKind::interrupt()).expect("int");
-    tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-}
-
-#[cfg(not(unix))]
-async fn wait_for_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!(
+        grace_s = grace.as_secs(),
+        active = state.cancellation.active(),
+        "drain: flipped drain flag, waiting for in-flight workers",
+    );
+    let deadline = Instant::now() + grace;
+    loop {
+        if state.cancellation.active() == 0 {
+            tracing::info!("drain: all workers finished within grace");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let remaining = state.cancellation.active();
+            tracing::warn!(
+                remaining,
+                "drain: grace expired, signaling DaemonShutdown to remaining workers",
+            );
+            state.cancellation.signal_all(RunCommand::DaemonShutdown);
+            // Workers may take a moment to receive + act on the signal.
+            // We do NOT block further — paavod::main returns from this
+            // function and the runtime drops, killing any survivors.
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    if let Err(e) = cron.shutdown().await {
+        tracing::error!(error = %e, "drain: cron scheduler shutdown failed");
+    } else {
+        tracing::info!("drain: cron scheduler stopped");
+    }
 }
 ```
 
-Add to lib: `pub mod shutdown;`. No standalone test — exercised by 4.4 main.
+Add to lib: `pub mod shutdown;`.
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 2: Tests**
+
+`crates/paavod/tests/shutdown_flow.rs`:
+```rust
+//! Tests the drain orchestration directly (signal delivery is wired
+//! by paavod::main, not testable cross-platform).
+
+use crossbeam_channel::{unbounded, Receiver};
+use paavo_db::Db;
+use paavo_proto::{BoardHealth, BoardSpec, JobId, ProbeSelector};
+use paavod::app_state::{AppState, DrainState};
+use paavod::cancellation::CancellationRegistry;
+use paavod::config::{
+    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
+    TimeoutsConfig, WebConfig,
+};
+use paavod::job_logs::JobLogsBroker;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn make_state(tmp: &std::path::Path) -> AppState {
+    let sd = paavod::state_dir::StateDir::from_root(tmp);
+    sd.ensure_dirs().unwrap();
+    let db = Db::open(&sd.sqlite_path).unwrap();
+    let board = BoardSpec {
+        id: "b".into(),
+        kind: "mcxa266".into(),
+        probe_selector: ProbeSelector {
+            vid: "x".into(),
+            pid: "x".into(),
+            serial: "x".into(),
+        },
+        chip_name: "x".into(),
+        target_name: "x".into(),
+        wiring_profile: None,
+        health: BoardHealth::Healthy,
+    };
+    paavo_db::BoardRow::insert(db.raw_conn(), &board, 0).unwrap();
+    AppState {
+        db: Arc::new(Mutex::new(db)),
+        config: Arc::new(Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                state_dir: tmp.to_path_buf(),
+                max_upload_bytes: 256 * 1024 * 1024,
+            },
+            web: WebConfig {
+                bind: "127.0.0.1:0".into(),
+            },
+            timeouts: TimeoutsConfig::default(),
+            scheduler: SchedulerConfig {
+                nightly_cron: "0 0 19 * * *".into(),
+                starvation_threshold_s: 21_600,
+            },
+            build_cache: BuildCacheConfig::default(),
+            retention: RetentionConfig::default(),
+            quarantine: QuarantineConfig::default(),
+            corpus: vec![],
+        }),
+        inventory: Arc::new(Mutex::new(vec![])),
+        drain: DrainState::default(),
+        cancellation: CancellationRegistry::default(),
+        job_logs: JobLogsBroker::new(),
+    }
+}
+
+async fn make_cron(state: AppState) -> paavod::cron::CronHandle {
+    paavod::cron::start(state).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_flips_flag_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let cron = make_cron(state.clone()).await;
+    assert!(!state.drain.is_draining());
+    let s2 = state.clone();
+    let drain_task = tokio::spawn(async move {
+        paavod::shutdown::drain_with_grace(s2, cron, Duration::from_millis(100)).await;
+    });
+    // Yield once so the drain task starts.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(state.drain.is_draining(), "drain flag must flip immediately");
+    drain_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_returns_early_when_no_workers_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let cron = make_cron(state.clone()).await;
+    let start = std::time::Instant::now();
+    paavod::shutdown::drain_with_grace(state, cron, Duration::from_secs(5)).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drain with empty registry should return immediately, took {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_signals_remaining_workers_after_grace_expires() {
+    // Register a fake worker; never call unregister. Drain should
+    // grace-wait, time out, signal DaemonShutdown to the registry
+    // entry, and return.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let cron = make_cron(state.clone()).await;
+    let (tx, rx) = unbounded::<paavo_runner::RunCommand>();
+    state.cancellation.register(JobId::new(), tx);
+
+    let start = std::time::Instant::now();
+    paavod::shutdown::drain_with_grace(state.clone(), cron, Duration::from_millis(200)).await;
+    let elapsed = start.elapsed();
+    // Should have waited approximately the grace duration.
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "drain returned before grace expired: {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "drain took too long after grace: {elapsed:?}",
+    );
+    // The fake worker should have received DaemonShutdown.
+    let signalled = recv_with_timeout(&rx, Duration::from_millis(500))
+        .expect("worker should receive DaemonShutdown");
+    assert_eq!(signalled, paavo_runner::RunCommand::DaemonShutdown);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_returns_when_worker_finishes_before_grace() {
+    // Register a worker, then unregister it on a short delay
+    // (simulating the dispatcher's finalize). Drain should poll, see
+    // the registry empty, and return well before grace expires.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let cron = make_cron(state.clone()).await;
+    let (tx, _rx) = unbounded::<paavo_runner::RunCommand>();
+    let id = JobId::new();
+    state.cancellation.register(id, tx);
+
+    let s2 = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        s2.cancellation.unregister(&id);
+    });
+
+    let start = std::time::Instant::now();
+    paavod::shutdown::drain_with_grace(state, cron, Duration::from_secs(5)).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "drain returned too fast — should have polled at least one cycle: {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drain should have returned soon after worker unregistered: {elapsed:?}",
+    );
+}
+
+fn recv_with_timeout(
+    rx: &Receiver<paavo_runner::RunCommand>,
+    timeout: Duration,
+) -> Option<paavo_runner::RunCommand> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(cmd) = rx.try_recv() {
+            return Some(cmd);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+```
+
+- [ ] **Step 3: Run**
+
+Run: `cargo test -p paavod --test shutdown_flow`
+Expected: 4 passed.
+
+Also `cargo test --workspace` and the usual clippy + fmt gates.
+
+- [ ] **Step 4: Commit**
 
 ```pwsh
 git -C D:\workspace\paavo add crates/paavod
