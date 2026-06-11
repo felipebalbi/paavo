@@ -13,4 +13,5 @@ pub mod cron;
 pub mod dispatch;
 pub mod job_logs;
 pub mod routes;
+pub mod shutdown;
 pub mod state_dir;
