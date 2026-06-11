@@ -9960,9 +9960,10 @@ pub async fn cancel_job(
         Ok(j) => j,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid id").into_response(),
     };
+    let now_ms = Utc::now().timestamp_millis();
     let res = {
         let db = s.db.lock();
-        paavo_core::cancel_if_submitted(db.raw_conn(), &id)
+        paavo_core::cancel_if_submitted(db.raw_conn(), &id, now_ms)
     };
     match res {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -9975,6 +9976,9 @@ pub async fn cancel_job(
             )
                 .into_response()
         }
+        Err(paavo_core::CoreError::Db(paavo_db::DbError::Sqlite(
+            rusqlite::Error::QueryReturnedNoRows,
+        ))) => (StatusCode::NOT_FOUND, "no such job").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -9987,7 +9991,39 @@ Add `#[derive(serde::Serialize)]` to `JobRow` in `crates/paavo-db/src/job.rs`. T
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p paavod --test api_jobs`
-Expected: 5 passed (the original 2 plus the 3 new ones).
+Expected: 15 passed (12 from M4.2.c.i plus the 3 new ones).
+
+Plus add 2 extra coverage tests (append to `crates/paavod/tests/api_jobs.rs`):
+```rust
+#[tokio::test]
+async fn get_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{}", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn cancel_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{}/cancel", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+```
+
+Final expected count: 17 passed.
 
 - [ ] **Step 5: Commit**
 
