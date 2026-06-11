@@ -8836,18 +8836,29 @@ This is large; we split into the three sub-steps that drive different test files
 
 ##### 4.2.c.i: Multipart submit + tar persistence
 
+**Setup before TDD:** add the two new runtime deps that `post_jobs`
+pulls in. In `crates/paavod/Cargo.toml` `[dependencies]`:
+```toml
+paavo-build = { workspace = true }
+```
+(`paavo-core` is already a dep, so `enqueue_job` + `CoreError` are
+available; `paavo-build::tar::blake3_hex` needs the new entry.)
+
 - [ ] **Step 1: Failing test for submit**
 
 `crates/paavod/tests/api_jobs.rs`:
 ```rust
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
-use parking_lot::Mutex;
-use paavod::app::build_router;
-use paavod::app_state::{AppState, DrainState};
-use paavod::config::*;
 use paavo_db::Db;
 use paavo_proto::{BoardHealth, BoardSpec, JobState, ProbeSelector};
+use paavod::app::build_router;
+use paavod::app_state::{AppState, DrainState};
+use paavod::config::{
+    BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
+    TimeoutsConfig, WebConfig,
+};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -8855,10 +8866,14 @@ use tower::ServiceExt;
 
 fn state(tmp_root: &std::path::Path) -> AppState {
     let db = Db::open(tmp_root.join("paavo.sqlite")).unwrap();
-    let mut inv = vec![BoardSpec {
+    let inv = vec![BoardSpec {
         id: "mcxa266-01".into(),
         kind: "mcxa266".into(),
-        probe_selector: ProbeSelector { vid: "x".into(), pid: "x".into(), serial: "x".into() },
+        probe_selector: ProbeSelector {
+            vid: "x".into(),
+            pid: "x".into(),
+            serial: "x".into(),
+        },
         chip_name: "x".into(),
         target_name: "x".into(),
         wiring_profile: Some("default".into()),
@@ -8867,10 +8882,18 @@ fn state(tmp_root: &std::path::Path) -> AppState {
     paavo_db::BoardRow::insert(db.raw_conn(), &inv[0], 0).unwrap();
 
     let cfg = Config {
-        server: ServerConfig { bind: "x".into(), state_dir: tmp_root.to_path_buf() },
-        web: WebConfig { bind: "x".into() },
+        server: ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            state_dir: tmp_root.to_path_buf(),
+        },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
         timeouts: TimeoutsConfig::default(),
-        scheduler: SchedulerConfig { nightly_cron: "0 0 19 * * *".into(), starvation_threshold_s: 21_600 },
+        scheduler: SchedulerConfig {
+            nightly_cron: "0 0 19 * * *".into(),
+            starvation_threshold_s: 21_600,
+        },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
         quarantine: QuarantineConfig::default(),
@@ -8883,7 +8906,7 @@ fn state(tmp_root: &std::path::Path) -> AppState {
     AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(cfg),
-        inventory: Arc::new(Mutex::new(std::mem::take(&mut inv))),
+        inventory: Arc::new(Mutex::new(inv)),
         drain: DrainState::default(),
     }
 }
@@ -8924,7 +8947,10 @@ async fn post_jobs_accepts_multipart_and_persists_tar() {
     let req = Request::builder()
         .method("POST")
         .uri("/jobs")
-        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -8935,11 +8961,75 @@ async fn post_jobs_accepts_multipart_and_persists_tar() {
 
     // Job row was inserted.
     let id: paavo_proto::JobId = job_id.parse().unwrap();
-    let row = paavo_db::JobRow::get(&s.db.lock().raw_conn(), &id).unwrap();
+    let row = paavo_db::JobRow::get(s.db.lock().raw_conn(), &id).unwrap();
     assert_eq!(row.state, JobState::Submitted);
     // Tar was persisted on disk under uploads_dir/<blake3>.tar.
     let upload_path = std::path::Path::new(&row.tar_path);
     assert!(upload_path.is_file(), "expected tar at {upload_path:?}");
+}
+
+#[tokio::test]
+async fn post_jobs_dedups_identical_tar_on_second_submit() {
+    // Locks in that re-uploading the same tar bytes does NOT rewrite
+    // the on-disk file (the `if !tar_path.is_file()` short-circuit in
+    // post_jobs). The blake3 path is the cache key.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s.clone());
+    let meta = json!({
+        "priority": "interactive",
+        "submitter": "felipe",
+        "source": "cli",
+        "board_selector": { "kind": "mcxa266" },
+        "inactivity_timeout_ms": 120000,
+        "hard_max_ms": 900000
+    });
+    let (boundary, body) = make_multipart_body(b"dedup payload", &meta.to_string());
+
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    let v1: Value = serde_json::from_slice(&to_bytes(r1.into_body(), 1024).await.unwrap()).unwrap();
+    let job1: paavo_proto::JobId = v1["job_id"].as_str().unwrap().parse().unwrap();
+    let row1 = paavo_db::JobRow::get(s.db.lock().raw_conn(), &job1).unwrap();
+    let mtime1 = std::fs::metadata(&row1.tar_path).unwrap().modified().unwrap();
+    // Sleep just long enough that a rewrite would change the mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let v2: Value = serde_json::from_slice(&to_bytes(r2.into_body(), 1024).await.unwrap()).unwrap();
+    let job2: paavo_proto::JobId = v2["job_id"].as_str().unwrap().parse().unwrap();
+    let row2 = paavo_db::JobRow::get(s.db.lock().raw_conn(), &job2).unwrap();
+    assert_eq!(row1.tar_path, row2.tar_path, "same blake3 → same path");
+    let mtime2 = std::fs::metadata(&row2.tar_path).unwrap().modified().unwrap();
+    assert_eq!(mtime1, mtime2, "second submit must NOT rewrite the file");
 }
 
 #[tokio::test]
@@ -8960,11 +9050,96 @@ async fn post_jobs_rejects_impossible_selector_with_400() {
     let req = Request::builder()
         .method("POST")
         .uri("/jobs")
-        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_jobs_rejects_over_ceiling_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    // Daemon ceiling is 8h = 28_800_000 ms; ask for 9h.
+    let meta = json!({
+        "priority": "interactive",
+        "submitter": "felipe",
+        "source": "cli",
+        "board_selector": { "kind": "mcxa266" },
+        "inactivity_timeout_ms": 120000,
+        "hard_max_ms": 32_400_000u64
+    });
+    let (boundary, body) = make_multipart_body(b"x", &meta.to_string());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jobs")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_jobs_rejects_missing_metadata_part_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let boundary = "----paavotest9999";
+    let mut body = Vec::new();
+    body.extend(format!("--{boundary}\r\n").as_bytes());
+    body.extend(b"Content-Disposition: form-data; name=\"crate\"; filename=\"crate.tar\"\r\n");
+    body.extend(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend(b"hi");
+    body.extend(b"\r\n");
+    body.extend(format!("--{boundary}--\r\n").as_bytes());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jobs")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_jobs_rejects_while_draining_with_503() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    s.drain.set_draining();
+    let app = build_router(s);
+    let meta = json!({
+        "priority": "interactive",
+        "submitter": "felipe",
+        "source": "cli",
+        "board_selector": { "kind": "mcxa266" },
+        "inactivity_timeout_ms": 120000,
+        "hard_max_ms": 900000
+    });
+    let (boundary, body) = make_multipart_body(b"x", &meta.to_string());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jobs")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 ```
 
@@ -8980,10 +9155,12 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::Utc;
 use paavo_core::{enqueue_job, EnqueueRequest};
 use paavo_proto::{BoardSelector, JobId, JobSource, Priority};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use tracing::error;
 
 /// JSON metadata part on `POST /jobs`.
 #[derive(Debug, Deserialize)]
@@ -9017,7 +9194,7 @@ pub async fn post_jobs(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<AcceptedBody>), (StatusCode, String)> {
     if s.drain.is_draining() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "draining".into()));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "paavod is draining".into()));
     }
     let mut metadata: Option<PostJobMetadata> = None;
     let mut tar_bytes: Option<Vec<u8>> = None;
@@ -9050,7 +9227,7 @@ pub async fn post_jobs(
     let metadata = metadata.ok_or((StatusCode::BAD_REQUEST, "missing metadata part".into()))?;
     let tar_bytes = tar_bytes.ok_or((StatusCode::BAD_REQUEST, "missing crate part".into()))?;
 
-    // Resolve defaults.
+    // Resolve defaults from the daemon config.
     let tcfg = &s.config.timeouts;
     let inactivity = metadata
         .inactivity_timeout_ms
@@ -9061,17 +9238,19 @@ pub async fn post_jobs(
     });
     let daemon_ceiling = tcfg.daemon_ceiling_s * 1_000;
 
-    // Persist tar.
+    // Persist tar to uploads/<blake3>.tar. Idempotent: if the file
+    // already exists (same blake3) we keep the existing copy untouched
+    // so the build cache stays warm.
     let sd = StateDir::from_root(&s.config.server.state_dir);
     sd.ensure_dirs()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let blake = paavo_build::tar::tar_blake3(&tar_bytes);
+        .map_err(|e| internal_with_log("ensure_dirs", e.to_string()))?;
+    let blake = paavo_build::tar::blake3_hex(&tar_bytes);
     let tar_path = sd.uploads_dir.join(format!("{blake}.tar"));
     if !tar_path.is_file() {
         let mut f = std::fs::File::create(&tar_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| internal_with_log("create tar", e.to_string()))?;
         f.write_all(&tar_bytes)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| internal_with_log("write tar", e.to_string()))?;
     }
 
     // Enqueue.
@@ -9089,9 +9268,10 @@ pub async fn post_jobs(
         tar_path: tar_path.display().to_string(),
         daemon_ceiling_ms: daemon_ceiling,
     };
+    let now_ms = Utc::now().timestamp_millis();
     let inserted = {
         let db = s.db.lock();
-        enqueue_job(db.raw_conn(), &inventory, req).map_err(core_to_http)?
+        enqueue_job(db.raw_conn(), &inventory, req, now_ms).map_err(core_to_http)?
     };
     Ok((
         StatusCode::ACCEPTED,
@@ -9107,8 +9287,16 @@ fn core_to_http(e: paavo_core::CoreError) -> (StatusCode, String) {
         SelectorNeverMatches(_) | OverCeiling { .. } | NotCancellable { .. } => {
             (StatusCode::BAD_REQUEST, format!("{e}"))
         }
-        Db(_) | Build(_) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+        Db(_) | Build(_) | Io(_) => {
+            error!(error = %e, "post_jobs internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+        }
     }
+}
+
+fn internal_with_log(stage: &'static str, msg: String) -> (StatusCode, String) {
+    error!(stage, msg = %msg, "post_jobs internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
 /// GET /jobs?state=...&limit=... — implemented in 4.2.c.ii.
@@ -9118,24 +9306,54 @@ pub async fn list_jobs(_state: State<AppState>) -> impl IntoResponse {
 
 /// GET /jobs/:id — implemented in 4.2.c.ii.
 pub async fn get_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "GET /jobs/:id is wired in 4.2.c.ii")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "GET /jobs/:id is wired in 4.2.c.ii",
+    )
 }
 
 /// POST /jobs/:id/cancel — implemented in 4.2.c.ii.
 pub async fn cancel_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "POST /jobs/:id/cancel is wired in 4.2.c.ii")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "POST /jobs/:id/cancel is wired in 4.2.c.ii",
+    )
 }
 
 /// GET /jobs/:id/stream — implemented in 4.2.c.iii.
 pub async fn stream_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "GET /jobs/:id/stream is wired in 4.2.c.iii")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "GET /jobs/:id/stream is wired in 4.2.c.iii",
+    )
 }
 ```
+
+Note: this replaces the M4.2.a `post_jobs` drain-aware stub but
+*preserves* the drain-503 invariant (it's the first check in the new
+handler). The M4.2.a tests `post_jobs_returns_503_while_draining` and
+`post_jobs_returns_501_when_not_draining` will need updating because
+the new handler returns 503 when draining (still good) and 400 when
+not draining + missing multipart body (instead of 501). Update the
+M4.2.a test file in this same commit:
+
+- Remove `post_jobs_returns_501_when_not_draining` (no longer accurate).
+- Keep `post_jobs_returns_503_while_draining` — still pins drain
+  semantics. The empty body request will still trip drain check first
+  and return 503 before multipart parsing, so it passes.
 
 - [ ] **Step 3: Run the submit test**
 
 Run: `cargo test -p paavod --test api_jobs`
-Expected: 2 passed (only the two submit tests so far).
+Expected: 6 passed (`post_jobs_accepts_multipart_and_persists_tar`,
+`post_jobs_dedups_identical_tar_on_second_submit`,
+`post_jobs_rejects_impossible_selector_with_400`,
+`post_jobs_rejects_over_ceiling_with_400`,
+`post_jobs_rejects_missing_metadata_part_with_400`,
+`post_jobs_rejects_while_draining_with_503`).
+
+Also: `cargo test -p paavod --test api_health` — must still pass (with
+the one test removed as noted above; expect 5 passed).
 
 - [ ] **Step 4: Commit**
 
