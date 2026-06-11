@@ -589,12 +589,38 @@ JSON request/response except where noted.
 
 `POST /jobs`
 
-- Multipart body: `crate.tar` (the tarred crate) + JSON metadata
-  (`board_selector`, `priority`, `timeout`, `inactivity_timeout`,
-  `submitter`).
-- Response: `{ "job_id": "01H..." }` + `202 Accepted` if enqueued;
-  `400 Bad Request` if the selector matches no possible board or the
-  requested timeout exceeds the daemon ceiling.
+- Multipart body with exactly two parts:
+  - `metadata` (`Content-Type: application/json`) — `{ "priority":
+    "interactive"|"scheduled", "submitter": "<free text>",
+    "board_selector": { "kind": "...", "instance": "...", "wiring_profile":
+    "..." }, "inactivity_timeout_ms": <u64 optional>, "hard_max_ms":
+    <u64 optional> }`. Fields not listed are rejected
+    (`#[serde(deny_unknown_fields)]`). `inactivity_timeout_ms` defaults to
+    `timeouts.default_inactivity_s * 1000`; `hard_max_ms` defaults to
+    `timeouts.default_ad_hoc_hard_max_s * 1000`. **`source` is NOT a wire
+    field** — every HTTP submit is recorded as `JobSource::Cli`. The
+    scheduler reaches `paavo_core::enqueue_job` directly, bypassing HTTP.
+  - `crate` (`Content-Type: application/octet-stream`, `filename=...`) —
+    the tarred test crate. Streamed to disk; not buffered in memory.
+- Responses:
+  - `202 Accepted` with body `{ "job_id": "01H..." }` on enqueue.
+  - `400 Bad Request` for: missing/duplicate metadata or crate part;
+    `metadata` not valid JSON; selector matches no inventory board;
+    `hard_max_ms` exceeds `timeouts.daemon_ceiling_s * 1000`; required
+    metadata field missing.
+  - `413 Payload Too Large` if the multipart body exceeds
+    `server.max_upload_bytes` (default 256 MiB; raise for fleets with
+    large vendored deps).
+  - `503 Service Unavailable` while paavod is draining (§6.3).
+  - `500 Internal Server Error` for unexpected `paavo-db` / `paavo-build`
+    / `paavo-core` / I/O failures; the daemon logs the full error.
+- Persistence model: the `crate` field is streamed to
+  `${state_dir}/uploads/.tmp-<jobid>.tar`, hashed in flight with blake3,
+  then atomically renamed to `${state_dir}/uploads/<blake3>.tar`. If the
+  final path already exists (a previously-submitted identical tar), the
+  temp file is removed without overwriting — the build cache keeps the
+  warm copy. Validation (selector + ceiling) happens BEFORE the rename
+  so a 400 leaves no orphan tar on disk.
 
 ### 9.2 Job log streaming
 
@@ -777,6 +803,9 @@ A single TOML file on the lab machine, default path
 [server]
 bind = "127.0.0.1:8080"
 state_dir = "/var/lib/paavo"
+# Per-request body cap for POST /jobs multipart uploads.
+# Default = 256 MiB. Raise for fleets with large vendored deps.
+max_upload_bytes = 268_435_456
 
 [web]
 bind = "127.0.0.1:8081"
