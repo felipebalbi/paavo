@@ -11958,6 +11958,103 @@ git -C D:\workspace\paavo add crates/paavod
 git -C D:\workspace\paavo commit -m "feat(paavod): nightly cron driver — corpus walker + Scheduled enqueue"
 ```
 
+**Round 2 amendments** (from spec + quality review of the as-shipped
+implementation — 4 real defects + 5 should-fix items, all addressed
+in a single follow-up commit):
+
+1. **`CorpusEntry::kind: String` (B1)**. The plan inferred board kind
+   from `entry.path.file_name()`, which silently breaks for the spec's
+   own example (path basename `mcxa2xx`, board kind `mcxa266`).
+   **Fix**: add explicit required `kind` field to `CorpusEntry`. The
+   cron driver reads `entry.kind` directly. Spec §13 example updated.
+
+2. **`cargo_update_packages` threading (B2)**. The plan loaded
+   `CorpusEntry::cargo_update` from config but dropped it on the
+   floor — `EnqueueRequest`, `NewJob`, `JobRow` had no field for it,
+   so `paavo_build::BuildPlan::cargo_update_packages` was always
+   hardcoded `vec![]`. Nightly soaks would never pull fresh embassy
+   revisions, defeating the regression-detection purpose. **Fix**:
+   - paavo-db migration: add `cargo_update_packages TEXT NOT NULL
+     DEFAULT '[]'` JSON column to `job` table.
+   - `NewJob` and `JobRow` gain `cargo_update_packages: Vec<String>`.
+   - `EnqueueRequest` gains the field; `enqueue_job` threads it
+     through.
+   - `JobView` exposes it on the wire so paavo-cli/web can display
+     "this nightly job pulls fresh embassy".
+   - `dispatch::build_or_cache` pulls from `job.cargo_update_packages`
+     and passes to `BuildPlan::cargo_update_packages`.
+   - `routes/jobs.rs::post_jobs` passes `vec![]` (HTTP path is locked
+     at submit time per spec §8.1).
+   - cron sets the field from `entry.cargo_update`.
+
+3. **`ScheduleRow::upsert` updates `last_triggered_at` on conflict (M1)**.
+   The original SQL `ON CONFLICT(id) DO UPDATE SET cron, enabled` left
+   `last_triggered_at` frozen at the first-ever fire's timestamp.
+   **Fix**: `DO UPDATE SET cron = excluded.cron, enabled = excluded.enabled,
+   last_triggered_at = COALESCE(excluded.last_triggered_at, last_triggered_at)`.
+   Existing paavo-db test stays green; add regression test that
+   double-fires and asserts the timestamp advances.
+
+4. **`last_completed_at` only set on partial success (D1)**. Previously
+   `apply_update` ran unconditionally at the end of `run_nightly_corpus`,
+   so a totally-failed nightly still showed "completed" on the web UI.
+   **Fix**: track `enqueued: usize` counter through the corpus walk;
+   only call `apply_update` when `enqueued > 0`. Spec §7.5 wording
+   updated.
+
+5. **Streaming tar (D2)**. `make_tar` materialized the entire archive
+   in `Vec<u8>` (multi-GB OOM risk for corpora with vendored deps).
+   **Fix**: stream-write the tar to
+   `${state_dir}/uploads/.tmp-<jobid>.tar` chunk-by-chunk while
+   feeding `blake3::Hasher` in flight, then atomic-rename to
+   `<blake>.tar` (mirrors the HTTP path's idiom from M4.2.c.i). On
+   dedup hit (`<blake>.tar` already exists), unlink the temp file.
+
+6. **Sync IO in async fn (S1)**. The per-crate inner body
+   (read_dir + tar + write + blake3) now runs inside
+   `tokio::task::spawn_blocking` to avoid stalling the runtime
+   worker thread on a multi-GB tar walk.
+
+7. **`CronHandle` newtype wrapping `JobScheduler` (S2)**. The plan
+   returned a bare `JobScheduler` that the caller would have to
+   remember to `.shutdown().await`. **Fix**: wrap in `CronHandle`
+   with explicit `pub async fn shutdown(self) -> anyhow::Result<()>`
+   so M4.3.d (and `paavod::main`) can't forget. The wrapper is
+   `#[must_use]` so dropping it logs a warn.
+
+8. **Per-crate error isolation (S3)**. A single unreadable file in
+   one corpus crate used to abort the entire entry's loop (10 crates
+   in the entry, 9 buildable → 0 enqueued). **Fix**: per-crate
+   failures (tar, write, kind inference) are now log + continue.
+   Only `read_dir` of the entry root remains fatal for that entry.
+
+9. **Atomic rename for tar persistence (S4)**. Was `if !is_file
+   { write }` — racy against a concurrent HTTP upload of identical
+   content. **Fix**: write to `.tmp-<jobid>.tar` then
+   `tokio::fs::rename` to final path (mirrors HTTP path).
+
+10. **Tests added/updated**:
+    - `cron_run_does_not_advance_completed_at_when_all_enqueues_fail`
+      (covers D1) — uses a corpus pointing at a kind no board provides
+      so every enqueue returns SelectorNeverMatches.
+    - `cron_run_advances_last_triggered_at_on_every_fire` (covers M1)
+      — fires `__test_run_once` twice with a gap and asserts the
+      timestamp increased.
+    - `cron_dedups_identical_tar_contents` (covers D2 + S4) —
+      two crates with byte-identical contents → one final `<blake>.tar`
+      on disk, no orphan temps.
+    - `cron_uses_explicit_kind_field_not_path_basename` (covers B1)
+      — corpus path is `<root>/whatever`, kind is `mcxa266`, board kind
+      is `mcxa266` → enqueue succeeds.
+    - `cron_threads_cargo_update_into_enqueued_job` (covers B2) —
+      asserts `JobRow.cargo_update_packages == entry.cargo_update`.
+    - Existing test `corpus_run_updates_schedule_row_with_trigger_and_completion`
+      tightened to assert `last_completed_at >= last_triggered_at`.
+
+Final shipped count: paavod tests cron_enqueue 8 (4 existing + 4 new),
+paavo-db schedule_ops gains 1 test, EnqueueRequest construction sites
+across the workspace updated to include `cargo_update_packages: vec![]`.
+
 ---
 
 #### 4.3.d: SIGTERM drain

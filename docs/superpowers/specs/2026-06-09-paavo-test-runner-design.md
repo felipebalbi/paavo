@@ -491,6 +491,7 @@ should open the DB. Five tables:
 | `tar_blake3`          | TEXT     | hash of the uploaded tar (build cache key)       |
 | `tar_path`            | TEXT     | where on disk the tar lives                     |
 | `elf_path`            | TEXT     | nullable; set after build                       |
+| `cargo_update_packages` | JSON   | array of package names; `paavo_build::BuildPlan` runs `cargo update -p <pkg>` for each before `cargo build`. HTTP-submitted jobs always pass `[]`; the nightly cron threads it through from `[[corpus]].cargo_update`. |
 
 ### 7.3 `log_frame`
 
@@ -525,11 +526,33 @@ value (default 5 GiB).
 | `id`                  | TEXT PK | e.g. `nightly`                     |
 | `cron`                | TEXT    |                                    |
 | `enabled`             | INT     | bool                               |
-| `last_triggered_at`   | INT     | nullable                           |
-| `last_completed_at`   | INT     | nullable                           |
+| `last_triggered_at`   | INT     | nullable; updated on every cron fire |
+| `last_completed_at`   | INT     | nullable; updated only when the corpus pass produced at least one successful enqueue |
 
 The **corpus** (which test crates to run) is config-file only, not DB —
 version-controlled in `paavo.toml`.
+
+**Cron firing contract.** On each fire, paavod walks every `[[corpus]]`
+entry. For each entry it lists the first-level subdirectories under
+`entry.path` that contain a `Cargo.toml`, tars each one (streamed to
+`${state_dir}/uploads/.tmp-<jobid>.tar`, blake3'd in flight, atomically
+renamed to `<blake>.tar`), and enqueues one `Scheduled` job per crate
+with `board_selector.kind = entry.kind` (no `instance`, no
+`wiring_profile` — corpus jobs target the kind-level pool) and
+`cargo_update_packages = entry.cargo_update` (threaded into the
+build sandbox per §8.1 step 4).
+
+`schedule.last_triggered_at` is bumped at the *start* of every fire
+(before the walk). `schedule.last_completed_at` is bumped at the *end*
+only if at least one job was successfully enqueued — a misconfigured
+corpus that enqueues zero jobs leaves `last_completed_at` unchanged so
+operators can detect silent failure on the web UI.
+
+**Cron-during-drain.** When `state.drain.is_draining()` the cron driver
+short-circuits the entire fire — neither `last_triggered_at` nor
+`last_completed_at` is updated, no enqueues happen, and a single INFO
+log line records the skip. M4.3.d's SIGTERM handler also calls
+`JobScheduler::shutdown` so subsequent fires don't happen.
 
 ### 7.6 Log retention (v1)
 
@@ -572,8 +595,11 @@ For each job, paavo-build:
 2. Untars the crate into `${paavo_state}/sandboxes/${job_id}/`.
 3. Sets `CARGO_TARGET_DIR=${paavo_state}/cargo-target/` (shared across jobs
    for incremental reuse; cargo's own locking handles concurrent reads).
-4. Runs `cargo update -p <relevant pkgs>` if the test crate is a known soak
-   test from `soak-tests/` (config flag).
+4. Runs `cargo update -p <pkg>` for every package listed in
+   `job.cargo_update_packages`. HTTP-submitted (`paavo-cli run`) jobs
+   always pass `[]` so the dep graph is locked at submit time; the
+   nightly cron threads each `[[corpus]].cargo_update` entry through
+   to here so soak runs pull fresh embassy revisions.
 5. Runs `cargo build --release` (build profile from job spec; default
    release).
 6. Discovers the ELF via `[package.metadata.embassy].build.artifact-dir` or,
@@ -697,8 +723,9 @@ JSON request/response except where noted.
   submitter, source, board_selector, inactivity_timeout_ms,
   hard_max_ms, state, outcome (Option), board_id (Option),
   submitted_at, started_at (Option), finished_at (Option),
-  tar_blake3. **Deliberately excludes** the daemon-local filesystem
-  paths (`tar_path`, `elf_path`); those are server-internal.
+  tar_blake3, cargo_update_packages. **Deliberately excludes** the
+  daemon-local filesystem paths (`tar_path`, `elf_path`); those are
+  server-internal.
 - All three endpoints serve during drain (operators monitoring
   shutdown need read access; cancelling an in-flight job during
   drain is exactly when you'd need it). Same carve-out as §9.4.
@@ -900,11 +927,21 @@ consecutive_infra_failures = 3
 
 [[corpus]]
 name = "embassy-mcxa-regression"
-path = "/var/lib/paavo/checkouts/embassy/tests/mcxa2xx"
+# Board kind the corpus targets. Must match a `board.kind` registered
+# via `paavo-cli board add`. The cron driver uses this directly when
+# building the selector for every Scheduled job it enqueues; the
+# corpus PATH basename is not parsed.
+kind = "mcxa266"
+path = "/var/lib/paavo/checkouts/embassy/tests/mcxa266"
+# Packages to `cargo update -p ...` before building each crate. The
+# nightly run threads these through to `paavo_build::BuildPlan::cargo_update_packages`
+# so each rebuild pulls fresh revisions of the listed deps (the
+# regression-detection purpose of the nightly).
 cargo_update = ["embassy-mcxa", "embassy-executor"]
 
 [[corpus]]
 name = "paavo-soak-mcxa266"
+kind = "mcxa266"
 path = "/var/lib/paavo/checkouts/paavo/soak-tests/mcxa266"
 cargo_update = []
 ```
