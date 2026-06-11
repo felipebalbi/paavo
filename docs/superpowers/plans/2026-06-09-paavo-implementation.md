@@ -9294,7 +9294,75 @@ async fn post_jobs_rejects_oversized_tar_with_413() {
     let resp = app.oneshot(submit_request(body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn post_jobs_rejects_duplicate_metadata_part_with_400() {
+    // Symmetric with `duplicate `crate` part`: spec §9.1 says "exactly
+    // two parts". A second metadata part must be rejected, not
+    // silently override the first.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let mut body = Vec::new();
+    body.extend(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend(b"Content-Disposition: form-data; name=\"metadata\"\r\n");
+    body.extend(b"Content-Type: application/json\r\n\r\n");
+    body.extend(default_meta().to_string().as_bytes());
+    body.extend(b"\r\n");
+    body.extend(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend(b"Content-Disposition: form-data; name=\"metadata\"\r\n");
+    body.extend(b"Content-Type: application/json\r\n\r\n");
+    body.extend(default_meta().to_string().as_bytes());
+    body.extend(b"\r\n");
+    body.extend(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend(b"Content-Disposition: form-data; name=\"crate\"; filename=\"crate.tar\"\r\n");
+    body.extend(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend(b"hi");
+    body.extend(b"\r\n");
+    body.extend(format!("--{BOUNDARY}--\r\n").as_bytes());
+    let resp = app.oneshot(submit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_jobs_rejects_oversized_metadata_part_with_413() {
+    // Per-field cap on `metadata` is 64 KiB regardless of the request-
+    // level `max_upload_bytes`. A 1 MiB metadata payload trips 413
+    // before serde_json even tries to parse it.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path()); // generous 256 MiB request cap
+    let app = build_router(s);
+    let mut meta = default_meta();
+    meta["submitter"] = serde_json::json!("x".repeat(128 * 1024));
+    let body = make_multipart_body(b"hi", &meta.to_string());
+    let resp = app.oneshot(submit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
 ```
+
+Also add the `assert_no_orphan_temps` helper alongside `default_meta`
+in the test file (it's referenced by the dedup test and the
+selector-reject test to pin no `.tmp-*` leaks):
+
+```rust
+/// Assert that `uploads/` contains no `.tmp-*` artifacts. Catches the
+/// dedup-hit / orphan-temp leak class.
+fn assert_no_orphan_temps(tmp_root: &std::path::Path) {
+    let uploads = tmp_root.join("uploads");
+    let temps: Vec<_> = std::fs::read_dir(&uploads)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-"))
+        .collect();
+    assert!(
+        temps.is_empty(),
+        "expected no orphan .tmp-* in {uploads:?}, found: {temps:?}"
+    );
+}
+```
+
+The dedup test ends with `assert_no_orphan_temps(tmp.path());`; the
+selector-reject test ends the same way after its orphan-`.tar` check.
 
 - [ ] **Step 4: Implement `POST /jobs` — streaming, validated, source-locked**
 
@@ -9377,13 +9445,29 @@ pub async fn post_jobs(
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(bad_request("multipart"))?
+        .map_err(multipart_err("multipart"))?
     {
         match field.name() {
             Some("metadata") => {
-                let bytes = field.bytes().await.map_err(bad_request("metadata"))?;
+                if metadata.is_some() {
+                    return Err((StatusCode::BAD_REQUEST, "duplicate `metadata` part".into()));
+                }
+                // Per-field cap: a malicious client could otherwise burn
+                // up to `max_upload_bytes` of RAM on a single JSON part.
+                // Legitimate metadata is a few hundred bytes.
+                const METADATA_MAX_BYTES: usize = 64 * 1024;
+                let mut buf: Vec<u8> = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(multipart_err("metadata"))? {
+                    if buf.len().saturating_add(chunk.len()) > METADATA_MAX_BYTES {
+                        return Err((
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!("metadata field exceeds {METADATA_MAX_BYTES} byte cap"),
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
                 let parsed: PostJobMetadata =
-                    serde_json::from_slice(&bytes).map_err(bad_request("metadata"))?;
+                    serde_json::from_slice(&buf).map_err(bad_request("metadata"))?;
                 metadata = Some(parsed);
             }
             Some("crate") => {
@@ -9397,7 +9481,7 @@ pub async fn post_jobs(
                 let mut file = tokio::fs::File::create(&tmp_path)
                     .await
                     .map_err(|e| internal("create tmp", e.to_string()))?;
-                while let Some(chunk) = field.chunk().await.map_err(bad_request("crate"))? {
+                while let Some(chunk) = field.chunk().await.map_err(multipart_err("crate"))? {
                     hasher.update(&chunk);
                     file.write_all(&chunk)
                         .await
@@ -9454,24 +9538,32 @@ pub async fn post_jobs(
         validate_enqueue(&pre_req, &inventory).map_err(core_to_http)?;
     }
 
-    // Atomically rename .tmp-<jobid>.tar → <blake>.tar. If the dest
-    // already exists (dedup hit) we unlink our temp file — the existing
+    // Atomically rename .tmp-<jobid>.tar → <blake>.tar.
+    //
+    // On a dedup hit (`<blake>.tar` already exists) we deliberately
+    // leave `cleanup` armed so its Drop unlinks our temp; the existing
     // copy is content-identical and keeps the build cache warm.
+    //
+    // On both POSIX (`rename(2)`) and Windows (`MoveFileExW` with
+    // REPLACE_EXISTING) `tokio::fs::rename` silently clobbers an
+    // existing destination, so two concurrent submitters of identical
+    // content both succeed; the loser's temp is gone (renamed) and the
+    // winner's bytes are content-identical to whatever was clobbered.
+    // We therefore do NOT branch on `AlreadyExists` here.
+    //
+    // No `fsync`: the build cache is allowed to lose tars on a hard
+    // crash — on recovery any DB row whose `tar_path` is missing or
+    // partial is treated as a fresh blake3 miss and the next submit
+    // re-populates it. Crash-consistency is a non-goal for `uploads/`.
     let final_path = sd.uploads_dir.join(format!("{blake}.tar"));
     let final_path_str = path_to_utf8(&final_path)?;
-    if final_path.is_file() {
-        // Dedup hit. Drop our temp via the cleanup guard.
-        cleanup.disarm_into(None);
-    } else {
-        match tokio::fs::rename(&tmp_path, &final_path).await {
-            Ok(()) => cleanup.disarm_into(None),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Won by a concurrent submitter; drop our temp.
-                cleanup.disarm_into(None);
-            }
-            Err(e) => return Err(internal("rename tmp", e.to_string())),
-        }
+    if !final_path.is_file() {
+        tokio::fs::rename(&tmp_path, &final_path)
+            .await
+            .map_err(|e| internal("rename tmp", e.to_string()))?;
+        cleanup.disarm();
     }
+    // (else: dedup hit — leave `cleanup` armed; Drop unlinks the temp.)
 
     // Enqueue under the db lock with an inventory snapshot taken in the
     // same critical section.
@@ -9501,9 +9593,9 @@ pub async fn post_jobs(
     ))
 }
 
-/// RAII guard that unlinks `path` on drop unless `disarm_into` was
-/// called. Used to clean up the streaming temp file on any early-return
-/// error path (validation failure, multipart error, mid-stream I/O fault).
+/// RAII guard that unlinks `path` on drop unless `disarm` was called.
+/// Used to clean up the streaming temp file on any early-return error
+/// path (validation failure, multipart error, mid-stream I/O fault).
 struct TempCleanup {
     path: Option<std::path::PathBuf>,
 }
@@ -9512,9 +9604,9 @@ impl TempCleanup {
     fn new(path: std::path::PathBuf) -> Self {
         Self { path: Some(path) }
     }
-    /// Mark the temp file as handled (renamed away, or intentionally
-    /// dropped on a dedup hit). The Drop impl becomes a no-op.
-    fn disarm_into(&mut self, _: Option<()>) {
+    /// Mark the temp file as handled (renamed away). The Drop impl
+    /// becomes a no-op.
+    fn disarm(&mut self) {
         self.path = None;
     }
 }
@@ -9535,6 +9627,17 @@ fn bad_request<E: std::fmt::Display>(
     stage: &'static str,
 ) -> impl FnOnce(E) -> (StatusCode, String) {
     move |e| (StatusCode::BAD_REQUEST, format!("{stage}: {e}"))
+}
+
+/// Map an `axum::extract::multipart::MultipartError` to an HTTP status.
+/// The error type carries the right status itself — most notably
+/// `413 Payload Too Large` when the request exceeds the per-route
+/// `DefaultBodyLimit`. Defaulting everything to 400 (as `bad_request`
+/// would) hides that.
+fn multipart_err(
+    stage: &'static str,
+) -> impl FnOnce(axum::extract::multipart::MultipartError) -> (StatusCode, String) {
+    move |e| (e.status(), format!("{stage}: {e}"))
 }
 
 fn internal(stage: &'static str, msg: String) -> (StatusCode, String) {
@@ -9660,9 +9763,10 @@ cargo fmt --all -- --check
 ```
 
 Expected paavod tests:
-- `api_jobs`: 9 passed (the 7 from the test file above + the 2 new
-  large-tar tests).
-- `api_health`: 4 passed (the two removed above are gone).
+- `api_jobs`: 12 passed (8 baseline submit/dedup/reject tests + 2 large-tar
+  tests + 2 metadata-cap/duplicate-metadata tests). The dedup and orphan-
+  selector tests assert no `.tmp-*` artifacts via `assert_no_orphan_temps`.
+- `api_health`: 4 passed.
 - `api_boards`: 8 passed (unchanged).
 - `config_loading`: 8 passed (6 existing + 2 new for max_upload_bytes).
 
