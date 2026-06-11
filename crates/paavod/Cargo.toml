@@ -7,6 +7,14 @@ repository.workspace = true
 authors.workspace = true
 description = "paavo daemon: HTTP server, scheduler, board fleet owner."
 
+[lib]
+name = "paavod"
+path = "src/lib.rs"
+
+[[bin]]
+name = "paavod"
+path = "src/main.rs"
+
 [dependencies]
 paavo-proto = { workspace = true }
 paavo-db    = { workspace = true }
@@ -16,6 +24,7 @@ tokio       = { workspace = true }
 tower       = { workspace = true }
 tower-http  = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
+cron        = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }
