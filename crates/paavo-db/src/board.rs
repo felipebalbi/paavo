@@ -80,10 +80,23 @@ impl BoardRow {
         Ok(rows)
     }
 
-    /// Find healthy boards matching the selector. Result is unordered; the
-    /// scheduler decides LRU.
+    /// Find healthy boards matching the selector AND not currently
+    /// dispatched (no `job` row in `building` or `running` state on
+    /// this board). Result is unordered; the scheduler decides LRU.
+    ///
+    /// The board-exclusivity clause (`NOT EXISTS (...)`) is what
+    /// stops the dispatcher from launching two jobs on the same probe
+    /// concurrently. Without it `pick_next` could happily return the
+    /// same board twice in quick succession because `health` stays
+    /// `Healthy` while a job runs.
     pub fn find_healthy_for_selector(conn: &Connection, sel: &BoardSelector) -> Result<Vec<Self>> {
-        let mut sql = String::from("SELECT * FROM board WHERE kind = ?1 AND health = 'healthy'");
+        let mut sql = String::from(
+            "SELECT * FROM board WHERE kind = ?1 AND health = 'healthy'
+             AND NOT EXISTS (
+                SELECT 1 FROM job WHERE job.board_id = board.id
+                  AND job.state IN ('building','running')
+             )",
+        );
         let mut next_param = 2;
         if sel.instance.is_some() {
             sql.push_str(&format!(" AND id = ?{next_param}"));

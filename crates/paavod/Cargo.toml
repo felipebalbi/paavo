@@ -43,6 +43,7 @@ tokio-stream = { workspace = true }
 bytes       = { workspace = true }
 parking_lot = { workspace = true }
 blake3      = { workspace = true }
+walkdir     = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }
