@@ -9,6 +9,7 @@ pub mod app;
 pub mod app_state;
 pub mod cancellation;
 pub mod config;
+pub mod cron;
 pub mod dispatch;
 pub mod job_logs;
 pub mod routes;
