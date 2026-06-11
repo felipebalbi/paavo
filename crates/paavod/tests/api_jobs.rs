@@ -61,6 +61,7 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
         config: Arc::new(cfg),
         inventory: Arc::new(Mutex::new(inv)),
         drain: DrainState::default(),
+        job_logs: paavod::job_logs::JobLogsBroker::new(),
     }
 }
 
@@ -655,4 +656,371 @@ async fn get_job_view_omits_tar_path_and_elf_path() {
     assert!(v.get("elf_path").is_none(), "elf_path leaked: {v}");
     // blake3 IS exposed (content-addressed, useful for build-cache debugging).
     assert_eq!(v["tar_blake3"], "deadbeef");
+}
+
+#[tokio::test]
+async fn stream_terminal_returns_historical_plus_outcome() {
+    use paavo_db::LogFrameDb;
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_proto::LogFrame::append_batch(
+        s.db.lock().raw_conn(),
+        &id,
+        &[paavo_proto::LogFrame {
+            seq: 0,
+            ts_us: 0,
+            level: paavo_proto::LogLevel::Info,
+            target: None,
+            message: "hi".into(),
+        }],
+    )
+    .unwrap();
+    paavo_db::JobRow::finalize(
+        s.db.lock().raw_conn(),
+        &id,
+        &paavo_db::OutcomeRecord {
+            state: paavo_proto::JobState::Passed,
+            outcome: paavo_proto::JobOutcome::Passed,
+            finished_at_ms: 1,
+        },
+    )
+    .unwrap();
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 NDJSON lines, got: {text}");
+    let frame_line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(frame_line["type"], "frame");
+    assert_eq!(frame_line["frame"]["message"], "hi");
+    let term_line: Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(term_line["type"], "terminal");
+    assert_eq!(term_line["outcome"], "passed");
+}
+
+#[tokio::test]
+async fn stream_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{}/stream", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn stream_rejects_invalid_id_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs/not-a-ulid/stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn stream_live_emits_published_frame_then_terminal() {
+    // Insert a Running job (no historical frames yet). Spawn a task
+    // that publishes a frame + terminal after a short delay so the
+    // handler subscribes first.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1).unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let broker = s.job_logs.clone();
+    tokio::spawn(async move {
+        // Poll until the handler has subscribed before publishing — the
+        // alternative is a fixed sleep, which is flaky on loaded CI.
+        for _ in 0..200 {
+            if broker.active_channels() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        broker.publish(
+            id,
+            paavod::job_logs::LiveEvent::Frame(paavo_proto::LogFrame {
+                seq: 0,
+                ts_us: 0,
+                level: paavo_proto::LogLevel::Info,
+                target: None,
+                message: "live".into(),
+            }),
+        );
+        broker.publish(
+            id,
+            paavod::job_logs::LiveEvent::Terminal(paavo_proto::JobOutcome::Passed),
+        );
+    });
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 NDJSON lines, got: {text}");
+    let frame_line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(frame_line["type"], "frame");
+    assert_eq!(frame_line["frame"]["message"], "live");
+    let term_line: Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(term_line["type"], "terminal");
+}
+
+#[tokio::test]
+async fn stream_terminal_does_not_leak_subscriber_channels() {
+    // Pins the no-leak invariant: a /stream request for an already-
+    // terminal job must NOT create a Sender in the broker (the
+    // worker won't come back to call finalize()).
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::finalize(
+        s.db.lock().raw_conn(),
+        &id,
+        &paavo_db::OutcomeRecord {
+            state: paavo_proto::JobState::Passed,
+            outcome: paavo_proto::JobOutcome::Passed,
+            finished_at_ms: 1,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.job_logs.active_channels(), 0);
+    let app = build_router(s.clone());
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(
+        s.job_logs.active_channels(),
+        0,
+        "terminal-job stream must not leave a Sender behind"
+    );
+}
+
+#[tokio::test]
+async fn stream_unknown_job_does_not_leak_subscriber_channels() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    assert_eq!(s.job_logs.active_channels(), 0);
+    let app = build_router(s.clone());
+    let req = Request::builder()
+        .uri(format!("/jobs/{}/stream", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        s.job_logs.active_channels(),
+        0,
+        "404 stream must not leave a Sender behind"
+    );
+}
+
+#[tokio::test]
+async fn stream_returns_500_when_terminal_outcome_is_null() {
+    // Pins the corrupted-DB defensive close: terminal state + NULL
+    // outcome should surface as 500, NOT a fabricated Aborted{User}.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    // Force a corrupt state: write state='passed' but leave
+    // outcome_detail NULL by bypassing JobRow::finalize.
+    s.db.lock()
+        .raw_conn()
+        .execute(
+            "UPDATE job SET state = 'passed', outcome_detail = NULL,
+             finished_at = 1 WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 500);
+}
+
+#[tokio::test]
+async fn stream_pages_historical_above_chunk_size() {
+    // Pins that the historical fetch is NOT capped at 10k (or any
+    // single chunk size). Inserts 1500 frames (above the 1000-frame
+    // page) and asserts they all appear in the stream.
+    use paavo_db::LogFrameDb;
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    let frames: Vec<paavo_proto::LogFrame> = (0..1500u64)
+        .map(|i| paavo_proto::LogFrame {
+            seq: i,
+            ts_us: i,
+            level: paavo_proto::LogLevel::Info,
+            target: None,
+            message: format!("frame-{i}"),
+        })
+        .collect();
+    paavo_proto::LogFrame::append_batch(s.db.lock().raw_conn(), &id, &frames).unwrap();
+    paavo_db::JobRow::finalize(
+        s.db.lock().raw_conn(),
+        &id,
+        &paavo_db::OutcomeRecord {
+            state: paavo_proto::JobState::Passed,
+            outcome: paavo_proto::JobOutcome::Passed,
+            finished_at_ms: 2,
+        },
+    )
+    .unwrap();
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    // Allow up to ~2 MiB for the body (1500 frames * ~50 bytes each).
+    let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1501, "1500 frames + 1 terminal");
+    // First and last frames should be present in order.
+    let first_frame: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first_frame["frame"]["message"], "frame-0");
+    let last_frame: Value = serde_json::from_str(lines[1499]).unwrap();
+    assert_eq!(last_frame["frame"]["message"], "frame-1499");
+    let term: Value = serde_json::from_str(lines[1500]).unwrap();
+    assert_eq!(term["type"], "terminal");
 }

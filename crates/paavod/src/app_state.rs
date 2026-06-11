@@ -55,6 +55,10 @@ pub struct AppState {
     pub inventory: Arc<Mutex<Vec<BoardSpec>>>,
     /// One-shot SIGTERM drain flag.
     pub drain: DrainState,
+    /// Per-job log frame broker; subscribers consume live frames
+    /// while a job is Building or Running. See
+    /// `crate::job_logs::JobLogsBroker`.
+    pub job_logs: crate::job_logs::JobLogsBroker,
 }
 
 impl AppState {

@@ -46,6 +46,7 @@ fn state() -> AppState {
         config: Arc::new(cfg),
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
+        job_logs: paavod::job_logs::JobLogsBroker::new(),
     }
 }
 

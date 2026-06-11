@@ -451,10 +451,259 @@ fn db_to_http(err: paavo_db::DbError) -> (StatusCode, String) {
     }
 }
 
-/// GET /jobs/:id/stream — implemented in 4.2.c.iii.
-pub async fn stream_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "GET /jobs/:id/stream is wired in 4.2.c.iii",
-    )
+/// GET /jobs/:id/stream — NDJSON long-poll. One JSON object per line:
+///   `{"type":"frame","frame":<LogFrame>}` for each historical or live
+///   frame, then exactly one `{"type":"terminal","outcome":<JobOutcome>}`
+///   line before the stream closes. A `{"type":"lagged","missed":<u64>}`
+///   line is emitted if the live broadcast channel falls behind. A
+///   `{"type":"truncated","reason":"..."}` line is emitted if the live
+///   stream ends without a Terminal event AND the job is still
+///   non-terminal in the DB (worker died / unexpected close).
+///
+/// Response is `application/x-ndjson`. Clients parse by splitting on
+/// `\n` and deserializing each line. Frames carry `seq` numbers so
+/// clients can dedup if the historical-then-live boundary races (rare
+/// in practice — see job_logs.rs for the ordering contract).
+///
+/// 400 if `:id` is not a valid ULID. 404 if no such job. 500 on db
+/// errors. Otherwise 200 with a streaming body.
+///
+/// Lifecycle ordering: the handler reads the job row FIRST. Only if
+/// the job exists AND is non-terminal does it subscribe to the broker.
+/// This avoids the Sender-leak class (the unconditional `subscribe`
+/// combined with `entry().or_insert_with` would otherwise materialize
+/// a Sender for every `/jobs/<random-ulid>/stream` request and never
+/// reclaim it). A re-check after subscribe catches the narrow race
+/// where the job finalizes between the initial read and the subscribe.
+pub async fn stream_job(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+    use std::convert::Infallible;
+
+    let id: JobId = match id.parse() {
+        Ok(i) => i,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+
+    // 1. Read the row first to decide whether the job exists and
+    //    whether it's already terminal. This is the leak-safe
+    //    ordering: we only subscribe to the broker if we actually
+    //    need a live channel.
+    let (state, outcome) = {
+        let db = s.db.lock();
+        match paavo_db::JobRow::find(db.raw_conn(), &id) {
+            Ok(Some(r)) => (r.state, r.outcome),
+            Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+            Err(e) => {
+                error!(error = %e, "stream_job: db find error");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    };
+
+    // 2. If terminal, emit historical + terminal-from-DB. No subscribe.
+    if state.is_terminal() {
+        let Some(outcome) = outcome else {
+            // Terminal state with NULL outcome is a corrupted-DB
+            // condition (paavo_db::JobRow::finalize requires an
+            // OutcomeRecord). Surface 500 rather than fabricate.
+            error!(%id, ?state, "stream_job: terminal state with NULL outcome");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "terminal state has no outcome (corrupted DB)",
+            )
+                .into_response();
+        };
+        return terminal_response(s.clone(), id, outcome);
+    }
+
+    // 3. Subscribe BEFORE re-checking the DB so any frame published in
+    //    the gap between subscribe and re-check is captured.
+    let rx = s.job_logs.subscribe(id);
+
+    // 4. Re-check: the job may have finalized while we were
+    //    subscribing. If so, drop rx and take the terminal-from-DB
+    //    branch; finalize the broker entry we just created to avoid
+    //    leaking a Sender.
+    let (state2, outcome2) = {
+        let db = s.db.lock();
+        match paavo_db::JobRow::find(db.raw_conn(), &id) {
+            Ok(Some(r)) => (r.state, r.outcome),
+            Ok(None) => {
+                drop(rx);
+                s.job_logs.finalize(id);
+                return (StatusCode::NOT_FOUND, "no such job").into_response();
+            }
+            Err(e) => {
+                drop(rx);
+                s.job_logs.finalize(id);
+                error!(error = %e, "stream_job: db recheck error");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    };
+    if state2.is_terminal() {
+        drop(rx);
+        s.job_logs.finalize(id);
+        let Some(outcome) = outcome2 else {
+            error!(%id, ?state2, "stream_job: terminal-after-subscribe with NULL outcome");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "terminal state has no outcome (corrupted DB)",
+            )
+                .into_response();
+        };
+        return terminal_response(s.clone(), id, outcome);
+    }
+
+    // 5. Live: stream paged historical frames, then live frames from
+    //    rx until Terminal or rx closes.
+    let s_for_stream = s.clone();
+    let live = async_stream::stream! {
+        // Page historical in chunks so memory stays bounded even for
+        // long-running jobs that have emitted >10k frames.
+        for line in historical_lines(&s_for_stream, &id) {
+            yield Ok::<_, Infallible>(line);
+        }
+        // Live tail.
+        use tokio_stream::wrappers::BroadcastStream;
+        use tokio_stream::StreamExt;
+        let mut rx = BroadcastStream::new(rx);
+        let mut saw_terminal = false;
+        while let Some(item) = rx.next().await {
+            match item {
+                Ok(crate::job_logs::LiveEvent::Frame(f)) => {
+                    yield Ok(ndjson_line(&serde_json::json!({"type":"frame","frame": f})));
+                }
+                Ok(crate::job_logs::LiveEvent::Terminal(o)) => {
+                    yield Ok(ndjson_line(
+                        &serde_json::json!({"type":"terminal","outcome": o}),
+                    ));
+                    saw_terminal = true;
+                    break;
+                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    yield Ok(ndjson_line(&serde_json::json!({
+                        "type": "lagged",
+                        "missed": n,
+                    })));
+                }
+            }
+        }
+        if !saw_terminal {
+            // Defensive close: rx ended without a Terminal event. Either
+            // the worker called finalize() without publishing Terminal
+            // (a worker bug), or the lag eviction race ate the Terminal
+            // before it reached us. Try to recover the terminal outcome
+            // from the DB; if the job is still non-terminal, emit a
+            // `truncated` marker so the client knows the stream
+            // ended unexpectedly.
+            let recovered = {
+                let db = s_for_stream.db.lock();
+                paavo_db::JobRow::find(db.raw_conn(), &id).ok().flatten()
+            };
+            match recovered {
+                Some(row) if row.state.is_terminal() => {
+                    if let Some(o) = row.outcome {
+                        yield Ok(ndjson_line(
+                            &serde_json::json!({"type":"terminal","outcome": o}),
+                        ));
+                    } else {
+                        yield Ok(ndjson_line(&serde_json::json!({
+                            "type": "truncated",
+                            "reason": "terminal DB row has NULL outcome",
+                        })));
+                    }
+                }
+                _ => {
+                    yield Ok(ndjson_line(&serde_json::json!({
+                        "type": "truncated",
+                        "reason": "live stream ended before terminal",
+                    })));
+                }
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(live))
+        .unwrap()
+}
+
+/// Build the terminal-response: paged historical frames + a single
+/// `terminal` line. Used when the job is already terminal at handler
+/// entry (or becomes terminal during the subscribe race window).
+fn terminal_response(
+    s: AppState,
+    id: JobId,
+    outcome: paavo_proto::JobOutcome,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+    use std::convert::Infallible;
+
+    let live = async_stream::stream! {
+        for line in historical_lines(&s, &id) {
+            yield Ok::<_, Infallible>(line);
+        }
+        yield Ok(ndjson_line(
+            &serde_json::json!({"type":"terminal","outcome": outcome}),
+        ));
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(live))
+        .unwrap()
+}
+
+/// Page historical frames for `id` in 1000-frame chunks, returning a
+/// `Vec` of NDJSON lines (one per frame). DB errors on any page log +
+/// produce a `truncated` line so the client sees an explicit failure
+/// instead of a silent empty body.
+fn historical_lines(s: &AppState, id: &JobId) -> Vec<bytes::Bytes> {
+    use paavo_db::LogFrameDb;
+    const PAGE: u32 = 1000;
+    let mut lines: Vec<bytes::Bytes> = Vec::new();
+    let mut offset: u32 = 0;
+    loop {
+        let chunk_result = {
+            let db = s.db.lock();
+            paavo_proto::LogFrame::list(db.raw_conn(), id, offset, PAGE)
+        };
+        match chunk_result {
+            Ok(chunk) => {
+                let n = chunk.len();
+                for f in chunk {
+                    lines.push(ndjson_line(&serde_json::json!({"type":"frame","frame": f})));
+                }
+                if n < PAGE as usize {
+                    break;
+                }
+                offset = offset.saturating_add(PAGE);
+            }
+            Err(e) => {
+                error!(error = %e, %id, "stream_job: db error paging historical frames");
+                lines.push(ndjson_line(&serde_json::json!({
+                    "type": "truncated",
+                    "reason": "db error reading historical frames",
+                })));
+                break;
+            }
+        }
+    }
+    lines
+}
+
+fn ndjson_line(v: &serde_json::Value) -> bytes::Bytes {
+    let mut s = v.to_string();
+    s.push('\n');
+    bytes::Bytes::from(s)
 }
