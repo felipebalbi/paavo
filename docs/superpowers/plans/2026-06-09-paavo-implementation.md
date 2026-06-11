@@ -6921,34 +6921,44 @@ git -C D:\workspace\paavo commit -m "feat(core): quarantine policy + Submitted-s
 
 #### 3.2.e: build_cache helpers (paavo-core)
 
-The cache lookup/store helpers compose `paavo-build::build_release` with `paavo-db::BuildCacheEntry`. They live in `paavo-core` because they cross both modules — exactly the glue role `paavo-core` exists for. The helpers are stateless: callers (paavod) pass a `Connection`; on Hit, the function pruning stale rows when the ELF file has been deleted (self-healing).
+The cache lookup/store helpers compose `paavo-build::build_release` with `paavo-db::BuildCacheEntry`. They live in `paavo-core` because they cross both modules — exactly the glue role `paavo-core` exists for. The helpers are stateless: callers (paavod) pass a `Connection`; on Hit, the function prunes stale rows when the ELF file has been deleted (self-healing). `evict_lru` is also exposed so the nightly cron can prune the cache.
 
 **Files:**
 - Create: `crates/paavo-core/src/build_cache.rs`
 - Test: `crates/paavo-core/tests/build_cache.rs`
 
-- [ ] **Step 1: Write the failing test**
+**Note:** `cache_lookup` takes `now_ms: i64` per the M3.2.a testability discipline (used to bump `last_used_at`). Production passes `Utc::now().timestamp_millis()`; tests inject deterministic values. `CoreError` gets an `Io(#[from] std::io::Error)` variant to type the cache_store filesystem-stat failure cleanly (previously the plan wrapped io::Error in rusqlite::Error::ToSqlConversionFailure which lied about the error class).
+
+- [ ] **Step 1: Add `Io` variant to `CoreError`**
+
+In `crates/paavo-core/src/error.rs`, add a new variant after `Build`:
+
+```rust
+    /// I/O failure outside paavo-build (e.g. stat'ing an ELF file in the
+    /// build-cache helpers).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+```
+
+- [ ] **Step 2: Write the failing test**
 
 `crates/paavo-core/tests/build_cache.rs`:
 ```rust
-use paavo_core::{cache_lookup, cache_store, CacheLookup};
-use paavo_db::{BuildCacheEntry, Db};
+mod common;
+
+use common::fresh_db;
+use paavo_core::{cache_lookup, cache_store, evict_lru, CacheLookup};
+use paavo_db::BuildCacheEntry;
 use std::fs;
 use tempfile::tempdir;
 
-fn fresh_db() -> Db {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("paavo.sqlite");
-    let db = Db::open(&path).unwrap();
-    std::mem::forget(dir);
-    db
-}
+const NOW: i64 = 1_700_000_000_000;
 
 #[test]
 fn lookup_returns_miss_when_no_entry() {
     let db = fresh_db();
     assert_eq!(
-        cache_lookup(db.raw_conn(), "deadbeef").unwrap(),
+        cache_lookup(db.raw_conn(), "deadbeef", NOW).unwrap(),
         CacheLookup::Miss
     );
 }
@@ -6961,15 +6971,14 @@ fn lookup_returns_hit_after_store_and_bumps_last_used() {
     fs::write(&elf, b"\x7fELF").unwrap();
 
     let blake = "aabbccdd";
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    cache_store(db.raw_conn(), blake, &elf, now_ms).unwrap();
+    cache_store(db.raw_conn(), blake, &elf, NOW).unwrap();
 
-    match cache_lookup(db.raw_conn(), blake).unwrap() {
+    match cache_lookup(db.raw_conn(), blake, NOW + 1).unwrap() {
         CacheLookup::Hit { elf_path } => assert_eq!(elf_path, elf),
         CacheLookup::Miss => panic!("expected Hit"),
     }
     let row = BuildCacheEntry::get(db.raw_conn(), blake).unwrap();
-    assert!(row.last_used_at >= now_ms);
+    assert_eq!(row.last_used_at, NOW + 1, "lookup must bump last_used_at");
 }
 
 #[test]
@@ -6979,24 +6988,59 @@ fn lookup_returns_miss_if_elf_file_disappeared() {
     let elf = tmp.path().join("foo.elf");
     fs::write(&elf, b"\x7fELF").unwrap();
     let blake = "ff00ff00";
-    cache_store(db.raw_conn(), blake, &elf, 0).unwrap();
+    cache_store(db.raw_conn(), blake, &elf, NOW).unwrap();
     fs::remove_file(&elf).unwrap();
 
     assert_eq!(
-        cache_lookup(db.raw_conn(), blake).unwrap(),
+        cache_lookup(db.raw_conn(), blake, NOW + 1).unwrap(),
         CacheLookup::Miss
     );
-    // And the stale row should have been pruned.
+    // The stale row should have been pruned.
     assert!(BuildCacheEntry::find(db.raw_conn(), blake).unwrap().is_none());
+}
+
+#[test]
+fn store_records_size_from_filesystem() {
+    let db = fresh_db();
+    let tmp = tempdir().unwrap();
+    let elf = tmp.path().join("foo.elf");
+    let payload = b"\x7fELFsomemorebytes";
+    fs::write(&elf, payload).unwrap();
+    cache_store(db.raw_conn(), "sizetest", &elf, NOW).unwrap();
+    let row = BuildCacheEntry::get(db.raw_conn(), "sizetest").unwrap();
+    assert_eq!(row.size_bytes, payload.len() as u64);
+}
+
+#[test]
+fn evict_lru_drops_least_recently_used_entries_and_unlinks_files() {
+    let db = fresh_db();
+    let tmp = tempdir().unwrap();
+
+    // Three entries with distinct last_used_at; size 100 each = 300 total.
+    let mut elfs: Vec<std::path::PathBuf> = Vec::new();
+    for (i, blake) in ["aa", "bb", "cc"].iter().enumerate() {
+        let path = tmp.path().join(format!("{blake}.elf"));
+        fs::write(&path, vec![0u8; 100]).unwrap();
+        cache_store(db.raw_conn(), blake, &path, NOW + i as i64).unwrap();
+        elfs.push(path);
+    }
+
+    // Cap at 200 bytes -> evict the oldest (aa).
+    let evicted = evict_lru(db.raw_conn(), 200).unwrap();
+    assert_eq!(evicted.len(), 1, "expected exactly one eviction");
+    assert_eq!(evicted[0].tar_blake3, "aa");
+    assert!(!elfs[0].exists(), "evicted ELF file must be unlinked");
+    assert!(elfs[1].exists(), "non-evicted ELF must remain");
+    assert!(elfs[2].exists());
 }
 ```
 
-- [ ] **Step 2: Run to confirm fail**
+- [ ] **Step 3: Run to confirm fail**
 
 Run: `cargo test -p paavo-core --test build_cache`
-Expected: FAIL — `cache_lookup`/`cache_store`/`CacheLookup` don't exist in `paavo-core`.
+Expected: FAIL — `cache_lookup` / `cache_store` / `evict_lru` / `CacheLookup` don't exist in `paavo-core` yet.
 
-- [ ] **Step 3: Implement the helpers**
+- [ ] **Step 4: Implement the helpers**
 
 `crates/paavo-core/src/build_cache.rs`:
 ```rust
@@ -7004,7 +7048,7 @@ Expected: FAIL — `cache_lookup`/`cache_store`/`CacheLookup` don't exist in `pa
 //! `paavo-db::BuildCacheEntry` (which persists where the ELF landed).
 //!
 //! Lives in `paavo-core` because it bridges the two; `paavo-build` itself
-//! stays DB-free.
+//! stays DB-free per spec §4.1.
 
 use crate::error::{CoreError, Result};
 use paavo_db::BuildCacheEntry;
@@ -7026,35 +7070,42 @@ pub enum CacheLookup {
 /// Look up a tar's cached ELF by blake3. Returns `Miss` if there's no row,
 /// or if the row's ELF file has gone missing on disk (in which case the
 /// stale row is also pruned so this function is self-healing).
-pub fn cache_lookup(conn: &Connection, tar_blake3: &str) -> Result<CacheLookup> {
-    let Some(entry) = BuildCacheEntry::find(conn, tar_blake3).map_err(CoreError::Db)? else {
+///
+/// `now_ms` is the wall-clock instant to record as `last_used_at` on a
+/// hit. Production passes `Utc::now().timestamp_millis()`; tests inject
+/// deterministic values.
+pub fn cache_lookup(
+    conn: &Connection,
+    tar_blake3: &str,
+    now_ms: i64,
+) -> Result<CacheLookup> {
+    let Some(entry) = BuildCacheEntry::find(conn, tar_blake3)? else {
         return Ok(CacheLookup::Miss);
     };
     let elf_path = PathBuf::from(&entry.elf_path);
     if !elf_path.is_file() {
+        // Self-heal: drop the stale row. Errors here are best-effort —
+        // the user-visible answer is still Miss.
         let _ = conn.execute(
             "DELETE FROM build_cache WHERE tar_blake3 = ?1",
             rusqlite::params![tar_blake3],
         );
         return Ok(CacheLookup::Miss);
     }
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    BuildCacheEntry::touch_last_used(conn, tar_blake3, now_ms).map_err(CoreError::Db)?;
+    BuildCacheEntry::touch_last_used(conn, tar_blake3, now_ms)?;
     Ok(CacheLookup::Hit { elf_path })
 }
 
 /// Insert (or refresh) a cache entry mapping `tar_blake3 -> elf_path`.
+/// Stats the ELF file to record its size; failure to stat returns
+/// `CoreError::Io`.
 pub fn cache_store(
     conn: &Connection,
     tar_blake3: &str,
     elf_path: &Path,
     now_ms: i64,
 ) -> Result<()> {
-    let size = std::fs::metadata(elf_path)
-        .map_err(|e| CoreError::Db(paavo_db::DbError::Sqlite(
-            rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-        )))?
-        .len();
+    let size = std::fs::metadata(elf_path)?.len();
     BuildCacheEntry::upsert(
         conn,
         &BuildCacheEntry {
@@ -7064,22 +7115,54 @@ pub fn cache_store(
             last_used_at: now_ms,
             size_bytes: size,
         },
-    )
-    .map_err(CoreError::Db)?;
+    )?;
     Ok(())
+}
+
+/// Evict cache entries until total size <= `max_bytes`. Removes the
+/// underlying ELF files on disk for each evicted row. Returns the list
+/// of evicted entries (in eviction order — least-recently-used first).
+///
+/// Best-effort on file deletion: if an ELF file is already gone, the
+/// eviction still counts as successful (the DB row is removed regardless).
+pub fn evict_lru(conn: &Connection, max_bytes: u64) -> Result<Vec<BuildCacheEntry>> {
+    let evicted = BuildCacheEntry::evict_until_under(conn, max_bytes)?;
+    for entry in &evicted {
+        let _ = std::fs::remove_file(&entry.elf_path);
+    }
+    Ok(evicted)
 }
 ```
 
-- [ ] **Step 4: Run the test**
+- [ ] **Step 5: Re-export from `lib.rs`**
+
+In `crates/paavo-core/src/lib.rs`, add:
+```rust
+mod build_cache;
+```
+(alphabetically, before `mod cancel;`)
+
+and:
+```rust
+pub use build_cache::{cache_lookup, cache_store, evict_lru, CacheLookup};
+```
+(alphabetically, before `pub use cancel::...`)
+
+- [ ] **Step 6: Run the test**
 
 Run: `cargo test -p paavo-core --test build_cache`
-Expected: 3 passed.
+Expected: 5 passed.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Full paavo-core suite**
+
+Run: `cargo test -p paavo-core`
+Expected: 6 enqueue + 4 priority + 3 lru + 3 starvation + 8 quarantine + 4 cancel + 5 build_cache = **33 integration tests**. Plus 1 doctest = **34 total**.
+
+- [ ] **Step 8: Commit**
 
 ```pwsh
 git -C D:\workspace\paavo add crates/paavo-core
-git -C D:\workspace\paavo commit -m "feat(core): build_cache lookup/store glue between paavo-build and paavo-db"
+git -C D:\workspace\paavo commit -m "feat(core): build_cache lookup/store/evict glue between paavo-build and paavo-db"
 ```
 
 ---
