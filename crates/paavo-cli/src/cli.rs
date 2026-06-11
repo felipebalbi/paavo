@@ -136,4 +136,11 @@ pub enum BoardOp {
         /// Board id.
         id: String,
     },
+    /// Permanently remove a board from the inventory. The board must
+    /// be currently quarantined and have no referencing job rows
+    /// (wait for retention to age out historical jobs first).
+    Remove {
+        /// Board id.
+        id: String,
+    },
 }

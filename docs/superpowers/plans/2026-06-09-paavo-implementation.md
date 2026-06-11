@@ -10625,6 +10625,488 @@ api_boards 8, config_loading 8, job_logs 3.
 
 ---
 
+#### 4.2.d: Board deletion (DELETE /boards/:id + `board remove`)
+
+Spec coverage: §9.4 (DELETE endpoint, quarantine-first guard,
+FK-preserved audit history) and §10.2 (`paavo-cli board remove`).
+Touches three crates: paavo-db (new `delete` helper with typed
+guard error), paavod (route + dispatch table + tests), and paavo-cli
+(new client method + subcommand). Added **after** the rest of M4.2
+because the original spec only covered add/quarantine/unquarantine
+— operator feedback exposed the need: a physically retired board
+otherwise lingers forever as `Quarantined`, polluting `/boards`.
+
+Design summary:
+
+- **Hard delete, not soft delete.** No new column, no `deleted_at`,
+  no filter clause everywhere. The `board` row is dropped.
+- **Quarantine-first guard.** Refused with `400 Bad Request` unless
+  the row's `health = 'quarantined'`. Forces the
+  quarantine-then-drain-then-delete pattern that §6.3 already
+  encodes for shutdown — symmetric, auditable, and blocks the
+  foot-gun where an operator deletes a board the dispatcher just
+  claimed.
+- **FK preserves audit history.** `job.board_id REFERENCES board(id)`
+  has no `ON DELETE` action, so SQLite's default `NO ACTION` rejects
+  the DELETE with a `ConstraintViolation` if any job row references
+  the board. We map that to `409 Conflict`. Operators who want to
+  purge such a board must wait for retention to age out the jobs.
+  `PRAGMA foreign_keys = ON` is already set at `Db::open` (verified;
+  see `crates/paavo-db/src/db.rs:60`), so the constraint is live.
+
+**Files (this sub-task touches three crates):**
+- Modify: `crates/paavo-db/src/error.rs` (add `Conflict` variant)
+- Modify: `crates/paavo-db/src/board.rs` (add `delete`)
+- Test: extend `crates/paavo-db/tests/board_ops.rs`
+- Modify: `crates/paavod/src/routes/boards.rs` (add `delete_board`)
+- Modify: `crates/paavod/src/app.rs` (mount `DELETE /boards/:id`)
+- Test: extend `crates/paavod/tests/api_boards.rs`
+- Modify: `crates/paavo-cli/src/cli.rs` (add `BoardOp::Remove`)
+- Modify: `crates/paavo-cli/src/cmd_boards.rs` (handle `Remove`)
+- Modify: `crates/paavo-cli/src/client.rs` (add `delete_json`)
+- Test: extend `crates/paavo-cli/tests/cli_help.rs`
+
+- [ ] **Step 1: Add `DbError::Conflict` variant**
+
+Extend `crates/paavo-db/src/error.rs`:
+```rust
+/// A typed entity could not be mutated because it conflicts with
+/// existing state (e.g. delete refused while related rows exist).
+/// Surfaces to HTTP as `409 Conflict`.
+#[error("{entity} {id} conflicts with existing state: {reason}")]
+Conflict {
+    /// Logical entity name.
+    entity: &'static str,
+    /// Id of the row.
+    id: String,
+    /// Human-readable reason.
+    reason: String,
+},
+```
+
+Add at the same level as the existing `NotFound` and `AlreadyExists`
+variants (alphabetical or grouped — match existing style).
+
+- [ ] **Step 2: Add the failing paavo-db test**
+
+Append to `crates/paavo-db/tests/board_ops.rs`:
+```rust
+#[test]
+fn delete_drops_quarantined_board_with_no_jobs() {
+    let (_tmp, db) = open();
+    let spec = sample_spec("mcxa266-99");
+    BoardRow::insert(db.raw_conn(), &spec, 0).unwrap();
+    BoardRow::quarantine(db.raw_conn(), &spec.id, "manual").unwrap();
+    BoardRow::delete(db.raw_conn(), &spec.id).unwrap();
+    assert!(matches!(
+        BoardRow::get(db.raw_conn(), &spec.id),
+        Err(DbError::NotFound { entity: "board", .. })
+    ));
+}
+
+#[test]
+fn delete_unknown_id_returns_not_found() {
+    let (_tmp, db) = open();
+    assert!(matches!(
+        BoardRow::delete(db.raw_conn(), "ghost"),
+        Err(DbError::NotFound { entity: "board", .. })
+    ));
+}
+
+#[test]
+fn delete_healthy_board_returns_conflict() {
+    let (_tmp, db) = open();
+    let spec = sample_spec("mcxa266-98");
+    BoardRow::insert(db.raw_conn(), &spec, 0).unwrap();
+    // never quarantined — should refuse
+    let err = BoardRow::delete(db.raw_conn(), &spec.id).unwrap_err();
+    assert!(matches!(
+        err,
+        DbError::Conflict { entity: "board", ref reason, .. }
+            if reason.contains("quarantined")
+    ));
+    // sanity: row is still there
+    assert!(BoardRow::get(db.raw_conn(), &spec.id).is_ok());
+}
+
+#[test]
+fn delete_board_with_referencing_job_returns_conflict() {
+    let (_tmp, db) = open();
+    let spec = sample_spec("mcxa266-97");
+    BoardRow::insert(db.raw_conn(), &spec, 0).unwrap();
+    BoardRow::quarantine(db.raw_conn(), &spec.id, "broken").unwrap();
+    // Insert a job that references this board.
+    let job_id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        db.raw_conn(),
+        &paavo_db::NewJob {
+            id: job_id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "test".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: spec.kind.clone(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 60_000,
+            hard_max_ms: 600_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+        },
+        0,
+    )
+    .unwrap();
+    // Attach the job to the board so the FK kicks in.
+    paavo_db::JobRow::transition_to_building(db.raw_conn(), job_id, &spec.id, 1).unwrap();
+    let err = BoardRow::delete(db.raw_conn(), &spec.id).unwrap_err();
+    assert!(matches!(
+        err,
+        DbError::Conflict { entity: "board", ref reason, .. }
+            if reason.contains("job") || reason.contains("referenc")
+    ));
+    assert!(BoardRow::get(db.raw_conn(), &spec.id).is_ok());
+}
+```
+
+Run: `cargo test -p paavo-db --test board_ops -- delete_`
+Expected: 4 fail (`BoardRow::delete` does not exist).
+
+- [ ] **Step 3: Implement `BoardRow::delete`**
+
+Append to `impl BoardRow` in `crates/paavo-db/src/board.rs`:
+```rust
+/// Permanently delete a board row. Refused unless the row is
+/// currently quarantined (caller's `quarantine_reason` doubles as
+/// the deletion justification). Refused if any `job` row references
+/// this `board_id` — SQLite enforces this via the FK constraint
+/// (`PRAGMA foreign_keys = ON` is set at `Db::open`).
+///
+/// Error mapping:
+/// - `DbError::NotFound { entity: "board", .. }` if the id is unknown
+/// - `DbError::Conflict { entity: "board", reason: "must be quarantined first", .. }`
+///   if the row's `health = 'healthy'`
+/// - `DbError::Conflict { entity: "board", reason: "referenced by ... job(s)", .. }`
+///   if at least one job references this board_id
+pub fn delete(conn: &Connection, id: &str) -> Result<()> {
+    // Read the row first so we can distinguish "not found" from
+    // "exists but healthy" with stable error messages, and so we
+    // can count referencing jobs for the FK-conflict message.
+    let row = match Self::find(conn, id)? {
+        Some(r) => r,
+        None => {
+            return Err(DbError::NotFound {
+                entity: "board",
+                id: id.to_string(),
+            });
+        }
+    };
+    if row.spec.health != BoardHealth::Quarantined {
+        return Err(DbError::Conflict {
+            entity: "board",
+            id: id.to_string(),
+            reason: "board must be quarantined first; \
+                     use POST /boards/:id/quarantine"
+                .into(),
+        });
+    }
+    let result = conn.execute("DELETE FROM board WHERE id = ?1", params![id]);
+    match result {
+        Ok(n) => {
+            // n == 0 cannot happen: we just read the row, the txn
+            // holds the row's lock at REPEATABLE READ semantics. If
+            // it does, treat as a race-induced NotFound.
+            if n == 0 {
+                Err(DbError::NotFound {
+                    entity: "board",
+                    id: id.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Err(RusqliteError::SqliteFailure(e, _))
+            if e.code == ErrorCode::ConstraintViolation =>
+        {
+            // FK rejection — count referencing jobs for a useful
+            // error message. We tolerate count failure: fall back
+            // to a generic message.
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM job WHERE board_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            let reason = if count >= 0 {
+                format!("referenced by {count} job row(s); \
+                         wait for retention to age them out")
+            } else {
+                "referenced by existing job rows; \
+                 wait for retention to age them out"
+                    .to_string()
+            };
+            Err(DbError::Conflict {
+                entity: "board",
+                id: id.to_string(),
+                reason,
+            })
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+```
+
+Run: `cargo test -p paavo-db --test board_ops -- delete_`
+Expected: 4 passed.
+
+- [ ] **Step 4: Write the failing paavod route test**
+
+Append to `crates/paavod/tests/api_boards.rs`:
+```rust
+#[tokio::test]
+async fn delete_board_drops_quarantined() {
+    let (app, state) = build_test_app();
+    // Add a board.
+    let spec = sample_board_spec("mcxa266-50");
+    seed_board(&state, &spec);
+    // Quarantine it.
+    post(&app, &format!("/boards/{}/quarantine", spec.id),
+         &json!({"reason": "manual"})).await;
+    // DELETE it.
+    let resp = delete(&app, &format!("/boards/{}", spec.id)).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // Verify the row is gone.
+    let listing: Vec<serde_json::Value> = get_json(&app, "/boards").await;
+    assert!(!listing.iter().any(|r| r["id"] == spec.id.as_str()));
+    // And the inventory cache is refreshed.
+    assert!(!state.inventory.lock().iter().any(|s| s.id == spec.id));
+}
+
+#[tokio::test]
+async fn delete_board_unknown_id_returns_404() {
+    let (app, _state) = build_test_app();
+    let resp = delete(&app, "/boards/ghost").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_board_healthy_returns_400() {
+    let (app, state) = build_test_app();
+    let spec = sample_board_spec("mcxa266-51");
+    seed_board(&state, &spec);
+    // Don't quarantine — should refuse.
+    let resp = delete(&app, &format!("/boards/{}", spec.id)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(body.contains("quarantined"), "got: {body}");
+}
+
+#[tokio::test]
+async fn delete_board_with_jobs_returns_409() {
+    let (app, state) = build_test_app();
+    let spec = sample_board_spec("mcxa266-52");
+    seed_board(&state, &spec);
+    // Seed a job that references the board.
+    {
+        let db = state.db.lock();
+        let job_id = paavo_proto::JobId::new();
+        paavo_db::JobRow::insert(
+            db.raw_conn(),
+            &paavo_db::NewJob {
+                id: job_id,
+                priority: paavo_proto::Priority::Interactive,
+                submitter: "test".into(),
+                source: paavo_proto::JobSource::Cli,
+                board_selector: paavo_proto::BoardSelector {
+                    kind: spec.kind.clone(),
+                    instance: None,
+                    wiring_profile: None,
+                },
+                inactivity_timeout_ms: 60_000,
+                hard_max_ms: 600_000,
+                tar_blake3: "x".into(),
+                tar_path: "/tmp/x.tar".into(),
+                cargo_update_packages: vec![],
+            },
+            0,
+        )
+        .unwrap();
+        paavo_db::JobRow::transition_to_building(db.raw_conn(), job_id, &spec.id, 1).unwrap();
+    }
+    // Quarantine the board.
+    post(&app, &format!("/boards/{}/quarantine", spec.id),
+         &json!({"reason": "broken"})).await;
+    // DELETE must refuse with 409 because the job row references it.
+    let resp = delete(&app, &format!("/boards/{}", spec.id)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_text(resp).await;
+    assert!(body.contains("job") || body.contains("referenc"),
+            "got: {body}");
+}
+```
+
+Add a `delete` helper near the existing `post` / `get_json` test
+helpers (top of file). Pattern:
+```rust
+async fn delete(app: &Router, path: &str) -> Response {
+    app.clone()
+        .oneshot(Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap())
+        .await
+        .unwrap()
+}
+```
+
+Run: `cargo test -p paavod --test api_boards -- delete_board`
+Expected: 4 fail (404 for the route — handler/dispatch don't exist).
+
+- [ ] **Step 5: Implement the paavod route**
+
+Append to `crates/paavod/src/routes/boards.rs`:
+```rust
+/// DELETE /boards/:id. See §9.4 for the contract.
+pub async fn delete_board(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> HandlerResult<StatusCode> {
+    {
+        let db = s.db.lock();
+        paavo_db::BoardRow::delete(db.raw_conn(), &id).map_err(db_to_http)?;
+    }
+    refresh_inventory_lossy(&s);
+    Ok(StatusCode::NO_CONTENT)
+}
+```
+
+Extend `db_to_http` to map `Conflict { reason, .. }` if it isn't
+already covered (it should be — the variant catch-all goes through
+`other => 500`). Replace the match to include:
+```rust
+DbError::Conflict { entity, id, reason } => {
+    let msg = format!("{entity} {id}: {reason}");
+    // "must be quarantined first" is a precondition failure (400),
+    // not a conflict with existing state (409). Distinguish on the
+    // reason text — the typed variant is intentionally vague so
+    // future call sites can reuse it.
+    let status = if reason.contains("quarantined first") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, msg)
+}
+```
+
+Mount the route in `crates/paavod/src/app.rs`:
+```rust
+.route(
+    "/boards/:id",
+    axum::routing::delete(routes::boards::delete_board),
+)
+```
+
+(Add to the existing `/boards/*` block; import `delete` from
+`axum::routing` at the top.)
+
+Run: `cargo test -p paavod --test api_boards -- delete_board`
+Expected: 4 passed.
+
+- [ ] **Step 6: Add `delete_json` to the CLI client**
+
+Append to `crates/paavo-cli/src/client.rs` `impl Client`:
+```rust
+/// DELETE the given path. Maps non-2xx into anyhow errors with the
+/// response body for operator-friendly diagnostics.
+pub async fn delete_json(&self, path: &str) -> Result<()> {
+    let resp = self
+        .http
+        .delete(format!("{}{}", self.base, path))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("paavod: {}", resp.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 7: Extend the CLI subcommand**
+
+Add to `crates/paavo-cli/src/cli.rs` `enum BoardOp`:
+```rust
+/// Permanently remove a board from the inventory. The board must
+/// be currently quarantined and have no referencing job rows.
+Remove {
+    /// Board id.
+    id: String,
+},
+```
+
+Handle it in `crates/paavo-cli/src/cmd_boards.rs`:
+```rust
+BoardOp::Remove { id } => {
+    client.delete_json(&format!("/boards/{id}")).await?;
+    println!("removed: {id}");
+    Ok(())
+}
+```
+
+- [ ] **Step 8: Add a CLI --help smoke test**
+
+Append to `crates/paavo-cli/tests/cli_help.rs`:
+```rust
+#[test]
+fn board_remove_help_mentions_id() {
+    let out = Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["board", "remove", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("Board id") || text.contains("<ID>"),
+            "board remove --help should mention the id arg; got:\n{text}");
+}
+```
+
+Run: `cargo test -p paavo-cli`
+Expected: all passing (existing + new test).
+
+- [ ] **Step 9: Clippy + fmt + commit**
+
+Run:
+```pwsh
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace
+```
+All green.
+
+```pwsh
+git -C D:\workspace\paavo add `
+    crates/paavo-db/src/error.rs `
+    crates/paavo-db/src/board.rs `
+    crates/paavo-db/tests/board_ops.rs `
+    crates/paavod/src/routes/boards.rs `
+    crates/paavod/src/app.rs `
+    crates/paavod/tests/api_boards.rs `
+    crates/paavo-cli/src/cli.rs `
+    crates/paavo-cli/src/cmd_boards.rs `
+    crates/paavo-cli/src/client.rs `
+    crates/paavo-cli/tests/cli_help.rs `
+    docs/superpowers/specs/2026-06-09-paavo-test-runner-design.md
+git -C D:\workspace\paavo commit -m "feat(boards): DELETE /boards/:id + paavo-cli board remove"
+```
+
+---
+
 ### Task 4.3: paavod — worker pool + dispatch loop + nightly cron + SIGTERM drain
 
 Spec coverage: §4.3 (one BoardWorker per board, OS thread), §5.3–§5.4 (dispatch + cancel paths), §6.3 (SIGTERM drain), §13 (nightly cron).

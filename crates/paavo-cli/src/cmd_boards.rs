@@ -79,5 +79,10 @@ pub async fn op(client: &Client, op: BoardOp) -> Result<()> {
             println!("unquarantined: {id}");
             Ok(())
         }
+        BoardOp::Remove { id } => {
+            client.delete_json(&format!("/boards/{id}")).await?;
+            println!("removed: {id}");
+            Ok(())
+        }
     }
 }

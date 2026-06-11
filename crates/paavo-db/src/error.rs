@@ -41,6 +41,18 @@ pub enum DbError {
         /// The duplicate id.
         id: String,
     },
+    /// A typed entity could not be mutated because it conflicts with
+    /// existing state (e.g. delete refused while related rows exist).
+    /// Surfaces to HTTP as `409 Conflict`.
+    #[error("{entity} {id} conflicts with existing state: {reason}")]
+    Conflict {
+        /// Logical entity name.
+        entity: &'static str,
+        /// Id of the row.
+        id: String,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// `Result` alias used throughout paavo-db.

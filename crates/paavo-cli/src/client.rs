@@ -96,4 +96,18 @@ impl Client {
     pub async fn add_board(&self, spec: &BoardSpec) -> Result<()> {
         self.post_json("/boards", Some(spec)).await
     }
+
+    /// DELETE the given path. Non-2xx is surfaced as an anyhow error
+    /// carrying the response body for operator-friendly diagnostics.
+    pub async fn delete_json(&self, path: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}{}", self.base, path))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("paavod: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
 }

@@ -269,3 +269,146 @@ async fn quarantine_and_unquarantine_flip_health_and_cache() {
     assert!(row.quarantine_reason.is_none());
     assert_eq!(s.inventory_snapshot()[0].health, BoardHealth::Healthy);
 }
+
+async fn delete_req(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+async fn read_text(resp: axum::http::Response<axum::body::Body>) -> String {
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn delete_board_drops_quarantined_row_and_refreshes_cache() {
+    let s = state();
+    let app = build_router(s.clone());
+
+    assert_eq!(
+        post_json(app.clone(), "/boards", sample_board_json())
+            .await
+            .status(),
+        StatusCode::CREATED,
+    );
+    assert_eq!(
+        post_json(
+            app.clone(),
+            "/boards/mcxa266-01/quarantine",
+            json!({"reason": "retire"}),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT,
+    );
+
+    let resp = delete_req(app.clone(), "/boards/mcxa266-01").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // GET /boards no longer lists it.
+    let req = Request::builder()
+        .uri("/boards")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let v = read_json(app.oneshot(req).await.unwrap()).await;
+    assert!(v.as_array().unwrap().is_empty(), "board should be gone");
+
+    // Inventory cache should also have dropped it.
+    assert!(
+        s.inventory_snapshot().is_empty(),
+        "cached inventory should reconverge on delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_board_unknown_id_returns_404() {
+    let s = state();
+    let app = build_router(s.clone());
+    let resp = delete_req(app, "/boards/ghost").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_board_when_healthy_returns_400_with_quarantined_message() {
+    // Operator-friendly precondition: refuse the destructive op on a
+    // live board with a clear next step. 400 (not 409) because the
+    // request itself is malformed for the current state.
+    let s = state();
+    let app = build_router(s.clone());
+    assert_eq!(
+        post_json(app.clone(), "/boards", sample_board_json())
+            .await
+            .status(),
+        StatusCode::CREATED,
+    );
+    let resp = delete_req(app, "/boards/mcxa266-01").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_text(resp).await;
+    assert!(
+        body.contains("quarantined"),
+        "body should hint at the quarantine flow, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delete_board_with_referencing_job_returns_409() {
+    // FK-backed: even after quarantine, a board with referencing job
+    // rows cannot be deleted until retention ages them out.
+    let s = state();
+    paavo_db::BoardRow::insert(
+        s.db.lock().raw_conn(),
+        &BoardSpec {
+            id: "b".into(),
+            kind: "mcxa266".into(),
+            probe_selector: ProbeSelector {
+                vid: "x".into(),
+                pid: "x".into(),
+                serial: "x".into(),
+            },
+            chip_name: "x".into(),
+            target_name: "x".into(),
+            wiring_profile: None,
+            health: BoardHealth::Healthy,
+        },
+        0,
+    )
+    .unwrap();
+    let sel = paavo_proto::BoardSelector {
+        kind: "mcxa266".into(),
+        instance: None,
+        wiring_profile: None,
+    };
+    let job_id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id: job_id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: sel,
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &job_id, "b", 1).unwrap();
+    paavo_db::BoardRow::quarantine(s.db.lock().raw_conn(), "b", "draining").unwrap();
+
+    let app = build_router(s.clone());
+    let resp = delete_req(app, "/boards/b").await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = read_text(resp).await;
+    assert!(
+        body.contains("job") || body.contains("referenc"),
+        "body should explain the FK conflict, got: {body}"
+    );
+}

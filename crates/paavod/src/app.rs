@@ -3,7 +3,7 @@
 use crate::app_state::AppState;
 use crate::routes;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
 /// Build the axum Router with all routes mounted.
@@ -25,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
             "/boards",
             get(routes::boards::list_boards).post(routes::boards::add_board),
         )
+        .route("/boards/:id", delete(routes::boards::delete_board))
         .route(
             "/boards/:id/quarantine",
             post(routes::boards::quarantine_board),

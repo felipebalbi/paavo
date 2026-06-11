@@ -103,6 +103,22 @@ pub async fn unquarantine_board(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// DELETE /boards/:id. See §9.4. Refused unless the board is currently
+/// quarantined (precondition → 400) and unless no `job` row references
+/// this `board_id` (FK conflict → 409). Successful delete refreshes the
+/// inventory cache.
+pub async fn delete_board(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> HandlerResult<StatusCode> {
+    {
+        let db = s.db.lock();
+        paavo_db::BoardRow::delete(db.raw_conn(), &id).map_err(db_to_http)?;
+    }
+    refresh_inventory_lossy(&s);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Re-read the `boards` table and replace the cached inventory. Takes
 /// both locks (db then inventory) so the read+write is atomic with
 /// respect to other writers. Called by `paavod::main` at startup to
@@ -135,10 +151,17 @@ fn row_to_view(r: paavo_db::BoardRow) -> BoardView {
 }
 
 /// Map a `DbError` to an HTTP status + message. Typed variants
-/// (`NotFound`, `AlreadyExists`) get 404/409 with their own messages;
-/// everything else becomes 500 with the `Display` text (info-leak
-/// risk on `Sqlite(...)` is acceptable for an internal lab tool but
-/// we log the full error so it's not silently lost).
+/// (`NotFound`, `AlreadyExists`, `Conflict`) get 404/409/(400 or 409)
+/// with their own messages; everything else becomes 500 with the
+/// `Display` text (info-leak risk on `Sqlite(...)` is acceptable for
+/// an internal lab tool but we log the full error so it's not silently
+/// lost).
+///
+/// `Conflict` is split between 400 and 409 based on whether the reason
+/// names a precondition the operator can fix locally (must-quarantine
+/// first) vs a true state conflict (FK still references this row).
+/// The "quarantined first" substring is a contract between
+/// `BoardRow::delete` and this function.
 fn db_to_http(err: DbError) -> (StatusCode, String) {
     match err {
         DbError::NotFound { entity, id } => {
@@ -148,6 +171,15 @@ fn db_to_http(err: DbError) -> (StatusCode, String) {
             StatusCode::CONFLICT,
             format!("{entity} already exists: {id}"),
         ),
+        DbError::Conflict { entity, id, reason } => {
+            let msg = format!("{entity} {id}: {reason}");
+            let status = if reason.contains("quarantined first") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, msg)
+        }
         other => {
             error!(error = ?other, "unexpected db error");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{other}"))

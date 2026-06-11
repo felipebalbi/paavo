@@ -90,7 +90,7 @@ runtime boundaries:
   systemd unit; can be restarted or upgraded independently of the daemon.
 - **`paavo-cli`** — the developer client. HTTP client to `paavod`. Subcommands
   include `run`, `new`, `cancel`, `logs`, `boards`, `jobs`, `board add`,
-  `board quarantine`, `board unquarantine`.
+  `board quarantine`, `board unquarantine`, `board remove`.
 
 ### 3.1 Top-level data flow
 
@@ -752,7 +752,22 @@ JSON request/response except where noted.
   or whitespace-only. Unknown id returns `404`.
 - `POST /boards/:id/unquarantine` — clear quarantine and reset the
   consecutive-infra-failure counter to 0. Unknown id returns `404`.
-- All four endpoints continue to serve while paavod is draining
+- `DELETE /boards/:id` — permanently remove a board from the
+  inventory. Guard: the row must currently be quarantined
+  (`health = 'quarantined'`) so the operator has already documented
+  *why* it is being retired and any in-flight jobs have had a chance
+  to drain. Returns `400 Bad Request` if the row is `healthy`,
+  `404 Not Found` if the row does not exist, and `409 Conflict` if
+  any `job` row references this `board_id` (preserves audit history
+  per §11). The FK is enforced by SQLite — `PRAGMA foreign_keys =
+  ON` is set at `Db::open`. On success the inventory cache is
+  refreshed and `204 No Content` is returned. The CLI exposes this
+  as `paavo-cli board remove <id>` (§10.2). Rationale for the
+  quarantine-first guard: symmetric with the "quarantine then
+  delete" pattern §6.3 already uses for graceful shutdown, and
+  blocks the foot-gun where an operator rm's a healthy board the
+  dispatcher just claimed.
+- All five endpoints continue to serve while paavod is draining
   (§6.3 drain semantics gate `POST /jobs` only — operators must be
   able to quarantine a misbehaving board during shutdown).
 - Error envelope is `text/plain` in v1 — a JSON envelope (`{"error":
@@ -795,6 +810,11 @@ behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
 - `paavo-cli board add --kind mcxa266 --instance mcxa266-02 --probe 1366:1015:000123456789 --chip MCXA266VFL --target frdm-mcx-a266 [--wiring-profile default]`
 - `paavo-cli board quarantine <id> --reason "broken JTAG header"`
 - `paavo-cli board unquarantine <id>`
+- `paavo-cli board remove <id>` — permanently delete the row. Refused
+  unless the board is currently quarantined (the quarantine reason
+  doubles as the deletion justification) and unless no `job` row still
+  references it. Operators who want to delete a board with referenced
+  jobs must wait for `retention` to age them out (per §11).
 
 ### 10.3 Server discovery
 

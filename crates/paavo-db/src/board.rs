@@ -188,6 +188,73 @@ impl BoardRow {
         )?;
         require_one_row(n, id)
     }
+
+    /// Permanently delete a board row. Refused unless the row is
+    /// currently quarantined. Refused if any job row references this
+    /// board_id (SQLite FK with PRAGMA foreign_keys = ON enforces this).
+    ///
+    /// Error mapping:
+    /// - `DbError::NotFound { entity: "board", .. }` if the id is unknown
+    /// - `DbError::Conflict { entity: "board", reason: "...quarantined first...", .. }`
+    ///   if the row is currently healthy
+    /// - `DbError::Conflict { entity: "board", reason: "referenced by N job row(s)...", .. }`
+    ///   if at least one job row references this board
+    pub fn delete(conn: &Connection, id: &str) -> Result<()> {
+        let row = match Self::find(conn, id)? {
+            Some(r) => r,
+            None => {
+                return Err(DbError::NotFound {
+                    entity: "board",
+                    id: id.to_string(),
+                });
+            }
+        };
+        if row.spec.health != BoardHealth::Quarantined {
+            return Err(DbError::Conflict {
+                entity: "board",
+                id: id.to_string(),
+                reason: "board must be quarantined first; use POST /boards/:id/quarantine".into(),
+            });
+        }
+        let result = conn.execute("DELETE FROM board WHERE id = ?1", params![id]);
+        match result {
+            Ok(n) => {
+                if n == 0 {
+                    Err(DbError::NotFound {
+                        entity: "board",
+                        id: id.to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Err(RusqliteError::SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
+                // Best-effort: count the offenders so the operator
+                // knows the scale. If the count query itself fails for
+                // any reason, fall back to a generic message — the
+                // outer Conflict is still useful.
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM job WHERE board_id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(-1);
+                let reason = if count >= 0 {
+                    format!("referenced by {count} job row(s); wait for retention to age them out")
+                } else {
+                    "referenced by existing job rows; wait for retention to age them out"
+                        .to_string()
+                };
+                Err(DbError::Conflict {
+                    entity: "board",
+                    id: id.to_string(),
+                    reason,
+                })
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
 }
 
 /// Map a `rusqlite::execute` rows-affected count to `Ok(())` or

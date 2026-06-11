@@ -359,3 +359,118 @@ fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
         "board should be eligible again after job finalized"
     );
 }
+
+#[test]
+fn delete_quarantined_board_succeeds() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
+    BoardRow::quarantine(db.raw_conn(), "mcxa266-01", "broken").unwrap();
+
+    BoardRow::delete(db.raw_conn(), "mcxa266-01").unwrap();
+
+    assert!(
+        BoardRow::find(db.raw_conn(), "mcxa266-01")
+            .unwrap()
+            .is_none(),
+        "row should be gone after delete"
+    );
+}
+
+#[test]
+fn delete_unknown_id_returns_not_found() {
+    let db = fresh_db();
+    let err = BoardRow::delete(db.raw_conn(), "ghost").unwrap_err();
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "ghost");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_healthy_board_returns_conflict_must_be_quarantined_first() {
+    // §9.4: delete is a destructive op and is gated by quarantine so an
+    // operator cannot accidentally yank a healthy board out from under
+    // running jobs. The "quarantined first" substring is load-bearing
+    // for the HTTP layer's 400-vs-409 routing in db_to_http.
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
+    let err = BoardRow::delete(db.raw_conn(), "mcxa266-01").unwrap_err();
+    match err {
+        paavo_db::DbError::Conflict { entity, id, reason } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "mcxa266-01");
+            assert!(
+                reason.contains("quarantined first"),
+                "reason should mention 'quarantined first', got: {reason}"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // And the row is still there.
+    assert!(BoardRow::find(db.raw_conn(), "mcxa266-01")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn delete_board_with_referencing_job_returns_conflict_via_fk() {
+    // SQLite foreign-key enforcement (PRAGMA foreign_keys = ON, set at
+    // Db::open) refuses the DELETE because job.board_id references this
+    // row. The typed Conflict reason should mention the referencing
+    // jobs so the operator knows why and what to do (wait for retention).
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
+
+    let sel = paavo_proto::BoardSelector {
+        kind: "mcxa266".into(),
+        instance: None,
+        wiring_profile: None,
+    };
+    let job_id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        db.raw_conn(),
+        &paavo_db::NewJob {
+            id: job_id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: sel,
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+        },
+        now,
+    )
+    .unwrap();
+    // Wire the job to this board via the building transition so
+    // job.board_id is populated.
+    paavo_db::JobRow::transition_to_building(db.raw_conn(), &job_id, "mcxa266-01", now + 1)
+        .unwrap();
+
+    // Even if we now quarantine the board, the FK still refuses delete.
+    BoardRow::quarantine(db.raw_conn(), "mcxa266-01", "draining").unwrap();
+    let err = BoardRow::delete(db.raw_conn(), "mcxa266-01").unwrap_err();
+    match err {
+        paavo_db::DbError::Conflict { entity, id, reason } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "mcxa266-01");
+            assert!(
+                reason.contains("referenced by") && reason.contains("job"),
+                "reason should mention referencing job rows, got: {reason}"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // Row still present.
+    assert!(BoardRow::find(db.raw_conn(), "mcxa266-01")
+        .unwrap()
+        .is_some());
+}
