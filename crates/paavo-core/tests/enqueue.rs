@@ -47,7 +47,7 @@ fn rejects_selector_with_no_matching_board() {
 }
 
 #[test]
-fn rejects_quarantined_only_kind_too() {
+fn accepts_when_only_match_is_quarantined() {
     // Per spec §5.5 the selector must be *possible*, not currently available.
     // A quarantined board is still possible — bring it back online with
     // unquarantine and it can run. So this case should be accepted.

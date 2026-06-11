@@ -6242,6 +6242,7 @@ fn enqueue_inserts_a_submitted_job() {
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
 
     let id = JobId::new();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let returned = enqueue_job(
         db.raw_conn(),
         &list_inventory_specs(&db),
@@ -6261,6 +6262,7 @@ fn enqueue_inserts_a_submitted_job() {
             tar_path: "/tmp/x.tar".into(),
             daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
         },
+        now_ms,
     )
     .unwrap();
     assert_eq!(returned, id);
@@ -6293,13 +6295,14 @@ fn rejects_selector_with_no_matching_board() {
             tar_path: "/tmp/x.tar".into(),
             daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
         },
+        chrono::Utc::now().timestamp_millis(),
     )
     .unwrap_err();
     assert!(matches!(err, CoreError::SelectorNeverMatches(_)), "{err}");
 }
 
 #[test]
-fn rejects_quarantined_only_kind_too() {
+fn accepts_when_only_match_is_quarantined() {
     // Per spec §5.5 the selector must be *possible*, not currently available.
     // A quarantined board is still possible — bring it back online with
     // unquarantine and it can run. So this case should be accepted.
@@ -6324,6 +6327,7 @@ fn rejects_quarantined_only_kind_too() {
             tar_path: "/tmp/x.tar".into(),
             daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
         },
+        chrono::Utc::now().timestamp_millis(),
     );
     assert!(id.is_ok(), "quarantined boards should not block enqueue");
 }
@@ -6352,6 +6356,7 @@ fn rejects_hard_max_above_daemon_ceiling() {
             tar_path: "/tmp/x.tar".into(),
             daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
         },
+        chrono::Utc::now().timestamp_millis(),
     )
     .unwrap_err();
     assert!(
