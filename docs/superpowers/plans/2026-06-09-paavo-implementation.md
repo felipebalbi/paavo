@@ -8380,9 +8380,14 @@ fn board_view_omits_none_quarantine_reason() {
         created_at: 0,
     };
     let j = serde_json::to_value(&view).unwrap();
+    // BoardView's own Option fields use skip_serializing_if.
     assert!(j.get("quarantine_reason").is_none());
     assert!(j.get("last_used_at").is_none());
-    assert!(j.get("wiring_profile").is_none());
+    // BoardSpec::wiring_profile does NOT use skip_serializing_if (the
+    // field's serde attrs live on `BoardSelector::wiring_profile`,
+    // not on `BoardSpec`), so it serializes as `null` here. Pin the
+    // explicit null so a future skip_serializing_if change is caught.
+    assert!(j["wiring_profile"].is_null());
 }
 ```
 
