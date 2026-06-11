@@ -6389,38 +6389,35 @@ git -C D:\workspace\paavo commit -m "test(core): enqueue path — selector + cei
 ```rust
 mod common;
 
-use chrono::Utc;
-use common::{fresh_db, insert_board, list_inventory_specs};
-use paavo_core::{enqueue_job, pick_next, EnqueueRequest, SchedulerConfig};
-use paavo_proto::{
-    BoardHealth, BoardSelector, JobId, JobSource, Priority,
-};
+use common::{default_enqueue_request, fresh_db, insert_board};
+use paavo_core::{enqueue_job, pick_next, SchedulerConfig};
+use paavo_proto::{BoardHealth, JobId, JobSource, Priority};
 
-fn enqueue(db: &paavo_db::Db, priority: Priority, source: JobSource) -> JobId {
-    let id = JobId::new();
+/// Inject a deterministic `submitted_at` so priority/order assertions are
+/// race-free. Uses the M3.2.b harness helper to keep the EnqueueRequest
+/// boilerplate out of the test bodies.
+fn enqueue_at(
+    db: &paavo_db::Db,
+    priority: Priority,
+    source: JobSource,
+    submitted_at_ms: i64,
+) -> JobId {
+    let mut req = default_enqueue_request("mcxa266");
+    req.priority = priority;
+    req.source = source;
+    let id = req.job_id;
     enqueue_job(
         db.raw_conn(),
-        &list_inventory_specs(db),
-        EnqueueRequest {
-            job_id: id,
-            priority,
-            submitter: "x".into(),
-            source,
-            board_selector: BoardSelector {
-                kind: "mcxa266".into(),
-                instance: None,
-                wiring_profile: None,
-            },
-            inactivity_timeout_ms: 120_000,
-            hard_max_ms: 900_000,
-            tar_blake3: "x".into(),
-            tar_path: "/tmp/x.tar".into(),
-            daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
-        },
+        &common::list_inventory_specs(db),
+        req,
+        submitted_at_ms,
     )
     .unwrap();
     id
 }
+
+const T0: i64 = 1_700_000_000_000;
+const NOW: i64 = T0 + 60_000;
 
 #[test]
 fn picks_interactive_over_scheduled_even_if_older() {
@@ -6428,11 +6425,12 @@ fn picks_interactive_over_scheduled_even_if_older() {
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
 
     // Scheduled inserted "first" (submitted_at lower).
-    let scheduled = enqueue(&db, Priority::Scheduled, JobSource::Scheduler);
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let interactive = enqueue(&db, Priority::Interactive, JobSource::Cli);
+    let scheduled = enqueue_at(&db, Priority::Scheduled, JobSource::Scheduler, T0);
+    let interactive = enqueue_at(&db, Priority::Interactive, JobSource::Cli, T0 + 2_000);
 
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap().unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW)
+        .unwrap()
+        .unwrap();
     assert_eq!(pick.job.id, interactive);
     assert_ne!(pick.job.id, scheduled);
 }
@@ -6441,9 +6439,9 @@ fn picks_interactive_over_scheduled_even_if_older() {
 fn returns_none_when_no_healthy_board_matches() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Quarantined);
-    let _ = enqueue(&db, Priority::Interactive, JobSource::Cli);
+    let _ = enqueue_at(&db, Priority::Interactive, JobSource::Cli, T0);
 
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW).unwrap();
     assert!(pick.is_none());
 }
 
@@ -6451,7 +6449,7 @@ fn returns_none_when_no_healthy_board_matches() {
 fn returns_none_when_no_submitted_jobs() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW).unwrap();
     assert!(pick.is_none());
 }
 
@@ -6460,11 +6458,12 @@ fn within_a_priority_class_oldest_submitted_wins() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
 
-    let a = enqueue(&db, Priority::Interactive, JobSource::Cli);
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let _b = enqueue(&db, Priority::Interactive, JobSource::Cli);
+    let a = enqueue_at(&db, Priority::Interactive, JobSource::Cli, T0);
+    let _b = enqueue_at(&db, Priority::Interactive, JobSource::Cli, T0 + 2_000);
 
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap().unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW)
+        .unwrap()
+        .unwrap();
     assert_eq!(pick.job.id, a);
 }
 ```
@@ -6475,35 +6474,15 @@ fn within_a_priority_class_oldest_submitted_wins() {
 ```rust
 mod common;
 
-use chrono::Utc;
-use common::{fresh_db, insert_board, list_inventory_specs};
-use paavo_core::{enqueue_job, pick_next, EnqueueRequest, SchedulerConfig};
-use paavo_proto::{
-    BoardHealth, BoardSelector, JobId, JobSource, Priority,
-};
+use common::{default_enqueue_request, fresh_db, insert_board, list_inventory_specs};
+use paavo_core::{enqueue_job, pick_next, SchedulerConfig};
+use paavo_proto::BoardHealth;
+
+const NOW: i64 = 1_700_000_060_000;
 
 fn enqueue(db: &paavo_db::Db) {
-    enqueue_job(
-        db.raw_conn(),
-        &list_inventory_specs(db),
-        EnqueueRequest {
-            job_id: JobId::new(),
-            priority: Priority::Interactive,
-            submitter: "x".into(),
-            source: JobSource::Cli,
-            board_selector: BoardSelector {
-                kind: "mcxa266".into(),
-                instance: None,
-                wiring_profile: None,
-            },
-            inactivity_timeout_ms: 120_000,
-            hard_max_ms: 900_000,
-            tar_blake3: "x".into(),
-            tar_path: "/tmp/x.tar".into(),
-            daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
-        },
-    )
-    .unwrap();
+    let req = default_enqueue_request("mcxa266");
+    enqueue_job(db.raw_conn(), &list_inventory_specs(db), req, NOW - 60_000).unwrap();
 }
 
 #[test]
@@ -6513,11 +6492,12 @@ fn never_used_board_wins_over_recently_used() {
     insert_board(&db, "mcxa266-02", "mcxa266", BoardHealth::Healthy);
 
     // Mark -01 as recently used.
-    let now = Utc::now().timestamp_millis();
-    paavo_db::BoardRow::touch_last_used(db.raw_conn(), "mcxa266-01", now).unwrap();
+    paavo_db::BoardRow::touch_last_used(db.raw_conn(), "mcxa266-01", NOW - 1_000).unwrap();
     enqueue(&db);
 
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap().unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW)
+        .unwrap()
+        .unwrap();
     assert_eq!(pick.board.spec.id, "mcxa266-02");
 }
 
@@ -6530,7 +6510,9 @@ fn older_last_used_wins_when_both_have_used() {
     paavo_db::BoardRow::touch_last_used(db.raw_conn(), "b", 100).unwrap();
     enqueue(&db);
 
-    let pick = pick_next(db.raw_conn(), SchedulerConfig::default()).unwrap().unwrap();
+    let pick = pick_next(db.raw_conn(), SchedulerConfig::default(), NOW)
+        .unwrap()
+        .unwrap();
     assert_eq!(pick.board.spec.id, "b");
 }
 ```
@@ -6541,75 +6523,79 @@ fn older_last_used_wins_when_both_have_used() {
 ```rust
 mod common;
 
-use chrono::Utc;
-use common::{fresh_db, insert_board, list_inventory_specs};
-use paavo_core::{enqueue_job, pick_next, EnqueueRequest, SchedulerConfig};
-use paavo_proto::{
-    BoardHealth, BoardSelector, JobId, JobSource, Priority,
-};
+use common::{default_enqueue_request, fresh_db, insert_board, list_inventory_specs};
+use paavo_core::{enqueue_job, pick_next, SchedulerConfig};
+use paavo_proto::{BoardHealth, JobId, JobSource, Priority};
 
 #[test]
 fn scheduled_job_older_than_threshold_outranks_a_fresh_interactive() {
     let db = fresh_db();
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
 
+    // Use injected timestamps so the test is race-free.
+    const T_SCHEDULED: i64 = 1_700_000_000_000;
+    const T_INTERACTIVE: i64 = T_SCHEDULED + 80; // ms
+    const NOW: i64 = T_INTERACTIVE + 1;
     let cfg = SchedulerConfig {
-        starvation_threshold_ms: 50, // tiny so the test runs in milliseconds
+        starvation_threshold_ms: 50,
     };
 
     let scheduled = JobId::new();
-    enqueue_job(
-        db.raw_conn(),
-        &list_inventory_specs(&db),
-        EnqueueRequest {
-            job_id: scheduled,
-            priority: Priority::Scheduled,
-            submitter: "scheduler".into(),
-            source: JobSource::Scheduler,
-            board_selector: BoardSelector {
-                kind: "mcxa266".into(),
-                instance: None,
-                wiring_profile: None,
-            },
-            inactivity_timeout_ms: 120_000,
-            hard_max_ms: 14_400_000,
-            tar_blake3: "x".into(),
-            tar_path: "/tmp/x.tar".into(),
-            daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
-        },
-    )
-    .unwrap();
-
-    // Wait past the starvation horizon.
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    let mut sreq = default_enqueue_request("mcxa266");
+    sreq.job_id = scheduled;
+    sreq.priority = Priority::Scheduled;
+    sreq.source = JobSource::Scheduler;
+    sreq.submitter = "scheduler".into();
+    sreq.hard_max_ms = 14_400_000;
+    enqueue_job(db.raw_conn(), &list_inventory_specs(&db), sreq, T_SCHEDULED).unwrap();
 
     let interactive = JobId::new();
-    enqueue_job(
-        db.raw_conn(),
-        &list_inventory_specs(&db),
-        EnqueueRequest {
-            job_id: interactive,
-            priority: Priority::Interactive,
-            submitter: "cli".into(),
-            source: JobSource::Cli,
-            board_selector: BoardSelector {
-                kind: "mcxa266".into(),
-                instance: None,
-                wiring_profile: None,
-            },
-            inactivity_timeout_ms: 120_000,
-            hard_max_ms: 900_000,
-            tar_blake3: "x".into(),
-            tar_path: "/tmp/x.tar".into(),
-            daemon_ceiling_ms: 8 * 60 * 60 * 1_000,
-        },
-    )
-    .unwrap();
+    let mut ireq = default_enqueue_request("mcxa266");
+    ireq.job_id = interactive;
+    ireq.priority = Priority::Interactive;
+    ireq.source = JobSource::Cli;
+    ireq.submitter = "cli".into();
+    enqueue_job(db.raw_conn(), &list_inventory_specs(&db), ireq, T_INTERACTIVE).unwrap();
 
-    let pick = pick_next(db.raw_conn(), cfg).unwrap().unwrap();
+    let pick = pick_next(db.raw_conn(), cfg, NOW).unwrap().unwrap();
     assert_eq!(
         pick.job.id, scheduled,
         "starved Scheduled job should outrank fresh Interactive"
+    );
+}
+
+#[test]
+fn scheduled_job_within_threshold_does_not_promote() {
+    // Mirror image of the above: when now-submitted_at < threshold, the
+    // Scheduled job is NOT promoted and the fresh Interactive wins.
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+
+    const T_SCHEDULED: i64 = 1_700_000_000_000;
+    const T_INTERACTIVE: i64 = T_SCHEDULED + 30; // ms
+    const NOW: i64 = T_INTERACTIVE + 1;
+    let cfg = SchedulerConfig {
+        starvation_threshold_ms: 50, // 50ms threshold, scheduled is only 31ms old at NOW
+    };
+
+    let scheduled = JobId::new();
+    let mut sreq = default_enqueue_request("mcxa266");
+    sreq.job_id = scheduled;
+    sreq.priority = Priority::Scheduled;
+    sreq.source = JobSource::Scheduler;
+    enqueue_job(db.raw_conn(), &list_inventory_specs(&db), sreq, T_SCHEDULED).unwrap();
+
+    let interactive = JobId::new();
+    let mut ireq = default_enqueue_request("mcxa266");
+    ireq.job_id = interactive;
+    ireq.priority = Priority::Interactive;
+    ireq.source = JobSource::Cli;
+    enqueue_job(db.raw_conn(), &list_inventory_specs(&db), ireq, T_INTERACTIVE).unwrap();
+
+    let pick = pick_next(db.raw_conn(), cfg, NOW).unwrap().unwrap();
+    assert_eq!(
+        pick.job.id, interactive,
+        "non-starved Scheduled job should not outrank a fresh Interactive"
     );
 }
 ```
@@ -6617,7 +6603,7 @@ fn scheduled_job_older_than_threshold_outranks_a_fresh_interactive() {
 - [ ] **Step 4: Run all three scheduler tests**
 
 Run: `cargo test -p paavo-core --tests`
-Expected: 4 + 2 + 1 + 4 enqueue = 11 passed (so far).
+Expected: 4 priority + 2 lru + 2 starvation + 6 enqueue = **14 passed**.
 
 - [ ] **Step 5: Commit**
 
