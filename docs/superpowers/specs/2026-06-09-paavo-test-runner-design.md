@@ -344,6 +344,13 @@ Tunable in config.
 - `Running` → signal watchdog with `force_cancel`; watchdog sends Cancel to
   BoardWorker.
 
+**v1 carve-out (until M4.3 wires the dispatch loop):** the HTTP cancel
+endpoint only handles `Submitted` inline; `Building`/`Running` return
+`409 Conflict` with a clear message. The full multi-state cancel above
+lands once M4.3 wires the BoardWorker signal path. Tests pin both
+behaviours so the day M4.3 lands the response transitions cleanly from
+409 to 204.
+
 ### 5.5 Board selector
 
 A `JobSpec` includes a `board_selector` that the scheduler matches against
@@ -634,9 +641,35 @@ JSON request/response except where noted.
 
 ### 9.3 Job query
 
-- `GET /jobs/:id` — current job row + outcome.
-- `GET /jobs?state=running&limit=50` — paginated query.
-- `POST /jobs/:id/cancel` — see §5.4.
+- `GET /jobs/:id` — returns a single `JobView` (current state + outcome
+  when terminal). 404 on unknown id. Invalid id (not a valid ULID)
+  returns 400.
+- `GET /jobs?state=&limit=` — returns `Vec<JobView>` ordered by
+  `submitted_at` descending (newest first). Query parameters:
+  - `state` (optional) — filter by one of `submitted`, `building`,
+    `running`, `passed`, `failed`, `timedout`, `aborted`. Omitted ⇒
+    defaults to `submitted` (the operator's queue view). Unknown
+    value ⇒ 400.
+  - `limit` (optional) — bound on the number of rows. Default 50,
+    must be `1..=500`. Unparseable or out-of-range ⇒ 400.
+  - **v1 has no pagination cursor**: with > `limit` matching rows the
+    response is truncated, not paginated. Cursor-based pagination
+    (`?cursor=<opaque>&limit=N` with a `next_cursor` envelope) is a
+    planned follow-up; until then the bare `Vec<JobView>` shape is
+    the wire contract.
+- `POST /jobs/:id/cancel` — see §5.4. v1 carve-out: only `Submitted`
+  jobs are cancellable inline (returns 204 + state ⇒ `Aborted`).
+  `Building` and `Running` jobs return `409 Conflict` until M4.3
+  wires the worker-signal path. Unknown id ⇒ 404. Invalid id ⇒ 400.
+- `JobView` wire shape (defined in `paavo-proto`): id, priority,
+  submitter, source, board_selector, inactivity_timeout_ms,
+  hard_max_ms, state, outcome (Option), board_id (Option),
+  submitted_at, started_at (Option), finished_at (Option),
+  tar_blake3. **Deliberately excludes** the daemon-local filesystem
+  paths (`tar_path`, `elf_path`); those are server-internal.
+- All three endpoints serve during drain (operators monitoring
+  shutdown need read access; cancelling an in-flight job during
+  drain is exactly when you'd need it). Same carve-out as §9.4.
 
 ### 9.4 Board management
 

@@ -10032,6 +10032,61 @@ git -C D:\workspace\paavo add crates/paavod crates/paavo-db
 git -C D:\workspace\paavo commit -m "feat(paavod): GET /jobs[?state=], GET /jobs/:id, POST /jobs/:id/cancel"
 ```
 
+**Round 2 amendments** (from spec + quality review of the as-shipped
+implementation):
+
+1. **`JobView` in `paavo-proto`** — the plan above derives
+   `serde::Serialize` on `paavo_db::JobRow` and serializes that
+   directly. Reviewers flagged two problems: (a) it exposes the
+   daemon-local `tar_path` and `elf_path` to all HTTP clients, an
+   information disclosure; (b) it makes `paavo-db`'s internal column
+   struct a wire contract, violating the §3 layering guideline. Fix:
+   add `paavo_proto::JobView` that wraps the public fields (no
+   `tar_path` / `elf_path`; keeps `tar_blake3` since it is
+   content-addressed and useful for build-cache debugging). The
+   handlers map `JobRow → JobView` via a private `row_to_view` helper.
+   Add 2 round-trip tests in `crates/paavo-proto/tests/serde_roundtrip.rs`
+   that pin the omission of the path fields.
+
+2. **`DbError::NotFound` instead of pattern-matching
+   `rusqlite::Error::QueryReturnedNoRows`** — the plan adds `rusqlite`
+   as a direct dependency of `paavod` solely so the cancel handler can
+   pattern-match the underlying rusqlite variant. The cleaner fix is
+   upstream: `paavo_db::JobRow::get` (and `BoardRow::get`) maps
+   `QueryReturnedNoRows` to `DbError::NotFound { entity, id }`, and the
+   handler matches the typed variant. This drops the `rusqlite` direct
+   dep from `paavod`. Add 2 unit tests in
+   `crates/paavo-db/tests/{board,job}_ops.rs` that pin the `NotFound`
+   mapping.
+
+3. **Strict `limit` validation** — the plan's `list_jobs` does
+   `q.get("limit").and_then(parse).unwrap_or(50).min(500)`, which
+   silently swallows `?limit=garbage` and `?limit=0`. Tighten to 400
+   on unparseable / out-of-range (`1..=500`). Add 2 tests:
+   `list_jobs_rejects_unparseable_limit_with_400` and
+   `list_jobs_rejects_out_of_range_limit_with_400`.
+
+4. **More 400/404/409 coverage** — add 5 more tests:
+   `list_jobs_rejects_unknown_state_with_400`,
+   `get_job_rejects_invalid_id_with_400`,
+   `cancel_job_rejects_invalid_id_with_400`,
+   `cancel_terminal_job_returns_409` (pins §5.4: terminal jobs are not
+   cancellable), `get_job_view_omits_tar_path_and_elf_path` (pins the
+   wire-shape contract from amendment 1).
+
+5. **Spec amendments** (committed alongside the implementation):
+   - §9.3 now documents the default `state` (= `submitted`), the
+     `limit` validation range, the lack of v1 pagination, the
+     `JobView` wire shape (with the deliberate exclusion of
+     `tar_path` / `elf_path`), the ordering (`submitted_at DESC`),
+     and the carve-out that read+cancel endpoints serve during drain.
+   - §5.4 now records the v1 carve-out: `Building`/`Running` return
+     `409 Conflict` until M4.3 wires the worker-signal path.
+
+Final shipped count: **24 paavod api_jobs tests** (17 from the original
+plan + 7 from these amendments). paavo-db gains 2 NotFound tests, paavo-proto
+gains 2 JobView round-trip tests.
+
 ---
 
 ##### 4.2.c.iii: Job log stream (NDJSON long-poll)
