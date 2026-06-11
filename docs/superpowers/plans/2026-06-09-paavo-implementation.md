@@ -10091,14 +10091,48 @@ gains 2 JobView round-trip tests.
 
 ##### 4.2.c.iii: Job log stream (NDJSON long-poll)
 
-This handler needs a live source of log frames keyed by job id. We add an `inbox` to `AppState` plus a "completed" terminal frame marker.
+The spec (§9.2) defines this as **NDJSON** — one JSON object per line,
+`Content-Type: application/x-ndjson`. We do NOT use SSE: NDJSON parsing
+is `split('\n')` + `from_str`, the same code-shape `paavo-cli` already
+uses for paavo-build's stderr stream, with no SSE event-framing
+parser.
 
-- [ ] **Step 1: Add a JobLogs broker to AppState**
+The handler delivers:
+1. The full historical log (every `LogFrame` persisted in sqlite,
+   ordered by `seq` ASC).
+2. Either the terminal-line drawn from the DB (if the job has already
+   finalized), OR a live tail subscribed to `JobLogsBroker` until a
+   terminal event arrives.
+
+We add an `inbox` to `AppState` for the live channel + a terminal
+marker.
+
+- [ ] **Step 1: Add `async-stream` to workspace deps**
+
+In `Cargo.toml` `[workspace.dependencies]` (alphabetical position):
+```toml
+async-stream = "0.3"
+```
+
+- [ ] **Step 2: Add a JobLogsBroker to AppState**
 
 `crates/paavod/src/job_logs.rs`:
 ```rust
 //! Per-job broadcast of log frames + terminal marker. In-memory only;
-//! historical logs are read from sqlite.
+//! historical frames live in sqlite.
+//!
+//! Subscriber semantics: a subscriber that joins AFTER a terminal event
+//! has been published and the channel finalized will miss the live
+//! terminal event. The `stream_job` handler therefore subscribes BEFORE
+//! reading the DB; if the DB then shows the job is already terminal the
+//! handler emits the terminal line from the persisted outcome and drops
+//! the subscriber. The historical frames + terminal-from-DB path is the
+//! authoritative "race-free" branch.
+//!
+//! Lag: the broadcast channel capacity is 256. A slow subscriber that
+//! falls behind gets `RecvError::Lagged(n)`; we surface that as a
+//! synthetic `LiveEvent::Lagged(n)` frame so the client can decide
+//! whether to refetch from sqlite.
 
 use paavo_proto::{JobId, JobOutcome, LogFrame};
 use parking_lot::Mutex;
@@ -10111,12 +10145,12 @@ use tokio::sync::broadcast;
 pub enum LiveEvent {
     /// One log frame.
     Frame(LogFrame),
-    /// Terminal outcome — closes the stream.
+    /// Terminal outcome — the stream closes after emitting this.
     Terminal(JobOutcome),
 }
 
 /// Per-job broadcaster.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct JobLogsBroker {
     inner: Arc<Mutex<HashMap<JobId, broadcast::Sender<LiveEvent>>>>,
 }
@@ -10124,9 +10158,7 @@ pub struct JobLogsBroker {
 impl JobLogsBroker {
     /// Construct an empty broker.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     /// Subscribe to (or create) the channel for `id`. Capacity 256.
@@ -10139,119 +10171,164 @@ impl JobLogsBroker {
         sender.subscribe()
     }
 
-    /// Publish a frame.
-    pub fn publish(&self, id: JobId, event: LiveEvent) {
+    /// Publish an event to all current subscribers. Returns the number
+    /// of subscribers reached (0 means nobody was listening). Lossless
+    /// if every subscriber has capacity; lagged subscribers see
+    /// `RecvError::Lagged(n)`.
+    pub fn publish(&self, id: JobId, event: LiveEvent) -> usize {
         let map = self.inner.lock();
-        if let Some(s) = map.get(&id) {
-            let _ = s.send(event);
-        }
+        map.get(&id).and_then(|s| s.send(event).ok()).unwrap_or(0)
     }
 
-    /// Drop the channel after a terminal event has been published, so memory
-    /// doesn't grow unbounded.
+    /// Drop the channel after a terminal event has been published so
+    /// memory doesn't grow unbounded. Idempotent.
     pub fn finalize(&self, id: JobId) {
         self.inner.lock().remove(&id);
     }
-}
 
-impl Default for JobLogsBroker {
-    fn default() -> Self {
-        Self::new()
+    /// Live-channel count for `id`. Useful for tests.
+    #[cfg(test)]
+    pub fn active_channels(&self) -> usize {
+        self.inner.lock().len()
     }
 }
 ```
 
-Add `pub mod job_logs;` to `crates/paavod/src/lib.rs`. Add `pub job_logs: crate::job_logs::JobLogsBroker,` to `AppState` and initialize in `make_state`/test helpers with `JobLogsBroker::new()`.
+Add `pub mod job_logs;` to `crates/paavod/src/lib.rs`. Add
+`pub job_logs: crate::job_logs::JobLogsBroker,` to `AppState` and
+initialize in `make_state` / test helpers with
+`JobLogsBroker::new()`. Update `api_health.rs`, `api_boards.rs`,
+`api_jobs.rs` test fixtures to populate the field.
 
-- [ ] **Step 2: Stream handler**
+- [ ] **Step 3: Stream handler**
 
 Replace `stream_job` in `crates/paavod/src/routes/jobs.rs`:
 ```rust
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use futures::stream::{self, Stream, StreamExt};
+use axum::body::Body;
+use axum::http::header;
+use axum::response::Response;
+use futures::stream::{self, StreamExt};
 use std::convert::Infallible;
+use tokio_stream::wrappers::BroadcastStream;
 
-/// GET /jobs/:id/stream — NDJSON-style SSE stream. Each event payload is one
-/// JSON line: either `{"type":"frame","frame":...}` or
-/// `{"type":"terminal","outcome":...}`. Stream ends after the terminal event.
+/// GET /jobs/:id/stream — NDJSON long-poll. One JSON object per line:
+///   `{"type":"frame","frame":<LogFrame>}` for each historical or live
+///   frame, then exactly one `{"type":"terminal","outcome":<JobOutcome>}`
+///   line before the stream closes.
+///
+/// Response is `application/x-ndjson`. Clients parse by splitting on
+/// `\n` and deserializing each line. Frames carry `seq` numbers so
+/// clients can dedup if the historical-then-live boundary races (rare
+/// in practice — see job_logs.rs for the ordering contract).
+///
+/// 400 if `:id` is not a valid ULID. 404 if no such job. Otherwise
+/// 200 with a streaming body.
 pub async fn stream_job(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let id: JobId = match id.parse() {
         Ok(i) => i,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid id").into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
     };
 
-    // 1. Historical frames from sqlite.
-    let historical: Vec<paavo_proto::LogFrame> = {
+    // Subscribe FIRST so that if the job finalizes between this point
+    // and the DB read we still receive any live frames published in
+    // that window. (If the DB shows terminal, we close the subscriber
+    // and emit the terminal from the persisted outcome instead.)
+    let rx = s.job_logs.subscribe(id);
+
+    // Read current state + historical frames under the db lock.
+    let (historical, current_state, current_outcome) = {
         use paavo_db::LogFrameDb;
         let db = s.db.lock();
-        paavo_proto::LogFrame::list(db.raw_conn(), &id, 0, 10_000).unwrap_or_default()
-    };
-
-    // 2. Check terminal state. If already terminal, emit historical + terminal
-    // outcome and close.
-    let terminal_already: Option<paavo_proto::JobOutcome> = {
-        let db = s.db.lock();
-        paavo_db::JobRow::find(db.raw_conn(), &id)
-            .ok()
-            .flatten()
-            .and_then(|r| r.outcome.filter(|_| r.state.is_terminal()))
-    };
-
-    if let Some(outcome) = terminal_already {
-        let frames = historical.clone();
-        let s = stream::iter(
-            frames
-                .into_iter()
-                .map(|f| serde_json::json!({"type":"frame","frame": f}))
-                .chain(std::iter::once(
-                    serde_json::json!({"type":"terminal","outcome": outcome}),
-                ))
-                .map(|v| SseEvent::default().data(v.to_string()))
-                .map(Ok::<_, Infallible>),
-        );
-        return Sse::new(s).keep_alive(KeepAlive::default()).into_response();
-    }
-
-    // 3. Live subscriber.
-    let mut rx = s.job_logs.subscribe(id);
-    let live = async_stream::stream! {
-        for h in historical {
-            yield Ok::<_, Infallible>(SseEvent::default().data(
-                serde_json::json!({"type":"frame","frame": h}).to_string(),
-            ));
-        }
-        loop {
-            match rx.recv().await {
-                Ok(crate::job_logs::LiveEvent::Frame(f)) => {
-                    yield Ok(SseEvent::default().data(
-                        serde_json::json!({"type":"frame","frame": f}).to_string(),
-                    ));
-                }
-                Ok(crate::job_logs::LiveEvent::Terminal(o)) => {
-                    yield Ok(SseEvent::default().data(
-                        serde_json::json!({"type":"terminal","outcome": o}).to_string(),
-                    ));
-                    break;
-                }
-                Err(_) => break,
+        let row = match paavo_db::JobRow::find(db.raw_conn(), &id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+            Err(e) => {
+                error!(error = %e, "stream_job db error");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
-        }
+        };
+        let frames = paavo_proto::LogFrame::list(db.raw_conn(), &id, 0, 10_000).unwrap_or_default();
+        (frames, row.state, row.outcome)
     };
-    Sse::new(live).keep_alive(KeepAlive::default()).into_response()
+
+    // Build the response body.
+    let body = if current_state.is_terminal() {
+        // Terminal already — emit historical + terminal-from-DB, close.
+        let outcome = current_outcome
+            .clone()
+            .unwrap_or(paavo_proto::JobOutcome::Aborted {
+                by: paavo_proto::AbortReason::User,
+            });
+        let lines = historical
+            .into_iter()
+            .map(|f| ndjson_line(&serde_json::json!({"type":"frame","frame": f})))
+            .chain(std::iter::once(ndjson_line(
+                &serde_json::json!({"type":"terminal","outcome": outcome}),
+            )))
+            .collect::<Vec<_>>();
+        Body::from_stream(stream::iter(lines).map(Ok::<_, Infallible>))
+    } else {
+        // Live — emit historical first, then read from the broadcast
+        // channel until Terminal.
+        let live = async_stream::stream! {
+            for f in historical {
+                yield Ok::<_, Infallible>(ndjson_line(
+                    &serde_json::json!({"type":"frame","frame": f}),
+                ));
+            }
+            let mut rx = BroadcastStream::new(rx);
+            while let Some(item) = rx.next().await {
+                match item {
+                    Ok(crate::job_logs::LiveEvent::Frame(f)) => {
+                        yield Ok(ndjson_line(
+                            &serde_json::json!({"type":"frame","frame": f}),
+                        ));
+                    }
+                    Ok(crate::job_logs::LiveEvent::Terminal(o)) => {
+                        yield Ok(ndjson_line(
+                            &serde_json::json!({"type":"terminal","outcome": o}),
+                        ));
+                        break;
+                    }
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        yield Ok(ndjson_line(&serde_json::json!({
+                            "type": "lagged",
+                            "missed": n,
+                        })));
+                    }
+                }
+            }
+        };
+        Body::from_stream(live)
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body)
+        .unwrap()
+}
+
+fn ndjson_line(v: &serde_json::Value) -> bytes::Bytes {
+    let mut s = v.to_string();
+    s.push('\n');
+    bytes::Bytes::from(s)
 }
 ```
 
 Add deps to `crates/paavod/Cargo.toml` under `[dependencies]`:
 ```toml
-async-stream = "0.3"
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
 ```
 
-Add to workspace deps and reference here.
+If `tokio-stream` is not yet in the workspace, add `tokio-stream = "0.1"`
+under `[workspace.dependencies]`.
 
-- [ ] **Step 3: Test the stream (terminal case)**
+- [ ] **Step 4: Tests**
 
 Append to `crates/paavod/tests/api_jobs.rs`:
 ```rust
@@ -10263,13 +10340,17 @@ async fn stream_terminal_returns_historical_plus_outcome() {
 
     let id = paavo_proto::JobId::new();
     paavo_db::JobRow::insert(
-        &s.db.lock().raw_conn(),
+        s.db.lock().raw_conn(),
         &paavo_db::NewJob {
             id,
             priority: paavo_proto::Priority::Interactive,
             submitter: "x".into(),
             source: paavo_proto::JobSource::Cli,
-            board_selector: paavo_proto::BoardSelector { kind: "mcxa266".into(), instance: None, wiring_profile: None },
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
             inactivity_timeout_ms: 120_000,
             hard_max_ms: 900_000,
             tar_blake3: "x".into(),
@@ -10279,17 +10360,19 @@ async fn stream_terminal_returns_historical_plus_outcome() {
     )
     .unwrap();
     paavo_proto::LogFrame::append_batch(
-        &s.db.lock().raw_conn(),
+        s.db.lock().raw_conn(),
         &id,
         &[paavo_proto::LogFrame {
-            seq: 0, ts_us: 0,
+            seq: 0,
+            ts_us: 0,
             level: paavo_proto::LogLevel::Info,
-            target: None, message: "hi".into(),
+            target: None,
+            message: "hi".into(),
         }],
     )
     .unwrap();
     paavo_db::JobRow::finalize(
-        &s.db.lock().raw_conn(),
+        s.db.lock().raw_conn(),
         &id,
         &paavo_db::OutcomeRecord {
             state: paavo_proto::JobState::Passed,
@@ -10306,26 +10389,186 @@ async fn stream_terminal_returns_historical_plus_outcome() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
-    assert!(text.contains("\"frame\""), "{text}");
-    assert!(text.contains("\"terminal\""), "{text}");
-    // JobOutcome::Passed serializes as the bare string "passed" (externally
-    // tagged enum unit variant).
-    assert!(text.contains("\"outcome\":\"passed\""), "{text}");
+    // Two lines: frame + terminal.
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 NDJSON lines, got: {text}");
+    let frame_line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(frame_line["type"], "frame");
+    assert_eq!(frame_line["frame"]["message"], "hi");
+    let term_line: Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(term_line["type"], "terminal");
+    assert_eq!(term_line["outcome"], "passed");
+}
+
+#[tokio::test]
+async fn stream_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{}/stream", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn stream_rejects_invalid_id_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs/not-a-ulid/stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn stream_live_emits_published_frame_then_terminal() {
+    use paavo_db::LogFrameDb;
+    // Insert a Running job (no historical frames yet). Subscribe via
+    // the broker, publish a frame + terminal from a spawned task, and
+    // verify the stream sees both then closes.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1).unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let broker = s.job_logs.clone();
+    // Publish from another task on a short delay so the handler
+    // subscribes first.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        broker.publish(
+            id,
+            crate::job_logs::LiveEvent::Frame(paavo_proto::LogFrame {
+                seq: 0,
+                ts_us: 0,
+                level: paavo_proto::LogLevel::Info,
+                target: None,
+                message: "live".into(),
+            }),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        broker.publish(
+            id,
+            crate::job_logs::LiveEvent::Terminal(paavo_proto::JobOutcome::Passed),
+        );
+    });
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}/stream"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 NDJSON lines, got: {text}");
+    let frame_line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(frame_line["type"], "frame");
+    assert_eq!(frame_line["frame"]["message"], "live");
+    let term_line: Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(term_line["type"], "terminal");
 }
 ```
 
-- [ ] **Step 4: Run**
+Test the broker directly in `crates/paavod/tests/job_logs.rs`:
+```rust
+use paavo_proto::{AbortReason, JobId, JobOutcome, LogFrame, LogLevel};
+use paavod::job_logs::{JobLogsBroker, LiveEvent};
 
-Run: `cargo test -p paavod --test api_jobs`
-Expected: 6 passed.
+#[tokio::test]
+async fn subscribe_publish_receive_in_order() {
+    let broker = JobLogsBroker::new();
+    let id = JobId::new();
+    let mut rx = broker.subscribe(id);
+    broker.publish(
+        id,
+        LiveEvent::Frame(LogFrame {
+            seq: 0,
+            ts_us: 0,
+            level: LogLevel::Info,
+            target: None,
+            message: "a".into(),
+        }),
+    );
+    broker.publish(id, LiveEvent::Terminal(JobOutcome::Passed));
+    let first = rx.recv().await.unwrap();
+    let second = rx.recv().await.unwrap();
+    matches!(first, LiveEvent::Frame(_));
+    matches!(second, LiveEvent::Terminal(_));
+}
 
-- [ ] **Step 5: Commit**
+#[tokio::test]
+async fn finalize_drops_channel() {
+    let broker = JobLogsBroker::new();
+    let id = JobId::new();
+    let _rx = broker.subscribe(id);
+    assert_eq!(broker.active_channels(), 1);
+    broker.finalize(id);
+    assert_eq!(broker.active_channels(), 0);
+}
+
+#[tokio::test]
+async fn publish_with_no_subscribers_is_a_noop() {
+    let broker = JobLogsBroker::new();
+    let id = JobId::new();
+    let n = broker.publish(
+        id,
+        LiveEvent::Terminal(JobOutcome::Aborted {
+            by: AbortReason::User,
+        }),
+    );
+    assert_eq!(n, 0);
+}
+```
+
+- [ ] **Step 5: Run**
+
+Run: `cargo test -p paavod`
+Expected: api_jobs 28 passed (24 + 4), api_health 4, api_boards 8,
+config_loading 8, job_logs 3.
+
+Also `cargo test --workspace` and the usual clippy + fmt gates.
+
+- [ ] **Step 6: Commit**
 
 ```pwsh
-git -C D:\workspace\paavo add crates/paavod Cargo.toml
-git -C D:\workspace\paavo commit -m "feat(paavod): /jobs/:id/stream SSE handler (historical + terminal)"
+git -C D:\workspace\paavo add crates/paavod Cargo.toml Cargo.lock
+git -C D:\workspace\paavo commit -m "feat(paavod): /jobs/:id/stream NDJSON live + historical log stream"
 ```
 
 ---

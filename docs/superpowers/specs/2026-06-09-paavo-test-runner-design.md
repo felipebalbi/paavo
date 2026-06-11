@@ -633,11 +633,23 @@ JSON request/response except where noted.
 
 `GET /jobs/:id/stream`
 
-- Long-lived NDJSON response. One JSON line per `LogFrame`. Ends with a
-  `{"type":"terminal","outcome":...}` line when the job reaches a terminal
-  state.
-- If the job is already terminal when the call arrives, the response is the
-  full historical log plus the terminal line, then closes.
+- Long-lived NDJSON response (`Content-Type: application/x-ndjson`).
+  Each line is one JSON object, parseable independently. Three line
+  types:
+  - `{"type":"frame","frame":{<LogFrame>}}` — one log frame. `frame.seq`
+    is monotonic per job; clients can dedup if the historical/live
+    boundary races.
+  - `{"type":"terminal","outcome":{<JobOutcome>}}` — exactly once,
+    immediately before the stream closes.
+  - `{"type":"lagged","missed":<u64>}` — informational: the live
+    broadcast channel dropped `missed` frames because the client
+    couldn't keep up. Client should re-fetch from the historical
+    endpoint to recover. (`broadcast::RecvError::Lagged` surfaces here.)
+- If the job is already terminal when the call arrives the response is
+  the full historical log followed by the terminal line, then closes.
+- 400 if `:id` is not a valid ULID. 404 if no such job. Otherwise 200.
+- Serves during drain (operators monitoring shutdown need access to
+  the live log of an in-flight job).
 
 ### 9.3 Job query
 
