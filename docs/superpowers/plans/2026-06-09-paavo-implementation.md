@@ -11517,6 +11517,54 @@ git -C D:\workspace\paavo add crates/paavod
 git -C D:\workspace\paavo commit -m "feat(paavod): dispatch loop (pick_next → build → run → finalize)"
 ```
 
+**Round 2 amendments** (from spec + quality review of the as-shipped
+implementation — three real defects, all hardware-safety / drain
+correctness):
+
+1. **Board exclusivity in paavo-db**. Reviewer caught that
+   `pick_next` would happily return the same (kind, board) pair for
+   two concurrent dispatches because nothing in the schema excludes
+   boards with an in-flight job. With a real probe-rs Runner that
+   means two BoardWorker tasks attaching to the same probe → flash
+   corruption / hung sessions / possible hardware damage. **Fix**:
+   `paavo_db::BoardRow::find_healthy_for_selector` now adds
+   `AND NOT EXISTS (SELECT 1 FROM job WHERE job.board_id = board.id
+   AND job.state IN ('building','running'))`. Two new tests pin the
+   invariant: one in `paavo-db/tests/board_ops.rs` exercising the SQL
+   directly, one in `paavod/tests/dispatch_loop.rs::dispatch_does_not_double_dispatch_same_board`
+   using a `CountingRunner` that asserts the max-concurrent count is 1.
+
+2. **Drain short-circuit at the loop level**. The plan's `if drain &&
+   active == 0 { return; }` would fall through to `pick_next` whenever
+   `active > 0`, claiming new jobs throughout the drain window. Spec
+   §6.3 forbids this. **Fix**: on every loop iteration, drain is
+   checked FIRST: if set and registry empty → return; if set and
+   registry non-empty → sleep and continue without picking. New test
+   `dispatch_does_not_pick_new_jobs_after_drain` pins it.
+
+3. **Panic / early-return safety in `run_one`**. The plan's
+   `transition_to_running` failure path returned without calling
+   `finalize_with_outcome`, leaking the cancellation entry, the
+   broker channel, and the DB row (stuck in Building forever).
+   Worse, a panic inside `runner.run` or `build_or_cache` would do
+   the same. **Fix**: refactor `run_one` into an inner
+   `run_one_inner` that returns `(JobOutcome, bool)`, wrap with
+   `std::panic::catch_unwind`, and have the outer `run_one` always
+   call `finalize_with_outcome` on any exit path (including panic,
+   surfaced as `Failed(InfraErr { stage: "dispatch", message })`).
+   The `transition_to_running` failure path now produces
+   `Failed(InfraErr { stage: "transition_to_running", message })`.
+   New test `dispatch_finalizes_on_runner_panic_without_leaking`
+   pins panic recovery + registry cleanup.
+
+Plus minor: claim-race path now sleeps 50ms instead of busy-looping;
+docstring on `_cancel_rx` corrected (unregister happens before rx
+drops).
+
+Final shipped count: paavod tests dispatch_loop 7 (+3 from R2),
+api_jobs 34, cancellation 5, api_health 4, api_boards 8, config 8,
+job_logs 3. paavo-db gains 1 test (exclusivity).
+
 ---
 
 #### 4.3.c: Nightly cron driver
