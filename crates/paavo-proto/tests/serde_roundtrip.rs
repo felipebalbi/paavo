@@ -300,3 +300,77 @@ fn job_outcome_wire_strings_pin_external_tagging() {
         "expected inner kind tag: {s}"
     );
 }
+
+#[test]
+fn job_view_roundtrip() {
+    use paavo_proto::*;
+    let view = JobView {
+        id: JobId::new(),
+        priority: Priority::Interactive,
+        submitter: "felipe".into(),
+        source: JobSource::Cli,
+        board_selector: BoardSelector {
+            kind: "mcxa266".into(),
+            instance: None,
+            wiring_profile: None,
+        },
+        inactivity_timeout_ms: 120_000,
+        hard_max_ms: 900_000,
+        state: JobState::Running,
+        outcome: None,
+        board_id: Some("mcxa266-01".into()),
+        submitted_at: 1_700_000_000_000,
+        started_at: Some(1_700_000_001_000),
+        finished_at: None,
+        tar_blake3: "deadbeef".into(),
+    };
+    let json = serde_json::to_value(&view).unwrap();
+    // Wire shape contract: no tar_path, no elf_path.
+    assert!(
+        json.get("tar_path").is_none(),
+        "JobView must not expose tar_path"
+    );
+    assert!(
+        json.get("elf_path").is_none(),
+        "JobView must not expose elf_path"
+    );
+    // state uses the JobState snake_case rename ("running").
+    assert_eq!(json["state"], "running");
+    // None fields are omitted via skip_serializing_if.
+    assert!(json.get("outcome").is_none());
+    assert!(json.get("finished_at").is_none());
+
+    let back: JobView = serde_json::from_value(json).unwrap();
+    assert_eq!(back, view);
+}
+
+#[test]
+fn job_view_terminal_includes_outcome_and_finished_at() {
+    use paavo_proto::*;
+    let view = JobView {
+        id: JobId::new(),
+        priority: Priority::Scheduled,
+        submitter: "cron".into(),
+        source: JobSource::Scheduler,
+        board_selector: BoardSelector {
+            kind: "mcxa266".into(),
+            instance: None,
+            wiring_profile: None,
+        },
+        inactivity_timeout_ms: 120_000,
+        hard_max_ms: 14_400_000,
+        state: JobState::Aborted,
+        outcome: Some(JobOutcome::Aborted {
+            by: AbortReason::User,
+        }),
+        board_id: None,
+        submitted_at: 1,
+        started_at: None,
+        finished_at: Some(2),
+        tar_blake3: "x".into(),
+    };
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["state"], "aborted");
+    assert_eq!(json["finished_at"], 2);
+    assert!(json["outcome"].is_object());
+}

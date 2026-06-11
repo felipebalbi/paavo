@@ -209,3 +209,20 @@ fn delete_cascades_to_log_frames() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[test]
+fn get_unknown_id_returns_not_found() {
+    // Pins that JobRow::get maps QueryReturnedNoRows → DbError::NotFound
+    // so the HTTP layer can do `match err { NotFound => 404 }` without
+    // pattern-matching on rusqlite primitives.
+    let db = fresh_db();
+    let ghost = paavo_proto::JobId::new();
+    let err = JobRow::get(db.raw_conn(), &ghost).unwrap_err();
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "job");
+            assert_eq!(id, ghost.to_string());
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}

@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use paavo_core::{enqueue_job, validate_enqueue, EnqueueRequest};
-use paavo_proto::{BoardSelector, JobId, JobSource, Priority};
+use paavo_proto::{BoardSelector, JobId, JobSource, JobView, Priority};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{error, warn};
@@ -298,28 +298,157 @@ fn core_to_http(e: paavo_core::CoreError) -> (StatusCode, String) {
     }
 }
 
-/// GET /jobs?state=...&limit=... — implemented in 4.2.c.ii.
-pub async fn list_jobs(_state: State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "GET /jobs is wired in 4.2.c.ii",
-    )
+/// GET /jobs?state=...&limit=... — list jobs filtered by state.
+///
+/// Defaults: `state` omitted ⇒ `Submitted`, `limit` omitted ⇒ 50,
+/// clamped to ≤ 500 to bound response size. Unknown `state` value
+/// ⇒ 400. Unparseable or out-of-range `limit` (0 or > 500) ⇒ 400.
+/// Returns `Vec<JobView>` — wire shape excludes server-local
+/// `tar_path` / `elf_path`.
+pub async fn list_jobs(
+    State(s): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<JobView>>, (StatusCode, String)> {
+    let limit: u32 = match q.get("limit") {
+        Some(v) => v
+            .parse::<u32>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid limit: {v}")))
+            .and_then(|n| {
+                if (1..=500).contains(&n) {
+                    Ok(n)
+                } else {
+                    Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("limit must be 1..=500, got {n}"),
+                    ))
+                }
+            })?,
+        None => 50,
+    };
+    let state = match q.get("state") {
+        Some(v) => parse_state(v)?,
+        None => paavo_proto::JobState::Submitted,
+    };
+    let rows = {
+        let db = s.db.lock();
+        paavo_db::JobRow::list_by_state(db.raw_conn(), state, limit)
+    }
+    .map_err(db_to_http)?;
+    Ok(Json(rows.into_iter().map(row_to_view).collect()))
 }
 
-/// GET /jobs/:id — implemented in 4.2.c.ii.
-pub async fn get_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "GET /jobs/:id is wired in 4.2.c.ii",
-    )
+// Keep `parse_state` in sync with `paavo_proto::JobState`'s
+// `#[serde(rename = "...")]` table; a rename there must propagate
+// here.
+fn parse_state(s: &str) -> Result<paavo_proto::JobState, (StatusCode, String)> {
+    use paavo_proto::JobState::*;
+    Ok(match s {
+        "submitted" => Submitted,
+        "building" => Building,
+        "running" => Running,
+        "passed" => Passed,
+        "failed" => Failed,
+        "timedout" => TimedOut,
+        "aborted" => Aborted,
+        _ => return Err((StatusCode::BAD_REQUEST, format!("unknown state: {s}"))),
+    })
 }
 
-/// POST /jobs/:id/cancel — implemented in 4.2.c.ii.
-pub async fn cancel_job(_state: State<AppState>, _id: Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "POST /jobs/:id/cancel is wired in 4.2.c.ii",
-    )
+/// GET /jobs/:id — fetch a single job. 404 on unknown id.
+pub async fn get_job(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobView>, (StatusCode, String)> {
+    let id: JobId = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid job id".into()))?;
+    let row = {
+        let db = s.db.lock();
+        paavo_db::JobRow::find(db.raw_conn(), &id)
+    }
+    .map_err(db_to_http)?;
+    match row {
+        Some(r) => Ok(Json(row_to_view(r))),
+        None => Err((StatusCode::NOT_FOUND, "no such job".into())),
+    }
+}
+
+/// POST /jobs/:id/cancel — cancel a `Submitted` job inline.
+///
+/// `Building`/`Running` cancellation will land in M4.3 (signal the
+/// worker); for now those return 409 so the API is honest. Unknown id
+/// returns 404 (paavo-db surfaces `DbError::NotFound { entity: "job" }`
+/// from `JobRow::get`, mapped here without pattern-matching on the
+/// underlying rusqlite variant).
+pub async fn cancel_job(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let id: JobId = match id.parse() {
+        Ok(j) => j,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    let res = {
+        let db = s.db.lock();
+        paavo_core::cancel_if_submitted(db.raw_conn(), &id, now_ms)
+    };
+    match res {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(paavo_core::CoreError::NotCancellable { state }) => (
+            StatusCode::CONFLICT,
+            format!("not cancellable in state {state:?}"),
+        )
+            .into_response(),
+        Err(paavo_core::CoreError::Db(paavo_db::DbError::NotFound { .. })) => {
+            (StatusCode::NOT_FOUND, "no such job").into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "cancel_job internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// Convert a `paavo_db::JobRow` into the wire-safe `paavo_proto::JobView`.
+/// Drops the server-local `tar_path` / `elf_path` fields; `tar_blake3`
+/// is preserved because it is content-addressed and useful to operators.
+fn row_to_view(r: paavo_db::JobRow) -> JobView {
+    JobView {
+        id: r.id,
+        priority: r.priority,
+        submitter: r.submitter,
+        source: r.source,
+        board_selector: r.board_selector,
+        inactivity_timeout_ms: r.inactivity_timeout_ms,
+        hard_max_ms: r.hard_max_ms,
+        state: r.state,
+        outcome: r.outcome,
+        board_id: r.board_id,
+        submitted_at: r.submitted_at,
+        started_at: r.started_at,
+        finished_at: r.finished_at,
+        tar_blake3: r.tar_blake3,
+    }
+}
+
+/// Map a paavo-db error to an HTTP status. `NotFound`/`AlreadyExists`
+/// get the typed mapping; everything else is logged and surfaces as
+/// 500.
+fn db_to_http(err: paavo_db::DbError) -> (StatusCode, String) {
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            (StatusCode::NOT_FOUND, format!("{entity} not found: {id}"))
+        }
+        paavo_db::DbError::AlreadyExists { entity, id } => (
+            StatusCode::CONFLICT,
+            format!("{entity} already exists: {id}"),
+        ),
+        other => {
+            error!(error = ?other, "unexpected db error");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{other}"))
+        }
+    }
 }
 
 /// GET /jobs/:id/stream — implemented in 4.2.c.iii.

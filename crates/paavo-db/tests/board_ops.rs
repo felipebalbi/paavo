@@ -271,3 +271,18 @@ fn reset_infra_failures_unknown_id_returns_not_found() {
     let err = BoardRow::reset_infra_failures(db.raw_conn(), "ghost").unwrap_err();
     assert!(matches!(err, paavo_db::DbError::NotFound { .. }));
 }
+
+#[test]
+fn get_unknown_id_returns_not_found() {
+    // Pins that BoardRow::get maps QueryReturnedNoRows → DbError::NotFound
+    // for consistency with the mutator helpers.
+    let db = fresh_db();
+    let err = BoardRow::get(db.raw_conn(), "ghost").unwrap_err();
+    match err {
+        paavo_db::DbError::NotFound { entity, id } => {
+            assert_eq!(entity, "board");
+            assert_eq!(id, "ghost");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}

@@ -55,12 +55,18 @@ impl BoardRow {
         }
     }
 
-    /// Fetch a single board by id. Errors if missing.
+    /// Fetch a single board by id. Returns `DbError::NotFound` if
+    /// missing so the HTTP layer can map straight to 404 without
+    /// pattern-matching on `rusqlite::Error::QueryReturnedNoRows`.
     pub fn get(conn: &Connection, id: &str) -> Result<Self> {
-        // Outer `?` propagates `rusqlite::Error` (via `DbError::From`),
-        // leaving the inner `Result<BoardRow>` produced by `from_row` —
-        // which is exactly this function's return type.
-        conn.query_row("SELECT * FROM board WHERE id = ?1", params![id], from_row)?
+        match conn.query_row("SELECT * FROM board WHERE id = ?1", params![id], from_row) {
+            Ok(row_result) => row_result,
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(DbError::NotFound {
+                entity: "board",
+                id: id.to_string(),
+            }),
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// List all boards, ordered by id ascending.

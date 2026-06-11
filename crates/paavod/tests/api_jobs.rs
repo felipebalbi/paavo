@@ -344,6 +344,148 @@ async fn post_jobs_rejects_duplicate_metadata_part_with_400() {
 }
 
 #[tokio::test]
+async fn get_job_returns_row() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    // Insert directly.
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["id"], id.to_string());
+    assert_eq!(v["state"], "submitted");
+}
+
+#[tokio::test]
+async fn cancel_submitted_job_returns_204() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    let app = build_router(s.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let row = paavo_db::JobRow::get(s.db.lock().raw_conn(), &id).unwrap();
+    assert_eq!(row.state, paavo_proto::JobState::Aborted);
+}
+
+#[tokio::test]
+async fn list_jobs_filters_by_state() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    for _ in 0..3 {
+        let id = paavo_proto::JobId::new();
+        paavo_db::JobRow::insert(
+            s.db.lock().raw_conn(),
+            &paavo_db::NewJob {
+                id,
+                priority: paavo_proto::Priority::Interactive,
+                submitter: "x".into(),
+                source: paavo_proto::JobSource::Cli,
+                board_selector: paavo_proto::BoardSelector {
+                    kind: "mcxa266".into(),
+                    instance: None,
+                    wiring_profile: None,
+                },
+                inactivity_timeout_ms: 120_000,
+                hard_max_ms: 900_000,
+                tar_blake3: "x".into(),
+                tar_path: "/tmp/x.tar".into(),
+            },
+            0,
+        )
+        .unwrap();
+    }
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs?state=submitted&limit=2")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn get_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{}", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn cancel_unknown_job_returns_404() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{}/cancel", paavo_proto::JobId::new()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
 async fn post_jobs_rejects_oversized_metadata_part_with_413() {
     // Per-field cap on `metadata` is 64 KiB regardless of the request-
     // level `max_upload_bytes`. A 1 MiB metadata payload trips 413
@@ -358,4 +500,159 @@ async fn post_jobs_rejects_oversized_metadata_part_with_413() {
     let body = make_multipart_body(b"hi", &meta.to_string());
     let resp = app.oneshot(submit_request(body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn list_jobs_rejects_unknown_state_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs?state=garbage")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_jobs_rejects_unparseable_limit_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs?limit=fifty")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_jobs_rejects_out_of_range_limit_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    for bad in ["0", "501", "999999"] {
+        let req = Request::builder()
+            .uri(format!("/jobs?limit={bad}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "limit={bad}");
+    }
+}
+
+#[tokio::test]
+async fn get_job_rejects_invalid_id_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri("/jobs/not-a-ulid")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cancel_job_rejects_invalid_id_with_400() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jobs/not-a-ulid/cancel")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cancel_terminal_job_returns_409() {
+    // Pins spec §5.4: terminal jobs are not cancellable. First cancel
+    // succeeds (Submitted → Aborted), second returns 409 because the
+    // row is already terminal.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    let app = build_router(s.clone());
+    // First cancel: 204.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 204);
+    // Second cancel on the now-terminal row: 409.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), 409);
+}
+
+#[tokio::test]
+async fn get_job_view_omits_tar_path_and_elf_path() {
+    // Pins the wire-shape contract: server-local filesystem paths must
+    // not leak through GET /jobs/:id.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "deadbeef".into(),
+            tar_path: "/var/lib/paavo/uploads/deadbeef.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    let app = build_router(s);
+    let req = Request::builder()
+        .uri(format!("/jobs/{id}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v.get("tar_path").is_none(), "tar_path leaked: {v}");
+    assert!(v.get("elf_path").is_none(), "elf_path leaked: {v}");
+    // blake3 IS exposed (content-addressed, useful for build-cache debugging).
+    assert_eq!(v["tar_blake3"], "deadbeef");
 }

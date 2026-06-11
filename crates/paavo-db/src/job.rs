@@ -106,16 +106,22 @@ impl JobRow {
         Ok(())
     }
 
-    /// Fetch a job by id. Errors if missing.
+    /// Fetch a job by id. Returns `DbError::NotFound` if missing so the
+    /// HTTP layer can map straight to 404 without pattern-matching on
+    /// `rusqlite::Error::QueryReturnedNoRows`.
     pub fn get(conn: &Connection, id: &JobId) -> Result<Self> {
-        // Outer `?` propagates `rusqlite::Error` (via `DbError::From`),
-        // leaving the inner `Result<JobRow>` produced by `from_row` —
-        // which is exactly this function's return type.
-        conn.query_row(
+        match conn.query_row(
             "SELECT * FROM job WHERE id = ?1",
             params![id.to_string()],
             from_row,
-        )?
+        ) {
+            Ok(row_result) => row_result,
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(crate::error::DbError::NotFound {
+                entity: "job",
+                id: id.to_string(),
+            }),
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// Fetch a job by id, returning `Ok(None)` if missing.

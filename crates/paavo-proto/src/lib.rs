@@ -21,6 +21,7 @@ mod log;
 pub use board::{BoardHealth, BoardSelector, BoardSpec, BoardView, ProbeSelector};
 pub use ids::JobId;
 pub use job::{
-    AbortReason, JobOutcome, JobSource, JobSpec, JobState, Priority, TerminalOutcome, TimeoutReason,
+    AbortReason, JobOutcome, JobSource, JobSpec, JobState, JobView, Priority, TerminalOutcome,
+    TimeoutReason,
 };
 pub use log::{LogFrame, LogLevel};

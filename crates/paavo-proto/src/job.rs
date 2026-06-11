@@ -1,6 +1,7 @@
 //! Job state machine, priority, source, and outcome types.
 
 use crate::board::BoardSelector;
+use crate::ids::JobId;
 use serde::{Deserialize, Serialize};
 
 /// Scheduler priority. Lower variant value = higher priority. Serializes as
@@ -191,5 +192,50 @@ pub struct JobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_max_ms: Option<u64>,
     /// blake3 of the uploaded crate tar, used as build-cache key.
+    pub tar_blake3: String,
+}
+
+/// JSON shape returned by `GET /jobs` and `GET /jobs/:id`. Mirrors the
+/// internal `paavo_db::JobRow` but **excludes server-local filesystem
+/// paths** (`tar_path`, `elf_path`) so the daemon's state-directory
+/// layout is not leaked to HTTP clients. `tar_blake3` IS exposed
+/// because it is content-addressed and useful for operators debugging
+/// the build cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobView {
+    /// Job id.
+    pub id: JobId,
+    /// Scheduler priority at submission time (may have been promoted
+    /// since via the starvation threshold).
+    pub priority: Priority,
+    /// Free-form submitter id.
+    pub submitter: String,
+    /// Where the job came from.
+    pub source: JobSource,
+    /// Board selector.
+    pub board_selector: BoardSelector,
+    /// Effective inactivity timeout (ms).
+    pub inactivity_timeout_ms: u64,
+    /// Hard-max wall clock (ms).
+    pub hard_max_ms: u64,
+    /// Current persistent state.
+    pub state: JobState,
+    /// Decoded outcome when terminal, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<JobOutcome>,
+    /// Board the job was dispatched to (set on Building/Running and
+    /// after).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_id: Option<String>,
+    /// Submission time, epoch ms.
+    pub submitted_at: i64,
+    /// Time the scheduler picked the job, epoch ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// Time the worker reached terminal state, epoch ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// blake3 of the uploaded crate tar (content-addressed; useful for
+    /// build-cache debugging).
     pub tar_blake3: String,
 }
