@@ -10638,13 +10638,201 @@ Spec coverage: §4.3 (one BoardWorker per board, OS thread), §5.3–§5.4 (disp
 
 #### 4.3.a: Cancellation registry
 
-- [ ] **Step 1: Implement registry**
+This unblocks the §5.4 cancel flow for `Building` and `Running` jobs.
+M4.2.c.ii's cancel handler returned 409 for non-Submitted states as a
+documented v1 carve-out; this sub-task replaces the carve-out with
+real signal delivery via a per-job `crossbeam_channel::Sender<RunCommand>`
+held in `AppState::cancellation`. The dispatch loop (M4.3.b) registers
+the sender at job start and unregisters at job finalize; the cancel
+handler signals through it.
+
+**Setup before TDD:** add `crossbeam-channel` and `paavo-runner` to
+`crates/paavod/Cargo.toml` `[dependencies]` (the former is already a
+workspace dep, the latter is not yet a paavod dep).
+
+- [ ] **Step 1: Failing test for the registry + cancel-handler signal path**
+
+`crates/paavod/tests/cancellation.rs`:
+```rust
+use crossbeam_channel::unbounded;
+use paavo_proto::JobId;
+use paavo_runner::RunCommand;
+use paavod::cancellation::CancellationRegistry;
+
+#[test]
+fn register_signal_unregister_round_trip() {
+    let reg = CancellationRegistry::default();
+    let id = JobId::new();
+    let (tx, rx) = unbounded::<RunCommand>();
+    reg.register(id, tx);
+
+    assert!(reg.signal(&id, RunCommand::Cancel));
+    assert_eq!(rx.recv().unwrap(), RunCommand::Cancel);
+
+    reg.unregister(&id);
+    assert!(!reg.signal(&id, RunCommand::Cancel));
+}
+
+#[test]
+fn signal_on_unknown_id_returns_false() {
+    let reg = CancellationRegistry::default();
+    assert!(!reg.signal(&JobId::new(), RunCommand::Cancel));
+}
+
+#[test]
+fn signal_all_reaches_every_registered_worker() {
+    let reg = CancellationRegistry::default();
+    let (tx1, rx1) = unbounded::<RunCommand>();
+    let (tx2, rx2) = unbounded::<RunCommand>();
+    reg.register(JobId::new(), tx1);
+    reg.register(JobId::new(), tx2);
+    reg.signal_all(RunCommand::DaemonShutdown);
+    assert_eq!(rx1.recv().unwrap(), RunCommand::DaemonShutdown);
+    assert_eq!(rx2.recv().unwrap(), RunCommand::DaemonShutdown);
+}
+
+#[test]
+fn register_twice_overwrites_silently_for_v1() {
+    // v1 semantics: there is exactly one dispatch loop, so a second
+    // register for the same id is treated as the authoritative one.
+    // Documented so a future contributor can decide to upgrade this
+    // to a panic if the invariant changes.
+    let reg = CancellationRegistry::default();
+    let id = JobId::new();
+    let (tx1, rx1) = unbounded::<RunCommand>();
+    let (tx2, rx2) = unbounded::<RunCommand>();
+    reg.register(id, tx1);
+    reg.register(id, tx2);
+    assert!(reg.signal(&id, RunCommand::Cancel));
+    // Only the second receiver got the signal.
+    assert_eq!(rx2.recv().unwrap(), RunCommand::Cancel);
+    assert!(rx1.try_recv().is_err());
+}
+
+#[test]
+fn signal_after_receiver_dropped_returns_false() {
+    // The watchdog drops the Receiver on exit; signaling that stale
+    // entry must not panic and must report "nothing happened" so the
+    // HTTP layer can fall through to 409.
+    let reg = CancellationRegistry::default();
+    let id = JobId::new();
+    let (tx, rx) = unbounded::<RunCommand>();
+    reg.register(id, tx);
+    drop(rx);
+    assert!(!reg.signal(&id, RunCommand::Cancel));
+}
+```
+
+Append to `crates/paavod/tests/api_jobs.rs` an integration test that
+pins the new 204 path for Building/Running:
+```rust
+#[tokio::test]
+async fn cancel_running_job_with_registered_signal_returns_204() {
+    use crossbeam_channel::unbounded;
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1)
+        .unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let (tx, rx) = unbounded::<paavo_runner::RunCommand>();
+    s.cancellation.register(id, tx);
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(rx.recv().unwrap(), paavo_runner::RunCommand::Cancel);
+}
+
+#[tokio::test]
+async fn cancel_running_job_without_registered_signal_returns_409() {
+    // Job is Running in the DB but the registry has no sender (worker
+    // died, registry entry already unregistered, dispatch loop not
+    // running yet, etc.). The cancel handler falls through to 409.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+        },
+        0,
+    )
+    .unwrap();
+    paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1)
+        .unwrap();
+    paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
+
+    let app = build_router(s);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 409);
+}
+```
+
+The existing `cancel_terminal_job_returns_409` test still pins that
+already-Aborted jobs return 409 (registry has no sender for them; the
+signal call returns false and we fall through).
+
+- [ ] **Step 2: Implement registry**
 
 `crates/paavod/src/cancellation.rs`:
 ```rust
-//! Per-job cancel-signal registry. Each running job has an entry; cancel
-//! handler signals through it. Used by the dispatch loop to satisfy
-//! `POST /jobs/:id/cancel` while the job is Building or Running.
+//! Per-job cancel-signal registry. The dispatch loop registers a
+//! `crossbeam_channel::Sender<RunCommand>` keyed by `JobId` when it
+//! launches a BoardWorker; the cancel handler signals through it to
+//! satisfy `POST /jobs/:id/cancel` while the job is Building or
+//! Running. The watchdog inside the worker maps `Cancel`/`DaemonShutdown`
+//! to the right outcome variant per spec §5.4.
+//!
+//! v1 semantics: a second `register(id, ...)` for the same job
+//! overwrites the previous Sender silently (there is exactly one
+//! dispatch loop, so a duplicate is "the authoritative new one").
+//! Tests pin this so a future contributor can decide to upgrade to a
+//! panic if the single-writer invariant changes.
 
 use crossbeam_channel::Sender;
 use paavo_proto::JobId;
@@ -10660,43 +10848,57 @@ pub struct CancellationRegistry {
 }
 
 impl CancellationRegistry {
-    /// Register a fresh sender for a job that's about to run.
+    /// Register a fresh sender for a job that's about to run. If
+    /// `id` already has a sender, the old one is dropped silently.
     pub fn register(&self, id: JobId, tx: Sender<RunCommand>) {
         self.inner.lock().insert(id, tx);
     }
 
-    /// Drop the sender after the job has finalized.
+    /// Drop the sender after the job has finalized. Idempotent.
     pub fn unregister(&self, id: &JobId) {
         self.inner.lock().remove(id);
     }
 
-    /// Try to send a Cancel/DaemonShutdown to a running job.
+    /// Try to send a `Cancel` / `DaemonShutdown` to a running job.
+    /// Returns `true` only if a sender existed AND the send succeeded
+    /// (the receiver was still alive). A dropped receiver (worker
+    /// exited) returns `false` so the HTTP layer can fall through to
+    /// 409.
     pub fn signal(&self, id: &JobId, cmd: RunCommand) -> bool {
-        if let Some(tx) = self.inner.lock().get(id) {
-            tx.send(cmd).is_ok()
-        } else {
-            false
+        match self.inner.lock().get(id) {
+            Some(tx) => tx.send(cmd).is_ok(),
+            None => false,
         }
     }
 
-    /// Signal every registered job (used during shutdown).
+    /// Signal every registered job. Used during shutdown drain
+    /// (M4.3.d). Send errors are swallowed — a dropped receiver during
+    /// shutdown is fine.
     pub fn signal_all(&self, cmd: RunCommand) {
         for (_id, tx) in self.inner.lock().iter() {
             let _ = tx.send(cmd);
         }
     }
+
+    /// Active-entry count. Useful for tests and drain bookkeeping.
+    pub fn active(&self) -> usize {
+        self.inner.lock().len()
+    }
 }
 ```
 
-Add to `lib.rs`: `pub mod cancellation;`. Add `pub cancellation: cancellation::CancellationRegistry,` to `AppState` and default-construct it in tests.
+Add to `crates/paavod/src/lib.rs`: `pub mod cancellation;`. Add
+`pub cancellation: cancellation::CancellationRegistry,` to `AppState`
+and default-construct it in test fixtures (`api_health.rs`,
+`api_boards.rs`, `api_jobs.rs`).
 
-- [ ] **Step 2: Wire cancel handler to use the registry**
+- [ ] **Step 3: Wire cancel handler to use the registry**
 
-In `crates/paavod/src/routes/jobs.rs::cancel_job`, after the `NotCancellable` case, signal the running worker:
+In `crates/paavod/src/routes/jobs.rs::cancel_job`, replace the
+`NotCancellable` arm so it tries the registry before returning 409:
 ```rust
 Err(paavo_core::CoreError::NotCancellable { state }) => {
-    let signalled = s.cancellation.signal(&id, paavo_runner::RunCommand::Cancel);
-    if signalled {
+    if s.cancellation.signal(&id, paavo_runner::RunCommand::Cancel) {
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -10708,10 +10910,33 @@ Err(paavo_core::CoreError::NotCancellable { state }) => {
 }
 ```
 
-- [ ] **Step 3: Commit**
+The semantics: if the registry has a live sender for `id`, send `Cancel`
+and return 204 (worker will produce `Aborted{User}`). If not (no entry
+or receiver dropped), return 409.
+
+- [ ] **Step 4: Spec amendment**
+
+Remove the v1 carve-out from spec §5.4 (it was added in M4.2.c.ii to
+document the temporary 409 behavior); the wire contract now matches
+the original §5.4 multi-state cancel. Replace the carve-out paragraph
+with a note that the BoardWorker signal path is wired via
+`paavod::cancellation::CancellationRegistry`.
+
+Update the `cancel_terminal_job_returns_409` test comment to reflect
+the new reality: terminal jobs return 409 because the registry has no
+entry for them (the dispatch loop unregistered on finalize), not
+because of a v1 carve-out.
+
+- [ ] **Step 5: Run**
+
+Run: `cargo test -p paavod`
+Expected: cancellation 5 passed; api_jobs 34 (32 + 2 new); other
+suites unchanged.
+
+- [ ] **Step 6: Commit**
 
 ```pwsh
-git -C D:\workspace\paavo add crates/paavod
+git -C D:\workspace\paavo add crates/paavod docs
 git -C D:\workspace\paavo commit -m "feat(paavod): per-job cancellation registry wired into cancel route"
 ```
 

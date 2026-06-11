@@ -344,12 +344,16 @@ Tunable in config.
 - `Running` → signal watchdog with `force_cancel`; watchdog sends Cancel to
   BoardWorker.
 
-**v1 carve-out (until M4.3 wires the dispatch loop):** the HTTP cancel
-endpoint only handles `Submitted` inline; `Building`/`Running` return
-`409 Conflict` with a clear message. The full multi-state cancel above
-lands once M4.3 wires the BoardWorker signal path. Tests pin both
-behaviours so the day M4.3 lands the response transitions cleanly from
-409 to 204.
+The HTTP path: `POST /jobs/:id/cancel` calls
+`paavo_core::cancel_if_submitted` inline for `Submitted` (204), and
+falls back to `AppState::cancellation::signal(id, RunCommand::Cancel)`
+for `Building`/`Running`. The registry holds a
+`crossbeam_channel::Sender<RunCommand>` per active worker; the watchdog
+inside `paavo-runner` maps `Cancel` → `Aborted{User}` and
+`DaemonShutdown` → `Aborted{DaemonShutdown}` per the variants in
+`paavo_proto::AbortReason`. If the registry has no live sender (worker
+already exited, dispatch loop not running yet, terminal row), the
+handler returns 409 — "not cancellable in state X".
 
 ### 5.5 Board selector
 
