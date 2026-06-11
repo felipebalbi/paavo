@@ -7,7 +7,7 @@
 //! used in others.
 
 use chrono::Utc;
-use paavo_core::EnqueueRequest;
+use paavo_core::{enqueue_job, EnqueueRequest};
 use paavo_db::{BoardRow, Db};
 use paavo_proto::{
     BoardHealth, BoardSelector, BoardSpec, JobId, JobSource, Priority, ProbeSelector,
@@ -94,4 +94,32 @@ pub fn default_enqueue_request(kind: &str) -> EnqueueRequest {
         tar_path: "/tmp/x.tar".into(),
         daemon_ceiling_ms: DAEMON_CEILING_8H_MS,
     }
+}
+
+/// Enqueue a job with one or more field overrides on the default request.
+/// Tests pass a closure that mutates the `EnqueueRequest` before insert.
+/// Returns the `JobId` so callers can assert on dispatch order.
+///
+/// ```ignore
+/// let id = enqueue_with(&db, NOW, |req| {
+///     req.priority = Priority::Scheduled;
+///     req.source = JobSource::Scheduler;
+/// });
+/// ```
+pub fn enqueue_with(
+    db: &Db,
+    submitted_at_ms: i64,
+    overrides: impl FnOnce(&mut EnqueueRequest),
+) -> JobId {
+    let mut req = default_enqueue_request("mcxa266");
+    overrides(&mut req);
+    let id = req.job_id;
+    enqueue_job(
+        db.raw_conn(),
+        &list_inventory_specs(db),
+        req,
+        submitted_at_ms,
+    )
+    .unwrap();
+    id
 }
