@@ -1,0 +1,23 @@
+[Unit]
+Description=paavo daemon (HIL test runner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paavo
+Group=paavo
+ExecStart=/usr/local/bin/paavod --config /etc/paavo/paavo.toml
+Restart=on-failure
+RestartSec=5
+StateDirectory=paavo
+ReadWritePaths=/var/lib/paavo
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

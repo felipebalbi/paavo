@@ -1,0 +1,79 @@
+# Sample paavo.toml for a Linux lab deployment.
+#
+# Install:
+#   sudo install -m 0644 paavo.toml.example /etc/paavo/paavo.toml
+#   sudoedit /etc/paavo/paavo.toml
+#
+# Every section the loader (`paavod::Config`) understands is shown
+# below, with default values made explicit so operators can see what
+# they are inheriting. Trim sections you do not need to override.
+
+[server]
+# `host:port` for the daemon HTTP API (POST /jobs, /boards, etc.).
+# Bind on 0.0.0.0 so paavo-cli on developer workstations can reach
+# the lab box. Firewall accordingly.
+bind = "0.0.0.0:8080"
+# Daemon state dir. Auto-created (uploads/, sandboxes/, cargo-target/,
+# cache/elf/) on first start. Sqlite + migrations land here too.
+# Matches the systemd unit's StateDirectory=paavo + ReadWritePaths.
+state_dir = "/var/lib/paavo"
+# Per-request multipart body cap for POST /jobs uploads. Default
+# 256 MiB. Raise if your test corpus vendors large dependencies.
+max_upload_bytes = 268435456
+
+[web]
+# `host:port` for the read-only web viewer (paavo-web). Bind on
+# 0.0.0.0 so lab residents can browse jobs in their browser.
+bind = "0.0.0.0:8081"
+
+[timeouts]
+# All values shown are defaults — uncomment and edit to override.
+# Inactivity timeout: how long the runner waits without a new defmt
+# frame before declaring a stuck test.
+default_inactivity_s = 120
+# Hard wall-clock max for ad-hoc `paavo-cli run` jobs (15 min).
+default_ad_hoc_hard_max_s = 900
+# Hard wall-clock max for nightly Scheduled jobs (4 h).
+default_scheduled_hard_max_s = 14400
+# Daemon ceiling. Any hard_max_ms above this is rejected at enqueue
+# (8 h).
+daemon_ceiling_s = 28800
+# SIGTERM drain grace before the daemon force-aborts running jobs.
+shutdown_grace_s = 60
+
+[scheduler]
+# 6-field cron: `sec min hour dom mon dow`. Time zone = daemon local.
+# `"0 0 19 * * *"` = every day at 19:00:00 local time.
+nightly_cron = "0 0 19 * * *"
+# Promote Scheduled→Interactive after this many seconds queued (6 h).
+starvation_threshold_s = 21600
+
+[build_cache]
+# blake3-keyed ELF cache. LRU evicted when over. Default 5 GiB.
+max_bytes = 5368709120
+
+[retention]
+# After 30 days, truncate trace/debug/info frames from Passed jobs.
+# Set to a negative value to disable truncation.
+passed_full_log_days = 30
+
+[quarantine]
+# Auto-quarantine a board after this many consecutive InfraErr outcomes.
+consecutive_infra_failures = 3
+
+# Optional `[[corpus]]` entries. Each entry is one nightly corpus.
+# The cron walks every first-level subdir of `path` that has a
+# Cargo.toml, tars it, and submits as a Scheduled job with the given
+# `kind`. Empty by default so the nightly cron is a no-op until you
+# fill this in.
+#
+# [[corpus]]
+# name = "embassy-mcxa-regression"
+# kind = "mcxa266"
+# path = "/var/lib/paavo/corpus/embassy-mcxa-regression"
+# cargo_update = ["embassy-mcxa", "embassy-executor"]
+#
+# [[corpus]]
+# name = "paavo-dma-soaks"
+# kind = "mcxa266"
+# path = "/opt/paavo/soak-tests/mcxa266"

@@ -1,0 +1,11 @@
+# probe-rs udev rules (excerpt). Adjust for the probes in your lab.
+# Source: https://probe.rs/docs/getting-started/probe-setup/
+
+# Daplink (e.g. mcxa eval boards)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", MODE="0660", GROUP="plugdev"
+
+# Segger J-Link
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1366", MODE="0660", GROUP="plugdev"
+
+# ST-Link (in case you mix)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", MODE="0660", GROUP="plugdev"
