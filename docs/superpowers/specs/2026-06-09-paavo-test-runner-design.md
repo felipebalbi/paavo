@@ -1224,6 +1224,31 @@ below is deliberately out of M7's scope and rolled to M8:
   every embassy dep line (without breaking the bare-default shape)
   needs more careful cargo-generate placeholder design than M7's
   scope allows. M8.
+- **`build_cache` cross-tar ELF poisoning**: `build_cache` keys on
+  `tar_blake3` but values are the discovered ELF path under the
+  shared `CARGO_TARGET_DIR`. Two scaffolds with different content
+  but the same Cargo package `name` (e.g. two operators both running
+  the default `hello-mcxa266` scaffold with hand-edited bodies)
+  hash to different `tar_blake3`s but write to the same physical
+  ELF file (`target/<triple>/release/<crate_name>`). Cargo
+  overwrites the file in place each build; the cache row's path
+  remains valid (`is_file()` says yes) but the bytes are whoever
+  built last. Cache returns stale ELFs across submissions.
+  M7.7 mitigation: `paavo-cli run --skip-cache` bypasses lookup
+  (commit 9401281). M8 fix candidates:
+  (a) key cache on `(tar_blake3, host_triple, rustc_version)` AND
+      copy the ELF into the cache dir at `cache_store` time so the
+      stored path is immutable;
+  (b) make `target_dir` per-job instead of shared (kills cargo's
+      incremental cache benefit; likely unacceptable);
+  (c) hash the produced ELF bytes and use that as the cache key
+      (still needs the copy-to-cache-dir step at store time).
+  (a)+ELF-copy is the recommended fix; the cargo target dir then
+  becomes purely an incremental-compilation accelerator, and the
+  `build_cache` table truly indexes immutable bytes by content.
+  M8 priority because the symptom is silent — operators don't see
+  the wrong ELF was used, just "my test fails identically every
+  time even after fixes."
 
 ---
 
