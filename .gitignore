@@ -20,3 +20,8 @@ Cargo.lock.bak
 /tests/fixtures/*/Cargo.lock
 /soak-tests/*/*/target
 /soak-tests/*/*/Cargo.lock
+# M7.0 spike crates — same rule. Source files checked in; target/ +
+# Cargo.lock are local-only because they're standalone, run-by-hand
+# binaries that nothing else in CI depends on.
+/dev/*/target
+/dev/*/Cargo.lock

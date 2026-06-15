@@ -19,6 +19,14 @@ members = [
 exclude = [
     "tests/fixtures/smoke-crate",
     "soak-tests",
+    # M7.0 spike — standalone probe-rs API exploration binary, run by hand
+    # against a real MCX-A266. Not shipped; lives outside the workspace so
+    # its 200+ transitive deps don't slow down cargo test --workspace.
+    "dev/probe-rs-spike",
+    # M7.0 spike fixture — minimal cortex-m + defmt-rtt ELF for the MCX-A266.
+    # Cross-compiles to thumbv8m.main-none-eabihf; the spike binary flashes
+    # this and confirms the RTT path end to end.
+    "dev/spike-fixture-mcxa266",
 ]
 
 [workspace.package]

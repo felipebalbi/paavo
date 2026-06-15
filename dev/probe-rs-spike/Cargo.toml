@@ -1,0 +1,23 @@
+[package]
+name = "probe-rs-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone — NOT a workspace member. Excluded by `workspace.exclude` in the
+# root Cargo.toml. This crate is a one-shot exploration of probe-rs 0.31's
+# API surface, run by hand against a real MCX-A266 EVK. Findings get folded
+# into the M7 plan; the binary itself is not shipped.
+
+[dependencies]
+probe-rs       = "0.31"
+defmt-decoder  = "1.1.0"
+object         = "0.36"
+anyhow         = "1"
+clap           = { version = "4", features = ["derive"] }
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "probe-rs-spike"
+path = "src/main.rs"

@@ -15575,11 +15575,43 @@ git -C D:\workspace\paavo commit -m "docs: README quickstart + deployment guide 
 
 ### Milestone 6 exit criteria
 
-- [ ] `templates/mcxa266` and `templates/rt685-evk` accept `cargo generate` and produce a buildable crate (manual check on the lab machine)
-- [ ] `soak-tests/mcxa266/dma-stress-overnight` exists; workspace `exclude` keeps it out of `cargo build --workspace`
-- [ ] `contrib/` has systemd units + sample paavo.toml + udev rules + install README
-- [ ] `docs/deployment.md` and `docs/hw-smoke-checklist.md` exist
-- [ ] HW smoke checklist (Task 6.6 / docs) completes end-to-end on real mcxa266 + rt685-evk (manual)
+- [x] `templates/mcxa266` and `templates/rt685-evk` accept `cargo generate` and produce a buildable crate (manual check on the lab machine)
+- [x] `soak-tests/mcxa266/dma-stress-overnight` exists; workspace `exclude` keeps it out of `cargo build --workspace`
+- [x] `contrib/` has systemd units + sample paavo.toml + udev rules + install README
+- [x] `docs/deployment.md` and `docs/hw-smoke-checklist.md` exist
+- [ ] HW smoke checklist (Task 6.6 / docs) completes end-to-end on real mcxa266 + rt685-evk (manual) — **deferred to M7**
+
+### Genuinely-missing follow-ups after M6 (rolled into M7 scope)
+
+Surfaced from the M6 exit-criteria review:
+
+1. **RealRunner wiring** — `paavod::main::RealRunner::run` returns
+   `Failed(InfraErr{stage:"real_runner_unimplemented"})` for every
+   non-fake job. `paavo-probe::RealSession` is also stubbed.
+   The HW smoke checklist cannot be executed until this is wired.
+   This is the central deliverable of M7.
+
+2. **`paavo-cli new` wiring** — the verb exists in clap, but the
+   handler errors at runtime. Needs to invoke `cargo generate
+   --path <templates_root>/<kind> --name <name> --define
+   embassy-rev=<rev>` (or use the `cargo-generate` library
+   directly). Unblocks the README quickstart. Small (~30 LoC
+   + 1-2 tests). M7 candidate.
+
+3. **CI workflow sanity check** — `.github/workflows/ci.yml`
+   exists from M0; not verified that it still passes on push
+   after the M4-M6 additions. M7 candidate (5 min check).
+
+4. **Embassy crate feature-flag validation** — the templates pin
+   `mcxa266vfl`, `rt685s`, etc. on `embassy-rs/embassy` `main`
+   without verification. The first operator scaffolding a real
+   crate will hit any drift. M7 will validate by actually building
+   one of the templates end-to-end as part of the RealRunner work.
+
+5. **`embassy-imxrt` lives at `OpenDevicePartnership/embassy-imxrt`
+   not `embassy-rs/embassy`.** Templates currently point at the
+   wrong upstream for rt685-evk. M7 must fix this when wiring
+   real builds for rt685.
 
 ---
 

@@ -1,0 +1,28 @@
+[package]
+name = "spike-fixture-mcxa266"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone Cortex-M33 hello-defmt-rtt fixture for the M7.0 probe-rs spike.
+# NOT part of the workspace; cross-compiles to thumbv8m.main-none-eabihf.
+#
+# This is intentionally minimal — NO embassy, NO HAL, NO board init. Just
+# cortex-m-rt + defmt + defmt-rtt + panic-probe so that the spike has a
+# known-good ELF to flash and an RTT control block to attach to. The "real"
+# template work (embassy-mcxa wiring, mcxa2xx feature flag, etc.) lives in
+# M7.1 and is independent of validating probe-rs.
+
+[dependencies]
+cortex-m       = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt    = { version = "0.7", features = ["set-sp", "set-vtor"] }
+defmt          = "1.0"
+defmt-rtt      = "1.0"
+panic-probe    = { version = "1.0", features = ["print-defmt"] }
+
+[profile.release]
+lto = true
+debug = 2          # full debug info — needed for defmt-decoder to find .defmt
+codegen-units = 1
+opt-level = "s"
+overflow-checks = false
