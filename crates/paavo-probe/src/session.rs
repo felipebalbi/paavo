@@ -12,9 +12,9 @@ use defmt_decoder::{DecodeError, StreamDecoder, Table};
 use defmt_parser::Level as DefmtLevel;
 use paavo_proto::{LogFrame, LogLevel};
 use probe_rs::{
-    flashing::{download_file, FormatKind},
+    flashing::{download_file_with_options, DownloadOptions, FormatKind},
     probe::{list::Lister, DebugProbeSelector},
-    rtt::Rtt,
+    rtt::{ChannelMode, Rtt},
     Permissions, Session,
 };
 use std::path::PathBuf;
@@ -79,6 +79,12 @@ pub struct RealSession {
     /// RTT handle scanned out of target RAM. Survives across `next_event`
     /// calls; the up-channel is read via `&mut session.core(0)`.
     rtt: Rtt,
+    /// Index into `rtt.up_channels` of the channel named "defmt". Looked
+    /// up by name during `connect()` so we don't accidentally read from
+    /// a SEGGER-terminal-style sibling channel that some firmwares add at
+    /// a lower index. defmt-rtt's own channel is always named "defmt"
+    /// (see `defmt-rtt/src/lib.rs::NAME`).
+    defmt_channel_index: usize,
     /// defmt stream decoder. Internally buffers RTT bytes across calls;
     /// `received()` appends, `decode()` drains one frame at a time. The
     /// `'static` lifetime is achieved via the `Box::leak(Table)` trick
@@ -155,9 +161,56 @@ impl RealSession {
             .map_err(|e| ProbeError::ProbeRs(format!("attach chip={}: {e}", opts.chip_name)))?;
 
         // 3. Flash. `FormatKind::Elf` is a unit variant — `Format::Elf`
-        // takes `ElfOptions`, and `From<FormatKind> for Format` wraps with
-        // `ElfOptions::default()` (spike finding).
-        download_file(&mut session, &opts.elf_path, FormatKind::Elf)
+        //    takes `ElfOptions`, and `From<FormatKind> for Format` wraps
+        //    with `ElfOptions::default()` (spike finding).
+        //
+        //    Use `download_file_with_options` with explicitly-named
+        //    DownloadOptions instead of the shorter `download_file`.
+        //    The contract is: paavod ALWAYS fully flashes the ELF on
+        //    every job, even if the operator resubmits the identical
+        //    binary back-to-back. No content-based skip, no read-back-
+        //    based verify shortcut, no leftover-region preservation.
+        //    Two identical submits → two identical flashes; if the
+        //    chip drifted into a bad state between runs, the second
+        //    flash heals it.
+        //
+        //    Concretely (all defaults today, named here so a future
+        //    DownloadOptions field default-flip can't silently change
+        //    behavior):
+        //
+        //      keep_unwritten_bytes: false  — don't try to preserve
+        //          flash sectors we don't write. We replace the whole
+        //          image every time.
+        //      dry_run:              false  — actually flash.
+        //      do_chip_erase:        false  — sector-erase is fine;
+        //          we don't need (or want) to nuke the whole device.
+        //      skip_erase:           false  — don't pretend the
+        //          chip was pre-erased; erase before write every time.
+        //      preverify:            false  — don't read-back BEFORE
+        //          flashing to skip "unchanged" regions. The whole
+        //          image gets written even if the chip already
+        //          contained byte-identical content.
+        //      verify:               false  — don't read-back AFTER
+        //          flashing. We rely on the chip's own write-verify
+        //          algorithm (every NXP flash algo does this) and
+        //          our RTT/defmt drive proves the firmware actually
+        //          executed correctly. A separate verify pass would
+        //          double the flash-stage time for no incremental
+        //          guarantee.
+        //      disable_double_buffering: false — let the algo
+        //          double-buffer where supported (faster).
+        //
+        //    User-facing rule, locked in here: "even if the user sends
+        //    the same thing, paavod always compiles and flashes."
+        let mut download_opts = DownloadOptions::default();
+        download_opts.keep_unwritten_bytes = false;
+        download_opts.dry_run = false;
+        download_opts.do_chip_erase = false;
+        download_opts.skip_erase = false;
+        download_opts.preverify = false;
+        download_opts.verify = false;
+        download_opts.disable_double_buffering = false;
+        download_file_with_options(&mut session, &opts.elf_path, FormatKind::Elf, download_opts)
             .map_err(|e| ProbeError::ProbeRs(format!("flash {}: {e}", opts.elf_path.display())))?;
 
         // 4. Reset + run (unless caller asked to skip — RT685S quirk).
@@ -193,33 +246,138 @@ impl RealSession {
         let decoder = table_static.new_stream_decoder();
 
         // 6. Wait briefly for firmware to initialise RTT, then attach.
-        // The 200ms is empirically necessary (spike finding); attaching
-        // sooner errors with `ControlBlockNotFound`.
+        //    The 200ms is empirically necessary (spike finding); attaching
+        //    sooner errors with `ControlBlockNotFound`.
+        //
+        //    Use `Rtt::attach_at` with the address looked up from the
+        //    ELF's `_SEGGER_RTT` symbol — NOT `Rtt::attach()` which
+        //    scans RAM for the SEGGER magic. The blind scan can latch
+        //    onto a stale or duplicated `SEGGER RTT\0...` byte
+        //    sequence elsewhere in RAM (e.g. left over from a previous
+        //    boot, or coincidentally present in a constant), then
+        //    interpret garbage as a valid control block. That manifests
+        //    as `up_channels` looking normal (a single "defmt" entry
+        //    with buf=1024) but `read()` returning a tiny pile of bytes
+        //    that decode as 5 rapid-fire "malformed frame skipped"
+        //    warnings. probe-rs `run` does the same — it grabs the
+        //    address from the ELF (via `find_rtt_control_block_in_raw_file`
+        //    upstream, which isn't published in 0.31.0 yet — so we
+        //    duplicate the trivial symbol lookup here) and calls
+        //    `attach_at`. See the M7.7 manual smoke for the byte-level
+        //    evidence.
+        let rtt_block_addr = find_segger_rtt(&elf_bytes).map_err(|e| {
+            ProbeError::ProbeRs(format!(
+                "find _SEGGER_RTT in elf {}: {e}",
+                opts.elf_path.display()
+            ))
+        })?;
+        tracing::info!(
+            address = format!("{rtt_block_addr:#010x}"),
+            "found _SEGGER_RTT control block in elf"
+        );
         std::thread::sleep(Duration::from_millis(200));
         let rtt = {
             let mut core = session
                 .core(0)
                 .map_err(|e| ProbeError::ProbeRs(format!("session.core(0) for rtt: {e}")))?;
-            Rtt::attach(&mut core).map_err(|e| {
+            Rtt::attach_at(&mut core, rtt_block_addr).map_err(|e| {
                 ProbeError::ProbeRs(format!(
-                    "rtt attach: {e} (firmware probably hasn't initialised RTT yet — \
-                     link defmt-rtt and ensure main() touches it before doing anything slow)"
+                    "rtt attach_at {rtt_block_addr:#010x}: {e} (firmware probably \
+                     hasn't initialised RTT yet — ensure main() touches defmt-rtt \
+                     before doing anything slow)"
                 ))
             })?
         };
 
-        // Size the read buffer to the up-channel's buffer; default to
-        // 1024 (what defmt-rtt uses) if there are no up channels (we'll
-        // never read in that case anyway).
+        // Log the RTT channel layout at INFO. The defmt-rtt convention is
+        // a single up channel named "defmt"; if firmware has more channels
+        // (e.g. SEGGER RTT terminal alongside defmt) or the channel name
+        // doesn't match, this surfaces it in the operator's terminal
+        // without requiring trace-level logging. The M7.7 manual smoke
+        // turned up a case where index-0 read raw rzcobs-looking bytes
+        // that didn't decode — being able to inspect channel names + IDs
+        // is the first step to diagnosing whether we're reading the
+        // wrong channel.
+        let up_summary: Vec<String> = rtt
+            .up_channels
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("[{i}] name={:?} buf={}B", c.name(), c.buffer_size()))
+            .collect();
+        tracing::info!(
+            up_count = rtt.up_channels.len(),
+            up_channels = ?up_summary,
+            "RTT attached"
+        );
+
+        // Find the "defmt" up channel by name. defmt-rtt always names
+        // its channel "defmt"; if firmware also registers other up
+        // channels (SEGGER terminal etc.), index 0 is not necessarily
+        // the defmt one and reading from it produces non-defmt bytes
+        // that all decode as Malformed.
+        let defmt_channel_index = rtt
+            .up_channels
+            .iter()
+            .position(|c| c.name() == Some("defmt"))
+            .ok_or_else(|| {
+                ProbeError::ProbeRs(format!(
+                    "no RTT up channel named \"defmt\" found; channels: {up_summary:?}. \
+                     Ensure the test crate links defmt-rtt (`use defmt_rtt as _;`)."
+                ))
+            })?;
+        tracing::info!(defmt_channel_index, "selected RTT channel for defmt decode");
+
+        // Set the channel to BlockIfFull mode, matching what probe-rs's
+        // `probe-rs run` does. defmt-rtt's default mode (set at static
+        // init time in defmt-rtt/src/lib.rs:92) is
+        // `MODE_NON_BLOCKING_TRIM` — which means when the RTT buffer
+        // is full, the firmware silently TRIMS the new write. Frames
+        // never survive an unread buffer wrap. probe-rs hardens against
+        // this by flipping the flag to BlockIfFull on attach: firmware
+        // blocks until the host drains, so data is never silently lost.
+        //
+        // Without this, the M7.7 manual smoke produced 5 "malformed
+        // frame skipped" warnings against bytes that looked like
+        // rzcobs but didn't match the symbol table — most likely
+        // partial frames from a buffer wrap that we never noticed in
+        // non-blocking mode. We mirror probe-rs's choice here.
+        {
+            let mut core = session
+                .core(0)
+                .map_err(|e| ProbeError::ProbeRs(format!("session.core(0) for set_mode: {e}")))?;
+            if let Some(ch) = rtt.up_channels.get(defmt_channel_index) {
+                match ch.set_mode(&mut core, ChannelMode::BlockIfFull) {
+                    Ok(()) => {
+                        tracing::info!("set defmt RTT channel mode to BlockIfFull");
+                    }
+                    Err(e) => {
+                        // Soft-fail: log but continue. Some firmwares may
+                        // have a read-only flags field (unusual but
+                        // possible). If the mode was already blocking by
+                        // other means, the decode path will still work.
+                        tracing::warn!(
+                            error = %e,
+                            "could not set defmt RTT channel to BlockIfFull; \
+                             continuing in firmware-default mode (likely \
+                             NonBlockingTrim — may lose frames on buffer wrap)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Size the read buffer to the defmt up-channel's buffer; default
+        // to 1024 (what defmt-rtt uses) as a floor.
         let buf_size = rtt
             .up_channels
-            .first()
+            .get(defmt_channel_index)
             .map(|c| c.buffer_size().max(256))
             .unwrap_or(1024);
 
         Ok(Self {
             session,
             rtt,
+            defmt_channel_index,
             decoder,
             rtt_buf: vec![0u8; buf_size],
             seen_bkpt: false,
@@ -243,9 +401,19 @@ impl RealSession {
             return Ok(Some(evt));
         }
 
-        // 2. Read more bytes from the up channel.
+        // 2. Read more bytes from the defmt up channel (looked up by
+        //    name at connect; see `defmt_channel_index`). Reading from
+        //    `up_channels.first_mut()` is NOT safe — firmwares that
+        //    register multiple up channels (e.g. a SEGGER terminal at
+        //    index 0, defmt-rtt's channel at index 1) would give us
+        //    non-defmt bytes that the rzcobs decoder would reject as
+        //    Malformed for every frame. Surfaced in the M7.7 manual
+        //    smoke as 5 rapid "defmt malformed frame skipped" warnings
+        //    against bytes `00 05 7e 00 06 7e 00 04 7e 00 03 7e 00 02
+        //    7e 00` (the latter looks like rzcobs but doesn't match
+        //    any string-table entry — wrong channel).
         let n = {
-            let Some(ch) = self.rtt.up_channels.first_mut() else {
+            let Some(ch) = self.rtt.up_channels.get_mut(self.defmt_channel_index) else {
                 return Ok(None);
             };
             let mut core = self
@@ -331,6 +499,40 @@ impl ProbeSession for RealSession {
 /// bytes), `Malformed` (skipped with a warn; bounded retry — see
 /// `MAX_MALFORMED_SKIPS`), or after exhausting the skip budget.
 ///
+/// Locate the address of `defmt-rtt`'s `_SEGGER_RTT` control-block
+/// symbol inside a parsed ELF, so that `Rtt::attach_at` can target it
+/// directly instead of scanning RAM.
+///
+/// Returns the symbol's virtual address. The bookkeeping is the same
+/// thing probe-rs's published 0.31.0 `rtt::find_rtt_control_block_in_raw_file`
+/// would do, but that helper is post-0.31.0 and we don't want to git-pin
+/// probe-rs just for this. Pre-validates that the symbol is defined
+/// (has a section index), not merely declared, so we don't hand
+/// `attach_at` a garbage 0 pointer that would scan from address 0.
+fn find_segger_rtt(elf: &[u8]) -> std::result::Result<u64, String> {
+    use object::{Object, ObjectSymbol};
+    let file = object::File::parse(elf).map_err(|e| format!("parse elf: {e}"))?;
+    for sym in file.symbols() {
+        let Ok(name) = sym.name() else { continue };
+        if name != "_SEGGER_RTT" {
+            continue;
+        }
+        if sym.section_index().is_none() {
+            // Symbol is declared but not defined in this ELF — that
+            // means defmt-rtt isn't actually linked in (the user
+            // probably forgot `use defmt_rtt as _;`). Surface that
+            // specifically rather than continuing to scan.
+            return Err("ELF declares `_SEGGER_RTT` but does not define it; \
+                 the test crate must link `defmt-rtt` (`use defmt_rtt as _;`)"
+                .into());
+        }
+        return Ok(sym.address());
+    }
+    Err("ELF has no `_SEGGER_RTT` symbol; the test crate must link \
+         `defmt-rtt` (`use defmt_rtt as _;`)"
+        .into())
+}
+
 /// Free function (not a method on `RealSession`) because of a real
 /// borrow conflict: `decoder.decode()` returns a `Frame<'_>` that
 /// reborrows `&mut self.decoder` for its lifetime. Bumping `self.seq`
