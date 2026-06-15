@@ -2,6 +2,11 @@
 description = "paavo test crate for the mcxa266 board kind"
 ignore = ["target", "Cargo.lock"]
 
+# `test-kind` is captured at scaffold time but is not yet wired into the
+# template body. A future milestone will switch the generated `main.rs`
+# between a quick-test skeleton and a soak skeleton based on this answer
+# (see plan §M6.4 for the soak shape). For now both values produce the
+# same scaffold; choose `quick` unless you're prototyping soak ergonomics.
 [placeholders.test-kind]
 type = "string"
 prompt = "Test kind: quick or soak?"
