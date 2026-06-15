@@ -56,7 +56,8 @@ async fn main() -> Result<()> {
         job_logs: JobLogsBroker::new(),
     };
 
-    // Runner selection: production uses RealRunner (M6.4 wires probe-rs).
+    // Runner selection: production uses RealRunner (see
+    // `paavod::real_runner`; M7.4-7.6 wire the probe-rs adapter).
     // Dev / CI can set PAAVO_FAKE_RUNNER=1 to use a FakeRunner that
     // always returns Passed — enables the M4.5.b end-to-end CLI test
     // to drive a real paavod without hardware.
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
         tracing::warn!("PAAVO_FAKE_RUNNER=1: using FakeRunner; every job returns Passed");
         Arc::new(FakeRunner)
     } else {
-        Arc::new(RealRunner)
+        Arc::new(paavod::real_runner::RealRunner::from_state(&state))
     };
 
     let dispatch_handle = paavod::dispatch::spawn(state.clone(), runner);
@@ -139,27 +140,6 @@ fn load_inventory(
         .into_iter()
         .map(|r| r.spec)
         .collect())
-}
-
-/// Real-runner adapter. Wires paavo-runner's BoardWorker with a
-/// paavo-probe RealSession in M6.4. For now this returns InfraErr so
-/// the API is honest about what's wired and what isn't — operators
-/// running paavod without M6.4 see a clear failure message instead
-/// of jobs hanging in Running forever.
-struct RealRunner;
-
-impl paavo_core::Runner for RealRunner {
-    fn run(&self, _job_id: JobId, _board_id: &str) -> paavo_core::RunOutcome {
-        paavo_core::RunOutcome {
-            outcome: JobOutcome::Failed(paavo_proto::TerminalOutcome::InfraErr {
-                stage: "real_runner".into(),
-                message: "RealRunner is wired in Milestone 6.4; \
-                          set PAAVO_FAKE_RUNNER=1 in dev to use the fake outcome runner"
-                    .into(),
-            }),
-            probe_released_cleanly: true,
-        }
-    }
 }
 
 /// Dev/CI runner that always returns Passed. Selected via
