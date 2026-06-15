@@ -34,5 +34,6 @@ pub fn build_router(state: AppState) -> Router {
             "/boards/:id/unquarantine",
             post(routes::boards::unquarantine_board),
         )
+        .route("/admin/purge", post(routes::admin::purge))
         .with_state(state)
 }

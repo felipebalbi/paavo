@@ -12,6 +12,13 @@ members = [
     "crates/paavo-cli",
     "crates/paavo-web",
 ]
+# Cross-compiled smoke / template fixtures are standalone crates.
+# Excluded so `cargo test --workspace` doesn't try to build them with
+# the host toolchain, and so cargo's workspace walker doesn't confuse
+# `paavo-smoke` with a workspace member.
+exclude = [
+    "tests/fixtures/smoke-crate",
+]
 
 [workspace.package]
 version = "0.1.0"

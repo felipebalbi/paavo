@@ -774,6 +774,29 @@ JSON request/response except where noted.
   "...", ...}`) is a planned follow-up; the wire shape on success is
   already JSON.
 
+### 9.5 Admin
+
+- `POST /admin/purge` — operator-driven dev-loop reset. Wipes all
+  job artifacts on disk and in the DB, preserving board and
+  schedule rows. On disk: deletes everything under
+  `${state_dir}/sandboxes/`, `${state_dir}/uploads/`, and
+  `${state_dir}/cargo-target/`. In the DB: truncates `job`,
+  `log_frame`, and `build_cache`. Boards and schedules are
+  preserved so the operator does not lose registered probes or
+  cron rows.
+- Returns `204 No Content` on success.
+- Returns `409 Conflict` if any `job` row is in state `building`
+  or `running` (mirrors the drain gate from §6.3; preserves the
+  invariant that the dispatcher never has its sandbox yanked
+  mid-flash). The operator must `paavo-cli cancel <id>` (or
+  wait) for in-flight jobs to terminate before purge.
+- Continues to serve while paavod is draining (no point gating
+  this — drain is exactly when an operator would want to reset).
+- CLI: `paavo-cli admin purge` (§10.3).
+- v1 has no auth, no audit log, no soft-delete recovery. This is
+  a dev-loop convenience verb — production operators with valuable
+  job history should rely on retention sweeps (§8) instead.
+
 ### 9.5 Health
 
 - `GET /health` — liveness probe; returns `200` with a small JSON blob even
@@ -816,7 +839,17 @@ behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
   references it. Operators who want to delete a board with referenced
   jobs must wait for `retention` to age them out (per §11).
 
-### 10.3 Server discovery
+### 10.3 Admin subcommands
+
+- `paavo-cli admin purge` — dev-loop reset. Calls `POST /admin/purge`
+  (§9.5). Wipes all job artifacts on disk (`sandboxes/`, `uploads/`,
+  `cargo-target/`) and in the DB (`job`, `log_frame`, `build_cache`)
+  while preserving board and schedule rows. Refused with `409
+  Conflict` if any job is currently `building` or `running`.
+  Intended for the `manual-smoke` loop and for operators recovering
+  from a botched state dir; not a substitute for proper retention.
+
+### 10.4 Server discovery
 
 - `PAAVO_HOST` env var (e.g. `http://lab.local:8080`).
 - `--host` flag overrides.

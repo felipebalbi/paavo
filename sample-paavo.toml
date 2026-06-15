@@ -1,0 +1,70 @@
+# Sample paavo.toml for manual testing on this Windows host.
+# Run with:
+#   $env:PAAVO_FAKE_RUNNER='1'
+#   cargo run -p paavod -- --config sample-paavo.toml
+#
+# Then in another shell:
+#   $env:PAAVO_HOST='http://127.0.0.1:8090'
+#   cargo run -p paavo-cli -- boards
+#   cargo run -p paavo-cli -- jobs
+
+[server]
+# 8080 is reserved on this host (some "ApplicationWebServer"
+# service grabs it at boot; netsh shows it as forbidden). 8090 is
+# free; pick any other free port if 8090 is taken on your box.
+bind = "127.0.0.1:8090"
+# Daemon state dir. Will be auto-created (uploads/, sandboxes/,
+# cargo-target/, cache/elf/). Sqlite + migrations land here too.
+state_dir = "C:/Users/febalbi/AppData/Local/paavo"
+# 256 MiB per-request body cap for POST /jobs uploads.
+max_upload_bytes = 268435456
+
+[web]
+# paavo-web isn't implemented until M5; the field is required but
+# unused until then.
+bind = "127.0.0.1:8081"
+
+[timeouts]
+# Inactivity timeout: how long the runner waits without a new defmt
+# frame before declaring a stuck test.
+default_inactivity_s = 120
+# Hard wall-clock max for ad-hoc paavo-cli run jobs (15 min).
+default_ad_hoc_hard_max_s = 900
+# Hard wall-clock max for nightly Scheduled jobs (4 h).
+default_scheduled_hard_max_s = 14400
+# Daemon ceiling. Any hard_max_ms above this is rejected at enqueue.
+daemon_ceiling_s = 28800
+# SIGTERM drain grace.
+shutdown_grace_s = 60
+
+[scheduler]
+# 6-field cron: sec min hour dom mon dow. Time zone = daemon local.
+# 0 19 * * * = every day at 19:00:00.
+nightly_cron = "0 0 19 * * *"
+# Scheduled jobs older than this get promoted to Interactive priority
+# (6 h).
+starvation_threshold_s = 21600
+
+[build_cache]
+# 5 GiB. blake3 keyed; LRU evicted when over.
+max_bytes = 5368709120
+
+[retention]
+# After 30 days, truncate trace/debug/info frames from Passed jobs.
+# Set negative to disable.
+passed_full_log_days = 30
+
+[quarantine]
+# Auto-quarantine a board after this many consecutive InfraErr outcomes.
+consecutive_infra_failures = 3
+
+# Optional. Each entry: one nightly corpus. The cron walks every
+# first-level subdir of path that has a Cargo.toml, tars it, and
+# submits as a Scheduled job with the given kind. Empty by default
+# so the nightly cron is a no-op until you fill this in.
+#
+# [[corpus]]
+# name = "embassy-mcxa-regression"
+# kind = "mcxa266"
+# path = "C:/Users/febalbi/AppData/Local/paavo/checkouts/embassy/tests/mcxa266"
+# cargo_update = ["embassy-mcxa", "embassy-executor"]

@@ -1,0 +1,15 @@
+# Pin the cross target so `cargo build --release` (no flags) cross-
+# compiles. paavo-build invokes plain `cargo build --release` and lets
+# the crate decide; this config makes a no-flag build produce a real
+# ELF under `target/thumbv8m.main-none-eabihf/release/`.
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+# Use cortex-m-rt's link.x glue so `#[entry]` resolves and we get a
+# proper reset vector. `memory.x` (sibling file) supplies the RAM /
+# FLASH origins the linker script needs. Both files live in this
+# crate so the sandboxed build sees them at the conventional paths.
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]

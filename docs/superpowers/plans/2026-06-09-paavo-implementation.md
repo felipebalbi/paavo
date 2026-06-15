@@ -14986,6 +14986,53 @@ fmt still clean.
 
 ---
 
+### Bridge to M6: dev-loop ergonomics (admin purge + smoke crate fixture)
+
+Surfaced from a manual smoke session between M5 and M6. Two real
+defects in the dev experience were committed as a bridging sub-task:
+
+1. **`manual-smoke.nu` was uploading `paavo-proto` as the test crate
+   body.** `paavo-proto`'s `Cargo.toml` uses
+   `edition.workspace = true`, but paavod's sandbox has no parent
+   `[workspace]` table — cargo blows up with `failed to find a
+   workspace root` on every job. Additionally, `cargo build --release`
+   on Windows produces a PE/COFF `.exe`, which paavo-build's
+   `is_elf` magic check correctly rejects (the daemon is documented
+   as Linux-only in spec §1.4 line 41, but the manual smoke loop on
+   Windows still needs a path that actually compiles to an ELF —
+   the build is *for the DUT*, not the host).
+
+   Fix: shipped `tests/fixtures/smoke-crate/`, a minimal `#![no_std]
+   #![no_main]` Cortex-M33 binary with a vendored `memory.x`,
+   `.cargo/config.toml` pinning `target = "thumbv8m.main-none-eabihf"`,
+   and an embedded `[workspace]` table to escape repo-root
+   discovery. Added the path to the repo root `workspace.exclude`
+   so `cargo test --workspace` doesn't try to host-build it. Also
+   serves as the prototype for M6.1's `quick-test` cargo-generate
+   template.
+
+2. **No way to reset state between smoke runs.** Sandbox dirs,
+   uploads, and the build cache accumulated indefinitely. The plan
+   originally deferred retention to M6.5, but that's too late for
+   the dev loop. Added `POST /admin/purge` (spec §9.5) and
+   `paavo-cli admin purge` (spec §10.3): wipes
+   `sandboxes/` + `uploads/` + `cargo-target/` on disk, truncates
+   `job` + `log_frame` + `build_cache` in the DB, preserves boards
+   and schedules. Refused with `409 Conflict` if any job is
+   currently `building` or `running` (mirrors §6.3 drain semantics
+   — the dispatcher must not have its sandbox yanked mid-flash).
+   Continues to serve during drain (drain only gates `POST /jobs`).
+
+   Tests: 6 paavod (`api_admin.rs`) covering empty-state success,
+   DB truncation, board/schedule preservation, 409-on-in-flight
+   guard, on-disk wipe with leftover artifacts, drain bypass. 2
+   paavo-cli help tests confirming the verb is reachable and the
+   help text telegraphs destructiveness.
+
+Test count delta: api_admin 0 → 6, cli_help 3 → 5.
+
+---
+
 ## Milestone 6 — Templates, soak, ops
 
 Goal: scaffolding templates for `cargo-generate`, one initial soak test crate, systemd units, udev rules, README + deployment doc, hardware smoke checklist.

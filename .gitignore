@@ -12,3 +12,9 @@ Cargo.lock.bak
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Standalone test-fixture crates have their own target dirs and their
+# own Cargo.lock files. The fixtures themselves are checked in; their
+# build outputs are not.
+/tests/fixtures/*/target
+/tests/fixtures/*/Cargo.lock

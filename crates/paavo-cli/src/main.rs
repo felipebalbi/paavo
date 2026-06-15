@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod cli;
 mod client;
+mod cmd_admin;
 mod cmd_boards;
 mod cmd_jobs;
 mod cmd_new;
@@ -51,5 +52,6 @@ async fn main() -> Result<()> {
         cli::Cmd::Jobs { state, limit } => cmd_jobs::list(&client, state.as_deref(), limit).await,
         cli::Cmd::Boards => cmd_boards::list(&client).await,
         cli::Cmd::Board { op } => cmd_boards::op(&client, op).await,
+        cli::Cmd::Admin { op } => cmd_admin::op(&client, op).await,
     }
 }

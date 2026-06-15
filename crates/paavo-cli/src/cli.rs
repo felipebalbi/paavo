@@ -79,6 +79,12 @@ pub enum Cmd {
         #[command(subcommand)]
         op: BoardOp,
     },
+    /// Admin / dev-loop operations.
+    Admin {
+        /// Operation.
+        #[command(subcommand)]
+        op: AdminOp,
+    },
 }
 
 /// Priority CLI arg.
@@ -143,4 +149,15 @@ pub enum BoardOp {
         /// Board id.
         id: String,
     },
+}
+
+/// `admin` ops.
+#[derive(Subcommand, Debug)]
+pub enum AdminOp {
+    /// Dev-loop reset: wipe job artifacts on disk (sandboxes, uploads,
+    /// cargo-target, cached ELFs) and truncate `job` / `log_frame` /
+    /// `build_cache` in the DB. Preserves boards and schedules.
+    /// Refused if any job is currently building or running. See
+    /// spec §9.5 / §10.3.
+    Purge,
 }

@@ -1,0 +1,38 @@
+[package]
+name = "paavo-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal cross-compiled crate body for manual-smoke.nu against PAAVO_FAKE_RUNNER. Prototypes the M6.1 quick-test template."
+
+# Standalone — no workspace inheritance. paavod's sandbox dir has no
+# parent Cargo.toml, so workspace.package.<field> would fail to
+# resolve. The empty `[workspace]` table also forces cargo to treat
+# this crate as standalone even when it lives inside paavo's repo
+# (otherwise cargo walks up to D:\workspace\paavo\Cargo.toml and
+# refuses the build).
+[workspace]
+
+[[bin]]
+name = "paavo-smoke"
+path = "src/main.rs"
+
+[dependencies]
+# cortex-m-rt provides the reset vector + initial entry point on
+# bare-metal Cortex-M targets. With no_main + no_std this is what
+# makes `cargo build --release --target thumbv8m.main-none-eabihf`
+# produce a real ELF that paavod's elf-discovery can find under
+# `target/thumbv8m.main-none-eabihf/release/`.
+cortex-m-rt = "0.7"
+
+[profile.release]
+# Keep the artifact small and self-contained: lto thin trims a few KiB
+# without slowing the build appreciably, and panic = "abort" is required
+# because we have no unwinder.
+lto = "thin"
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
+debug = true       # paavod's elf discovery just needs ELF magic, but
+                   # leaving debug info makes future probe-rs flashing
+                   # produce useful backtraces.
