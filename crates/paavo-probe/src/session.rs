@@ -258,6 +258,19 @@ impl RealSession {
         if n == 0 {
             return Ok(None);
         }
+        // Trace-log the raw RTT chunk as hex. Off by default; enable
+        // with RUST_LOG=paavo_probe=trace to debug defmt framing
+        // mismatches (e.g. "all frames malformed" → check whether the
+        // bytes look like a defmt frame start at all, or whether they
+        // are some other channel's traffic).
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let hex: String = self.rtt_buf[..n]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::trace!(bytes = n, "rtt chunk: {hex}");
+        }
         self.decoder.received(&self.rtt_buf[..n]);
 
         // 3. Try again now that we have more bytes.
@@ -360,6 +373,19 @@ fn drain_one_frame(
                 // saturating is cheaper than panicking and matches
                 // the rest of paavo's "no panic in hot paths" rule.
                 let ts_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                // Debug-trace every decoded frame so a failure like
+                // "bkpt without preceding Test OK" can be diagnosed
+                // from logs alone — we can see the exact level + message
+                // bytes the decoder produced, and whether the OK frame
+                // ever arrived. Off by default; enable with
+                // RUST_LOG=paavo_probe=debug.
+                tracing::debug!(
+                    seq = this_seq,
+                    ts_us,
+                    ?level,
+                    message_len = message.len(),
+                    "defmt frame: {message:?}"
+                );
                 return Some(Event::LogFrame(LogFrame {
                     seq: this_seq,
                     ts_us,
