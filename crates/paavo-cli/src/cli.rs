@@ -48,6 +48,18 @@ pub enum Cmd {
         /// quick / soak.
         #[arg(long, default_value = "quick")]
         kind: TestKindArg,
+        /// Destination directory; the scaffolded crate lands at
+        /// `<into>/<name>/`. Defaults to the current working directory.
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Explicit templates root. Overrides the default
+        /// auto-discovery (walking up from CWD for a paavo checkout).
+        #[arg(long)]
+        templates_path: Option<PathBuf>,
+        /// Override the `embassy-rev` template placeholder. Defaults
+        /// to the pinned value in the template's cargo-generate.toml.
+        #[arg(long)]
+        embassy_rev: Option<String>,
     },
     /// Cancel a queued or running job.
     Cancel {

@@ -46,7 +46,28 @@ async fn main() -> Result<()> {
             name,
             board_kind,
             kind,
-        } => cmd_new::new(&name, &board_kind, kind),
+            into,
+            templates_path,
+            embassy_rev,
+        } => {
+            let kind_str = match kind {
+                cli::TestKindArg::Quick => "quick",
+                cli::TestKindArg::Soak => "soak",
+            }
+            .to_string();
+            let into = into.unwrap_or_else(|| {
+                std::env::current_dir().expect("current_dir for default --into")
+            });
+            let code = cmd_new::run(cmd_new::NewArgs {
+                crate_name: name,
+                board_kind,
+                kind: kind_str,
+                into,
+                templates_path,
+                embassy_rev,
+            })?;
+            std::process::exit(code);
+        }
         cli::Cmd::Cancel { job_id } => cmd_jobs::cancel(&client, &job_id).await,
         cli::Cmd::Logs { job_id, follow } => cmd_jobs::logs(&client, &job_id, follow).await,
         cli::Cmd::Jobs { state, limit } => cmd_jobs::list(&client, state.as_deref(), limit).await,
