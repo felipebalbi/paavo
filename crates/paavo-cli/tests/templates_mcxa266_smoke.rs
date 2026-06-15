@@ -86,6 +86,54 @@ fn templates_mcxa266_smoke_renders_corrected_feature_flags() {
          thumbv8m.main-none-eabihf). Cargo.toml.liquid:\n{cargo_toml}"
     );
 
+    // ─── Manual-smoke correction: edition = "2024" is REQUIRED.
+    //
+    // Edition 2024 implies `resolver = "3"`, which (like resolver
+    // 2 before it) splits feature unification by host vs target.
+    // The legacy resolver = "1" (the edition-2021 default) unifies
+    // a package's feature set across BOTH the [build-dependencies]
+    // (host compile) AND the [dependencies] (target compile) slots.
+    // That is fatal for nxp-pac: embassy-mcxa pulls nxp-pac in
+    // twice —
+    //
+    //   [dependencies]       nxp-pac = { ..., features = ["rt"] }
+    //   [build-dependencies] nxp-pac = { ..., default-features =
+    //                                   false, features = ["metadata"] }
+    //
+    // With resolver 1, the host-compile of nxp-pac inherits `rt`,
+    // which transitively pulls `cortex-m` into the host build. The
+    // host-compile of cortex-m then tries to compile `register/
+    // basepri.rs` (gated `cfg(all(not(armv6m), not(armv8m_base)))`
+    // — true on x86_64) which expands `call_asm!(__basepri_r() ->
+    // u8)` to `crate::asm::inline::__basepri_r()`. With
+    // `inline-asm` enabled (also unified across host/target under
+    // resolver 1), `asm/inline.rs` is included for host and emits
+    // `asm!("bkpt #0xab", inout("r0") nr, in("r1") arg, ...)` —
+    // which fails on x86 with "invalid register `r0`".
+    //
+    // The full failure was 6 errors (E0425 ×4 for
+    // __basepri_{r,w,max} + __faultmask_r, plus 2 "invalid
+    // register" errors for r0/r1).
+    //
+    // Edition 2024 / resolver 3 fixes this cleanly — the host
+    // compile of nxp-pac only gets `metadata` (no cortex-m at
+    // all) and the problem disappears. Surfaced during the M7.7
+    // manual smoke; lock the edition in here so no future template
+    // refresh can accidentally downgrade it back to 2021.
+    assert!(
+        cargo_toml.contains(r#"edition = "2024""#),
+        "Cargo.toml.liquid must set `edition = \"2024\"`. Without it, \
+         legacy feature unification (resolver 1) leaks thumb-only \
+         cortex-m features into the host compile of nxp-pac \
+         (build-dep) and the cortex-m host build fails with E0425. \
+         Cargo.toml.liquid:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains(r#"edition = "2021""#),
+        "stale `edition = \"2021\"` must be removed (it implies \
+         resolver = \"1\" which breaks the host build of nxp-pac)"
+    );
+
     // ─── M7.1 correction #4: defmt family moves to 1.x.
     // The version string is open-ended (`"1"` matches anything ≥ 1.0
     // by cargo's caret semantics), so we negate the stale 0.x pins
