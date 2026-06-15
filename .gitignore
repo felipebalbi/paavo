@@ -18,3 +18,5 @@ Cargo.lock.bak
 # build outputs are not.
 /tests/fixtures/*/target
 /tests/fixtures/*/Cargo.lock
+/soak-tests/*/*/target
+/soak-tests/*/*/Cargo.lock

@@ -1,0 +1,7 @@
+/* mcxa266 default memory map. Confirm against the NXP datasheet for your
+ * exact part number before first run. */
+MEMORY
+{
+  FLASH : ORIGIN = 0x00000000, LENGTH = 1M
+  RAM   : ORIGIN = 0x20000000, LENGTH = 192K
+}

@@ -18,6 +18,7 @@ members = [
 # `paavo-smoke` with a workspace member.
 exclude = [
     "tests/fixtures/smoke-crate",
+    "soak-tests",
 ]
 
 [workspace.package]
