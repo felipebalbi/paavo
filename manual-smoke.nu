@@ -40,6 +40,31 @@ def --env wait-for-daemon [] {
 wait-for-daemon
 
 # ---------------------------------------------------------------
+# 0. Reset to a clean slate.
+#    - `admin purge` wipes job artifacts (disk + db) but preserves
+#      boards by design (operators normally do not want to re-register
+#      probes after a purge — see spec §9.5).
+#    - For the smoke loop we *do* want a fresh inventory so the
+#      `board add` calls below succeed on every run, so we manually
+#      sweep the board table too: quarantine each row (required by
+#      the FK guard on DELETE /boards/:id) then remove it. Pull the
+#      id list from the JSON wire shape rather than the formatted
+#      table that `paavo-cli boards` prints.
+#    NOTE: purge refuses (409) if any job is currently building or
+#    running. If that happens, cancel them with `paavo-cli cancel <id>`
+#    or wait for them to terminate, then re-run.
+# ---------------------------------------------------------------
+print "\n=== reset state (admin purge + wipe inventory) ==="
+cargo run -p paavo-cli -- admin purge
+let existing = (try { http get $"($env.PAAVO_HOST)/boards" } catch { [] })
+for row in $existing {
+    let id = $row.id
+    print $"  removing leftover board ($id)"
+    cargo run -p paavo-cli -- board quarantine $id --reason "smoke reset"
+    cargo run -p paavo-cli -- board remove $id
+}
+
+# ---------------------------------------------------------------
 # 1. Register 2 boards.
 # ---------------------------------------------------------------
 print "\n=== register boards ==="
