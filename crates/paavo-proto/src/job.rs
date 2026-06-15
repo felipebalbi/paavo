@@ -196,6 +196,17 @@ pub struct JobSpec {
     /// the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_max_ms: Option<u64>,
+    /// Skip the build cache for this job. When `false` (default),
+    /// paavod consults `build_cache` keyed by `tar_blake3` — an
+    /// identical resubmit reuses the prior ELF. When `true`, paavod
+    /// always invokes `cargo build --release` and flashes the freshly-
+    /// produced binary. Used by `paavo-cli run --skip-cache` when
+    /// chasing a flaky chip or a transient toolchain issue where the
+    /// operator wants a clean build path. The cache row, if one
+    /// exists, is left alone (not invalidated) so subsequent
+    /// without-`--skip-cache` submits still hit it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_cache: bool,
 }
 
 /// JSON shape returned by `GET /jobs` and `GET /jobs/:id`. Mirrors the
@@ -247,4 +258,9 @@ pub struct JobView {
     /// can show "this nightly job will pull fresh embassy revisions".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cargo_update_packages: Vec<String>,
+    /// `true` if the job was submitted with `--skip-cache`. Surfaced
+    /// for paavo-cli/web so operators can see why an otherwise
+    /// cacheable resubmit took the slow path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_cache: bool,
 }

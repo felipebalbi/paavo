@@ -323,6 +323,7 @@ fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         now,
     )
@@ -446,6 +447,7 @@ fn delete_board_with_referencing_job_returns_conflict_via_fk() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         now,
     )

@@ -368,6 +368,7 @@ async fn get_job_returns_row() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -407,6 +408,7 @@ async fn cancel_submitted_job_returns_204() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -446,6 +448,7 @@ async fn list_jobs_filters_by_state() {
                 tar_blake3: "x".into(),
                 tar_path: "/tmp/x.tar".into(),
                 cargo_update_packages: vec![],
+                skip_cache: false,
             },
             0,
         )
@@ -601,6 +604,7 @@ async fn cancel_terminal_job_returns_409() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -646,6 +650,7 @@ async fn get_job_view_omits_tar_path_and_elf_path() {
             tar_blake3: "deadbeef".into(),
             tar_path: "/var/lib/paavo/uploads/deadbeef.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -689,6 +694,7 @@ async fn stream_terminal_returns_historical_plus_outcome() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -790,6 +796,7 @@ async fn stream_live_emits_published_frame_then_terminal() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -867,6 +874,7 @@ async fn stream_terminal_does_not_leak_subscriber_channels() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -941,6 +949,7 @@ async fn stream_returns_500_when_terminal_outcome_is_null() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -991,6 +1000,7 @@ async fn stream_pages_historical_above_chunk_size() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -1059,6 +1069,7 @@ async fn cancel_running_job_with_registered_signal_returns_204() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )
@@ -1105,6 +1116,7 @@ async fn cancel_running_job_without_registered_signal_returns_409() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )

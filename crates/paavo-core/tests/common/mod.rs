@@ -94,6 +94,7 @@ pub fn default_enqueue_request(kind: &str) -> EnqueueRequest {
         tar_path: "/tmp/x.tar".into(),
         daemon_ceiling_ms: DAEMON_CEILING_8H_MS,
         cargo_update_packages: vec![],
+        skip_cache: false,
     }
 }
 

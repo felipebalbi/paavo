@@ -33,6 +33,13 @@ pub struct NewJob {
     /// the nightly cron threads each `[[corpus]].cargo_update` here so
     /// soak runs pull fresh embassy revisions (spec §8.1 step 4).
     pub cargo_update_packages: Vec<String>,
+    /// `true` when the caller wants to bypass the build cache for this
+    /// job — paavod will always invoke `paavo_build::build_release`
+    /// rather than reusing a cached ELF for the same `tar_blake3`. Set
+    /// from `JobSpec::skip_cache` on the HTTP ingress side (`paavo-cli
+    /// run --skip-cache`); always `false` for the nightly cron's
+    /// scheduled jobs (the cron benefits from cache hits).
+    pub skip_cache: bool,
 }
 
 /// Captured terminal-state transition payload.
@@ -85,6 +92,11 @@ pub struct JobRow {
     /// HTTP-submitted jobs; populated for Scheduled jobs from
     /// `[[corpus]].cargo_update`.
     pub cargo_update_packages: Vec<String>,
+    /// `true` when the caller wants to bypass the build cache for
+    /// this job — paavod always invokes `paavo_build::build_release`
+    /// rather than reusing a cached ELF. Mirrors
+    /// `NewJob::skip_cache`. Surfaced on `JobView` for the UI.
+    pub skip_cache: bool,
 }
 
 impl JobRow {
@@ -97,9 +109,10 @@ impl JobRow {
                 id, priority, submitter, source, board_selector,
                 inactivity_timeout_ms, hard_max_ms, state, outcome_detail,
                 board_id, submitted_at, started_at, finished_at,
-                tar_blake3, tar_path, elf_path, cargo_update_packages
+                tar_blake3, tar_path, elf_path, cargo_update_packages,
+                skip_cache
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'submitted', NULL, NULL,
-                      ?8, NULL, NULL, ?9, ?10, NULL, ?11)",
+                      ?8, NULL, NULL, ?9, ?10, NULL, ?11, ?12)",
             params![
                 j.id.to_string(),
                 j.priority.weight() as i64,
@@ -112,6 +125,7 @@ impl JobRow {
                 j.tar_blake3,
                 j.tar_path,
                 pkgs_json,
+                j.skip_cache as i64,
             ],
         )?;
         Ok(())
@@ -370,6 +384,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
     let tar_path: String = r.get("tar_path")?;
     let elf_path: Option<String> = r.get("elf_path")?;
     let pkgs_json: String = r.get("cargo_update_packages")?;
+    let skip_cache_raw: i64 = r.get("skip_cache")?;
 
     Ok((|| -> Result<JobRow> {
         let id = JobId::from_str(&id_str).map_err(|_| DbError::UnknownEnum {
@@ -396,6 +411,20 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             value: "negative or > i64::MAX".into(),
         })?;
         let cargo_update_packages: Vec<String> = serde_json::from_str(&pkgs_json)?;
+        // `skip_cache` is stored as INTEGER 0/1 (SQLite has no native
+        // bool). Anything outside that range is a schema invariant
+        // violation, not user input, so map to UnknownEnum with the
+        // raw value for debugging.
+        let skip_cache = match skip_cache_raw {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(DbError::UnknownEnum {
+                    column: "job.skip_cache",
+                    value: other.to_string(),
+                });
+            }
+        };
         Ok(JobRow {
             id,
             priority,
@@ -414,6 +443,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             tar_path,
             elf_path,
             cargo_update_packages,
+            skip_cache,
         })
     })())
 }

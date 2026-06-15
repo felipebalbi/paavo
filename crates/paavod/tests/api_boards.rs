@@ -396,6 +396,7 @@ async fn delete_board_with_referencing_job_returns_409() {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         0,
     )

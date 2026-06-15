@@ -24,6 +24,7 @@ pub async fn run(
     inactivity: Option<&str>,
     priority: PriorityArg,
     follow: bool,
+    skip_cache: bool,
 ) -> Result<()> {
     let kind = board_kind.ok_or_else(|| anyhow::anyhow!("--board-kind is required for `run`"))?;
     let crate_dir = resolve_crate_dir(path)?;
@@ -45,6 +46,7 @@ pub async fn run(
         },
         inactivity_timeout_ms: inactivity.map(parse_duration_ms).transpose()?,
         hard_max_ms: timeout.map(parse_duration_ms).transpose()?,
+        skip_cache,
     };
 
     let job_id = client.submit_job(&spec, tar_bytes).await?;

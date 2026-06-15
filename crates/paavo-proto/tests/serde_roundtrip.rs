@@ -112,6 +112,7 @@ fn job_spec_roundtrip() {
         },
         inactivity_timeout_ms: Some(120_000),
         hard_max_ms: Some(900_000),
+        skip_cache: true,
     };
     let s = serde_json::to_string(&spec).unwrap();
     let parsed: JobSpec = serde_json::from_str(&s).unwrap();
@@ -135,6 +136,7 @@ fn job_spec_wire_shape_omits_source_and_tar_blake3() {
         },
         inactivity_timeout_ms: None,
         hard_max_ms: None,
+        skip_cache: false,
     };
     let j = serde_json::to_value(&spec).unwrap();
     assert!(j.get("source").is_none(), "JobSpec must not expose source");
@@ -145,6 +147,14 @@ fn job_spec_wire_shape_omits_source_and_tar_blake3() {
     // Optional None fields are omitted via skip_serializing_if.
     assert!(j.get("inactivity_timeout_ms").is_none());
     assert!(j.get("hard_max_ms").is_none());
+    // `skip_cache: false` is the default (not setting --skip-cache);
+    // ensure it's omitted from the wire so paavod treats older
+    // clients identically — preserves the previous on-wire shape for
+    // every existing submitter.
+    assert!(
+        j.get("skip_cache").is_none(),
+        "JobSpec must omit skip_cache when false (default-omit)"
+    );
 }
 
 #[test]
@@ -351,6 +361,7 @@ fn job_view_roundtrip() {
         finished_at: None,
         tar_blake3: "deadbeef".into(),
         cargo_update_packages: vec![],
+        skip_cache: false,
     };
     let json = serde_json::to_value(&view).unwrap();
     // Wire shape contract: no tar_path, no elf_path.
@@ -397,6 +408,7 @@ fn job_view_terminal_includes_outcome_and_finished_at() {
         finished_at: Some(2),
         tar_blake3: "x".into(),
         cargo_update_packages: vec![],
+        skip_cache: false,
     };
     let json = serde_json::to_value(&view).unwrap();
     assert_eq!(json["state"], "aborted");

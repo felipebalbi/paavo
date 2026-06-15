@@ -44,6 +44,14 @@ pub enum Cmd {
         /// `paavo-cli logs <id> --follow`.
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Force paavod to rebuild this submission instead of reusing
+        /// a cached ELF for the same tar. Use when you suspect the
+        /// chip or toolchain drifted between runs and want a clean
+        /// "compile + flash from scratch" path. The cache row itself
+        /// is left intact, so subsequent normal submits still benefit
+        /// from the cache.
+        #[arg(long)]
+        skip_cache: bool,
     },
     /// Scaffold a new test crate via cargo-generate templates.
     New {

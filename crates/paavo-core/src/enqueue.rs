@@ -35,6 +35,11 @@ pub struct EnqueueRequest {
     /// `[[corpus]].cargo_update` through here so soak runs pull fresh
     /// embassy revisions (spec §8.1 step 4).
     pub cargo_update_packages: Vec<String>,
+    /// Caller asked for the build cache to be bypassed for this job.
+    /// HTTP submitters set this via `JobSpec::skip_cache` (`paavo-cli
+    /// run --skip-cache`); the nightly cron always passes `false`
+    /// because cache hits are what make the soak loop tractable.
+    pub skip_cache: bool,
 }
 
 /// Pre-validate the parts of an enqueue request that do NOT require
@@ -77,6 +82,7 @@ pub fn enqueue_job(
         tar_blake3: req.tar_blake3,
         tar_path: req.tar_path,
         cargo_update_packages: req.cargo_update_packages,
+        skip_cache: req.skip_cache,
     };
     paavo_db::JobRow::insert(conn, &new, now_ms)?;
     Ok(req.job_id)

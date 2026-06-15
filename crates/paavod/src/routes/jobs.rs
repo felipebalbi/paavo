@@ -34,6 +34,11 @@ pub struct PostJobMetadata {
     /// `timeouts.default_ad_hoc_hard_max_s * 1000`.
     #[serde(default)]
     pub hard_max_ms: Option<u64>,
+    /// Bypass the build cache for this job. Mirrors
+    /// `JobSpec::skip_cache`. Defaults to `false` for clients that
+    /// don't set the field — preserves the previous wire contract.
+    #[serde(default)]
+    pub skip_cache: bool,
 }
 
 /// 202 response body.
@@ -160,6 +165,7 @@ pub async fn post_jobs(
         tar_path: String::new(),
         daemon_ceiling_ms,
         cargo_update_packages: vec![],
+        skip_cache: metadata.skip_cache,
     };
     {
         let inventory = s.inventory_snapshot();
@@ -209,6 +215,7 @@ pub async fn post_jobs(
         tar_path: final_path_str,
         daemon_ceiling_ms,
         cargo_update_packages: vec![],
+        skip_cache: pre_req.skip_cache,
     };
     let inserted = {
         let db = s.db.lock();
@@ -444,6 +451,7 @@ fn row_to_view(r: paavo_db::JobRow) -> JobView {
         finished_at: r.finished_at,
         tar_blake3: r.tar_blake3,
         cargo_update_packages: r.cargo_update_packages,
+        skip_cache: r.skip_cache,
     }
 }
 

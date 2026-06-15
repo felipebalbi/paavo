@@ -95,6 +95,7 @@ fn seed_terminal_job(state: &AppState) -> JobId {
                 tar_blake3: "x".into(),
                 tar_path: "/tmp/x.tar".into(),
                 cargo_update_packages: vec![],
+                skip_cache: false,
             },
             0,
         )
@@ -134,6 +135,7 @@ fn seed_in_flight_job(state: &AppState) -> JobId {
                 tar_blake3: "x".into(),
                 tar_path: "/tmp/x.tar".into(),
                 cargo_update_packages: vec![],
+                skip_cache: false,
             },
             0,
         )

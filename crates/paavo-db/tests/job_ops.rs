@@ -50,6 +50,7 @@ fn sample_new_job(id: JobId) -> NewJob {
         tar_blake3: "deadbeef".into(),
         tar_path: "/var/lib/paavo/uploads/deadbeef.tar".into(),
         cargo_update_packages: vec![],
+        skip_cache: false,
     }
 }
 

@@ -154,6 +154,7 @@ fn real_runner_passes_against_real_mcxa266() {
                 tar_blake3: "0".repeat(64),
                 tar_path: tmp.path().join("dummy.tar").display().to_string(),
                 cargo_update_packages: vec![],
+                skip_cache: false,
             },
             chrono::Utc::now().timestamp_millis(),
         )

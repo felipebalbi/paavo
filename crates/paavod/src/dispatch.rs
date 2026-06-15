@@ -180,7 +180,11 @@ fn run_one_inner(
 ) -> (JobOutcome, bool) {
     let job_id = job.id;
 
-    // 2. Cache lookup or build.
+    // 2. Cache lookup or build. The cache is keyed by tar_blake3, so
+    //    an identical resubmit hits it (fast turnaround). Operators
+    //    chasing a flaky chip can force a fresh build + flash by
+    //    submitting with `--skip-cache` (paavo-cli) / `skip_cache:
+    //    true` (JobSpec); see `JobRow::skip_cache`.
     let elf_path = match build_or_cache(state, job) {
         Ok(p) => p,
         Err(stderr) => {
@@ -235,12 +239,33 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// stderr tail so the caller can produce a `BuildErr` outcome.
 fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path::PathBuf, String> {
     let now_ms = Utc::now().timestamp_millis();
-    let lookup = {
-        let db = state.db.lock();
-        cache_lookup(db.raw_conn(), &job.tar_blake3, now_ms)
-    };
-    if let Ok(CacheLookup::Hit { elf_path }) = lookup {
-        return Ok(elf_path);
+    // `skip_cache` is the operator's explicit "rebuild, don't reuse a
+    // cached ELF for this tar_blake3" knob (set via paavo-cli
+    // `--skip-cache` / JobSpec::skip_cache). When true we deliberately
+    // do NOT consult the build_cache table; the cargo target dir is
+    // still shared across jobs (CARGO_TARGET_DIR) so a no-op rebuild
+    // is fast, but the path goes through `paavo_build::build_release`
+    // every time so any drift between submits is healed.
+    //
+    // We also do NOT delete the existing cache row — a subsequent
+    // submit without --skip-cache should still hit the cache. The
+    // upstream cache_store at the end of this function refreshes the
+    // row's last_used_at + elf_path either way, so the cache stays
+    // warm for the next operator who wants the fast path.
+    if !job.skip_cache {
+        let lookup = {
+            let db = state.db.lock();
+            cache_lookup(db.raw_conn(), &job.tar_blake3, now_ms)
+        };
+        if let Ok(CacheLookup::Hit { elf_path }) = lookup {
+            return Ok(elf_path);
+        }
+    } else {
+        tracing::info!(
+            job_id = %job.id,
+            tar_blake3 = %job.tar_blake3,
+            "build: skip_cache=true; bypassing build_cache lookup, will rebuild"
+        );
     }
 
     // Cache miss (or lookup error — fall through to a fresh build).

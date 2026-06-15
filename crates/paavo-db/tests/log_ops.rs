@@ -34,6 +34,7 @@ fn enqueue_job(db: &Db) -> JobId {
             tar_blake3: "x".into(),
             tar_path: "/tmp/x.tar".into(),
             cargo_update_packages: vec![],
+            skip_cache: false,
         },
         now,
     )

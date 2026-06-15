@@ -227,6 +227,10 @@ async fn enqueue_one_crate(
         // before `cargo build`, giving the nightly fresh embassy
         // revisions on every run (spec §8.1 step 4).
         cargo_update_packages: entry.cargo_update.clone(),
+        // The nightly cron always benefits from cache hits — that's
+        // what makes the soak loop tractable across hundreds of crates
+        // and dozens of boards. No `--skip-cache` plumbed here today.
+        skip_cache: false,
     };
     let inventory = state.inventory_snapshot();
     let now_ms = Utc::now().timestamp_millis();

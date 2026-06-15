@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
             inactivity,
             priority,
             follow,
+            skip_cache,
         } => {
             cmd_run::run(
                 &client,
@@ -41,6 +42,7 @@ async fn main() -> Result<()> {
                 inactivity.as_deref(),
                 priority,
                 follow,
+                skip_cache,
             )
             .await
         }
