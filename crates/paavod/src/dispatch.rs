@@ -98,19 +98,19 @@ pub fn spawn(state: AppState, runner: Arc<dyn Runner>) -> tokio::task::JoinHandl
                 sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<paavo_runner::RunCommand>();
-            state.cancellation.register(job_id, cancel_tx);
+            // Allocate a fresh cancel channel inside the registry. The
+            // sender stays on the registry entry so `signal()` keeps
+            // working through the job's lifetime; the receiver is
+            // consumed later by `RealRunner::run` via `take_receiver`,
+            // which hands it to the BoardWorker's watchdog. Dispatch
+            // itself never touches the rx — wiring is centralised in
+            // the runner.
+            state.cancellation.register(job_id);
 
             let state_clone = state.clone();
             let runner_clone = runner.clone();
             tokio::task::spawn_blocking(move || {
-                run_one(
-                    state_clone,
-                    runner_clone,
-                    scheduled.job,
-                    scheduled.board,
-                    cancel_rx,
-                );
+                run_one(state_clone, runner_clone, scheduled.job, scheduled.board);
             });
         }
     })
@@ -129,19 +129,16 @@ pub fn spawn(state: AppState, runner: Arc<dyn Runner>) -> tokio::task::JoinHandl
 /// the operator sees a clear terminal instead of a stuck Building/
 /// Running row.
 ///
-/// `_cancel_rx` is the receiver end of the cancellation channel
-/// registered by `spawn`. The current `Runner` trait does not yet
-/// accept a cancel receiver — that wiring lands in M6 alongside the
-/// real probe-rs session. For now the receiver is held in this stack
-/// frame and dropped at function exit (after `unregister` removes the
-/// Sender from the registry map, so signal() naturally returns false
-/// from then on).
+/// The cancel-channel rx is owned by the `CancellationRegistry`
+/// entry that `spawn` allocated via `register(job_id)`; the runner
+/// consumes it via `take_receiver` inside `runner.run`. Dispatch
+/// does not touch the rx directly — wiring is centralised in
+/// `RealRunner::run`.
 fn run_one(
     state: AppState,
     runner: Arc<dyn Runner>,
     job: paavo_db::JobRow,
     board: paavo_db::BoardRow,
-    _cancel_rx: crossbeam_channel::Receiver<paavo_runner::RunCommand>,
 ) {
     let job_id = job.id;
     let board_id = board.spec.id.clone();

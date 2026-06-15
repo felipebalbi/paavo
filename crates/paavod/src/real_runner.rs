@@ -1,45 +1,57 @@
 //! Real probe-rs-backed runner. Replaces the M2.1 unit-struct stub.
 //!
 //! Owns the four pieces of state needed to drive a real BoardWorker:
-//! - DB handle: read `elf_path` from the job row (dispatch already
-//!   wrote it via `transition_to_running`).
+//! - DB handle: read `elf_path` + the board's `BoardSpec` per job.
 //! - JobLogsBroker: stream decoded defmt frames to live tail listeners.
-//! - CancellationRegistry: read the cancel rx for the job (M7 stub;
-//!   M8 acts on it inside the inner loop).
-//! - Config: timeouts (hard_max, inactivity, probe_release_grace) and
-//!   probe defaults.
+//! - CancellationRegistry: consume the rx half via `take_receiver` so
+//!   the watchdog can read user/daemon cancel signals directly.
+//! - Config: timeouts (per-job inactivity/hard-max ride on the JobRow;
+//!   probe_release_grace is a literal for v1 — see TODO below).
 //!
 //! M7 sub-tasks:
-//!   7.3 - this skeleton (current step). `run()` reads the elf_path,
-//!         returns InfraErr citing it. No probe-rs calls yet.
-//!   7.4 - `RealSession::connect` lands; `run()` calls it and returns
-//!         InfraErr citing connect failure (no run loop yet).
-//!   7.6 - stitches `paavo_runner::run_job` and returns real outcomes.
+//!   7.3 - skeleton: `run()` read elf_path + returned InfraErr.
+//!   7.4 - `RealSession::connect` landed.
+//!   7.5 - `RealSession::next_event` landed (RTT + defmt + bkpt).
+//!   7.6 - this step. Stitches `paavo_runner::run_job` to RealSession,
+//!         pumps log frames into the live broker, and returns real
+//!         outcomes. This is the M7 demo path.
 
 use crate::app_state::AppState;
 use crate::cancellation::CancellationRegistry;
 use crate::config::Config;
-use crate::job_logs::JobLogsBroker;
+use crate::job_logs::{JobLogsBroker, LiveEvent};
 use paavo_core::{RunOutcome, Runner};
-use paavo_db::{Db, JobRow};
+use paavo_db::{BoardRow, Db, JobRow};
 use paavo_proto::{JobId, JobOutcome, TerminalOutcome};
 use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Real probe-rs-backed runner skeleton.
+/// Probe-release grace in ms — how long the runner waits after a
+/// stop signal for the probe to drop before declaring it
+/// unresponsive (M8 wires the actual `Cancel`-pulse-into-probe
+/// behaviour; today the value flows through to `run_job` and is
+/// reserved on `WatchdogState`).
+///
+/// TODO(spec §6.2 + config schema follow-up): make this a config
+/// knob. The M4.1 `TimeoutsConfig` schema doesn't yet expose it —
+/// adding it now would touch every paavo.toml in the wild, and the
+/// value is dead code until M8 anyway. A literal of 2_000 (2 s)
+/// matches what the spec proposes as the v2 default.
+const PROBE_RELEASE_GRACE_MS: u64 = 2_000;
+
+/// Real probe-rs-backed runner.
 ///
 /// Constructed once at daemon startup (see `paavod::main`) and shared
-/// across every dispatch via `Arc<dyn Runner>`. The actual probe-rs +
-/// `paavo_runner::run_job` wiring lands in M7.4-7.6; until then `run`
-/// reads `elf_path` from the job row and returns an `InfraErr` that
-/// names exactly what would have been flashed.
+/// across every dispatch via `Arc<dyn Runner>`. Stitches
+/// `paavo_runner::run_job` + `paavo_probe::RealSession` together,
+/// pumps decoded `LogFrame`s into the live `JobLogsBroker`, and
+/// returns the resulting `JobOutcome`.
 pub struct RealRunner {
     db: Arc<Mutex<Db>>,
-    #[allow(dead_code)] // wired in 7.6
     job_logs: JobLogsBroker,
-    #[allow(dead_code)] // wired in 7.6 (read rx); used by M8 to abort
     cancellation: CancellationRegistry,
-    #[allow(dead_code)] // wired in 7.4 (probe defaults) + 7.6 (timeouts)
+    #[allow(dead_code)] // reserved for M8 (probe defaults, retention rules)
     config: Arc<Config>,
 }
 
@@ -74,67 +86,189 @@ impl RealRunner {
 }
 
 impl Runner for RealRunner {
-    fn run(&self, job_id: JobId, _board_id: &str) -> RunOutcome {
-        // Read elf_path off the job row. Dispatch already wrote it via
-        // `transition_to_running`. If the row is missing (a race we do
-        // not expect, but be defensive), report InfraErr with
-        // stage=real_runner.db_lookup so the operator sees a clear,
-        // structured error pointing at the lookup.
-        let elf_path = {
+    fn run(&self, job_id: JobId, board_id: &str) -> RunOutcome {
+        // 1. Read elf_path + board spec + per-job timeouts under one
+        //    DB lock. Lock duration is bounded (two indexed SELECTs).
+        let lookup = {
             let db = self.db.lock();
-            match JobRow::find(db.raw_conn(), &job_id) {
-                Ok(Some(row)) => row.elf_path,
+            let job = match JobRow::find(db.raw_conn(), &job_id) {
+                Ok(Some(j)) => j,
                 Ok(None) => {
-                    return RunOutcome {
-                        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
-                            stage: "real_runner.db_lookup".into(),
-                            message: format!("job row not found: {job_id}"),
-                        }),
-                        probe_released_cleanly: true,
-                    };
+                    return infraerr(
+                        "real_runner.db_lookup",
+                        format!("job row not found: {job_id}"),
+                    );
                 }
                 Err(e) => {
-                    return RunOutcome {
-                        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
-                            stage: "real_runner.db_lookup".into(),
-                            message: format!("DB error reading job row: {e}"),
-                        }),
-                        probe_released_cleanly: true,
-                    };
+                    return infraerr(
+                        "real_runner.db_lookup",
+                        format!("DB error reading job row: {e}"),
+                    );
                 }
+            };
+            let board = match BoardRow::find(db.raw_conn(), board_id) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return infraerr(
+                        "real_runner.db_lookup",
+                        format!("board row not found: {board_id}"),
+                    );
+                }
+                Err(e) => {
+                    return infraerr(
+                        "real_runner.db_lookup",
+                        format!("DB error reading board row: {e}"),
+                    );
+                }
+            };
+            (job, board.spec)
+        };
+        let (job, board_spec) = lookup;
+
+        // `elf_path` is `Option<String>` at the schema level. Dispatch
+        // always calls `transition_to_running(elf_path)` before
+        // `runner.run`, so a NULL here means dispatch's contract was
+        // violated — surface as InfraErr rather than panicking.
+        let elf_path = match job.elf_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                return infraerr(
+                    "real_runner.elf_path_missing",
+                    format!(
+                        "elf_path column is NULL on job row {job_id} — \
+                         dispatch did not transition past Building before \
+                         invoking runner.run"
+                    ),
+                );
             }
         };
 
-        // `elf_path` is `Option<String>`. NULL means dispatch did not
-        // transition the row past Building before invoking us — not
-        // expected under the current dispatch contract (which always
-        // calls `transition_to_running(elf_path)` before `runner.run`),
-        // but the column is `Option` at the schema level so we surface
-        // a clear placeholder rather than panicking. We reuse the
-        // `real_session.connect_unwired` stage here (rather than
-        // inventing a third stage that no test exercises) so operators
-        // see one consistent shape regardless of the NULL-vs-Some path.
-        let elf_display = elf_path
-            .as_deref()
-            .unwrap_or("(elf_path column was NULL on job row)");
+        // 2. Take the cancel rx out of the registry. Dispatch's
+        //    `register(job_id)` allocated the channel; the sender
+        //    stays in the registry so a `POST /jobs/:id/cancel` keeps
+        //    routing.
+        //
+        //    If `take_receiver` returns `None`, the dispatch contract
+        //    was violated (`register` was never called for this job)
+        //    OR the rx was already taken by an earlier `runner.run`
+        //    call. EITHER way the cancel path is dead: a fallback to
+        //    a disconnected channel would let the run "succeed" but
+        //    `POST /jobs/:id/cancel` would silently return 204 while
+        //    the watchdog never sees the Cancel. Surface as InfraErr
+        //    instead — symmetry with the `elf_path == None` branch
+        //    above. Reviewers flagged this in M7.6's quality review.
+        let cancel_rx = match self.cancellation.take_receiver(&job_id) {
+            Some(rx) => rx,
+            None => {
+                return infraerr(
+                    "real_runner.cancel_registry_missing",
+                    format!(
+                        "no cancel-channel entry for job {job_id} — \
+                         dispatch did not call CancellationRegistry::register \
+                         before runner.run, or another runner already took \
+                         the receiver. Cancel path would be dead; refusing \
+                         to run."
+                    ),
+                );
+            }
+        };
 
-        // M7 sub-tasks 7.4-7.6 replace this with: RealSession::connect →
-        // paavo_runner::run_job → outcome mapping. (7.5 lives entirely
-        // inside RealSession and does not touch this run() body — it
-        // implements `ProbeSession::next_event` for the real adapter.)
-        // Until then we return an InfraErr that names the resolved
-        // elf_path so operators see exactly what would have been
-        // flashed and can sanity-check build_or_cache before the
-        // runner lands.
+        // 3. Build JobInputs + JobOutputs.
+        //
+        //    Per-job timeouts come off the JobRow (HTTP/CLI overrides
+        //    were validated at enqueue against `daemon_ceiling_s`).
+        //    Falling back to config defaults here would silently
+        //    override caller intent — spec §6.2 wants per-job values.
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+        let inputs = paavo_runner::JobInputs {
+            job_id,
+            inactivity_timeout_ms: job.inactivity_timeout_ms,
+            hard_max_ms: job.hard_max_ms,
+            probe_release_grace_ms: PROBE_RELEASE_GRACE_MS,
+            cancel_rx,
+        };
+        let outputs = paavo_runner::JobOutputs { log_tx };
+
+        // 4. Spawn forwarder thread: drain log_rx → JobLogsBroker.
+        //    The thread exits when the worker drops log_tx (which
+        //    happens when run_job's worker thread returns).
+        let broker = self.job_logs.clone();
+        let fwd = std::thread::Builder::new()
+            .name("paavod-log-forwarder".into())
+            .spawn(move || {
+                while let Ok(frame) = log_rx.recv() {
+                    broker.publish(job_id, LiveEvent::Frame(frame));
+                }
+            })
+            .expect("spawn log forwarder thread");
+
+        // 5. Build the make_session closure. RealSession::connect is
+        //    fallible; the runner's worker handles the error path via
+        //    JobOutcome::Failed(InfraErr { stage: "probe_attach" }).
+        //
+        //    skip_post_load_reset is a literal false: BoardSpec
+        //    doesn't carry it (the RT685S quirk is deferred to M8 per
+        //    spec §17 "Deferred from M7"). When M8 lands, add a field
+        //    to BoardSpec and thread it through here.
+        let opts = paavo_probe::RealSessionOptions {
+            probe_selector: board_spec.probe_selector.clone(),
+            chip_name: board_spec.chip_name.clone(),
+            elf_path,
+            skip_post_load_reset: false,
+        };
+        let make_session = move || -> paavo_probe::Result<Box<dyn paavo_probe::ProbeSession>> {
+            let s = paavo_probe::RealSession::connect(opts)?;
+            Ok(Box::new(s) as Box<dyn paavo_probe::ProbeSession>)
+        };
+
+        // 6. Run the worker to completion, join the forwarder.
+        let handle = paavo_runner::run_job(inputs, outputs, make_session);
+        let outcome = handle.join();
+        // Forwarder exits when log_tx is dropped (worker thread
+        // exited inside `handle.join()`). Joining here ensures the
+        // last live frames have been published before we publish
+        // the terminal event in dispatch. If the forwarder panicked
+        // (broker bug, OOM-during-publish, etc.), surface it via
+        // tracing — silently swallowing was masking real failures.
+        if let Err(payload) = fwd.join() {
+            let msg = panic_message(&payload);
+            tracing::error!(%job_id, msg, "log forwarder thread panicked");
+        }
+
+        // probe_released_cleanly is hard-coded `true` for v1:
+        // detecting unresponsive-probe-on-stop is M8 work (see
+        // `paavo_runner::worker::finalise_for_stop` TODO and spec
+        // §17). The watchdog grace window is wired into JobInputs
+        // but not yet read on the path back out.
         RunOutcome {
-            outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
-                stage: "real_session.connect_unwired".into(),
-                message: format!(
-                    "RealSession is wired in Milestone 7.4. \
-                     Would have flashed: {elf_display}"
-                ),
-            }),
+            outcome,
             probe_released_cleanly: true,
         }
+    }
+}
+
+/// Build an `InfraErr` outcome with `probe_released_cleanly: true`.
+/// Used by every early-return path in `Runner::run` before the probe
+/// session is constructed.
+fn infraerr(stage: &str, message: String) -> RunOutcome {
+    RunOutcome {
+        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
+            stage: stage.into(),
+            message,
+        }),
+        probe_released_cleanly: true,
+    }
+}
+
+/// Extract a human-readable message from a panic payload caught via
+/// `thread::JoinHandle::join`. Mirrors `dispatch::panic_message` so
+/// the two callers produce identical operator-facing strings.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }

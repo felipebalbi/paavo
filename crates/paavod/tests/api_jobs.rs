@@ -1039,7 +1039,6 @@ async fn stream_pages_historical_above_chunk_size() {
 
 #[tokio::test]
 async fn cancel_running_job_with_registered_signal_returns_204() {
-    use crossbeam_channel::unbounded;
     let tmp = tempdir().unwrap();
     let s = state(tmp.path());
     let id = paavo_proto::JobId::new();
@@ -1067,8 +1066,8 @@ async fn cancel_running_job_with_registered_signal_returns_204() {
     paavo_db::JobRow::transition_to_building(s.db.lock().raw_conn(), &id, "mcxa266-01", 1).unwrap();
     paavo_db::JobRow::transition_to_running(s.db.lock().raw_conn(), &id, "/elf").unwrap();
 
-    let (tx, rx) = unbounded::<paavo_runner::RunCommand>();
-    s.cancellation.register(id, tx);
+    s.cancellation.register(id);
+    let rx = s.cancellation.take_receiver(&id).unwrap();
 
     let app = build_router(s);
     let req = Request::builder()

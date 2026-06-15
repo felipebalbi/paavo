@@ -2374,6 +2374,7 @@ dependencies = [
  "paavo-build",
  "paavo-core",
  "paavo-db",
+ "paavo-probe",
  "paavo-proto",
  "paavo-runner",
  "parking_lot",

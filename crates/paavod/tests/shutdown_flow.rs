@@ -1,7 +1,7 @@
 //! Tests the drain orchestration directly (signal delivery is wired
 //! by paavod::main, not testable cross-platform).
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::Receiver;
 use paavo_db::Db;
 use paavo_proto::{BoardHealth, BoardSpec, JobId, ProbeSelector};
 use paavod::app_state::{AppState, DrainState};
@@ -106,8 +106,9 @@ async fn drain_signals_remaining_workers_after_grace_expires() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let cron = make_cron(state.clone()).await;
-    let (tx, rx) = unbounded::<paavo_runner::RunCommand>();
-    state.cancellation.register(JobId::new(), tx);
+    let id = JobId::new();
+    state.cancellation.register(id);
+    let rx = state.cancellation.take_receiver(&id).unwrap();
 
     let start = std::time::Instant::now();
     paavod::shutdown::drain_with_grace(state.clone(), cron, Duration::from_millis(200)).await;
@@ -135,9 +136,13 @@ async fn drain_returns_when_worker_finishes_before_grace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let cron = make_cron(state.clone()).await;
-    let (tx, _rx) = unbounded::<paavo_runner::RunCommand>();
     let id = JobId::new();
-    state.cancellation.register(id, tx);
+    state.cancellation.register(id);
+    // Take the rx so the registry behaves like a real dispatch
+    // (RealRunner::run takes it before the watchdog reads it).
+    // Dropping the rx here is fine — drain only checks the
+    // registry's active count, not the rx half.
+    let _rx = state.cancellation.take_receiver(&id).unwrap();
 
     let s2 = state.clone();
     tokio::spawn(async move {
