@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
             timeout,
             inactivity,
             priority,
+            follow,
         } => {
             cmd_run::run(
                 &client,
@@ -39,6 +40,7 @@ async fn main() -> Result<()> {
                 timeout.as_deref(),
                 inactivity.as_deref(),
                 priority,
+                follow,
             )
             .await
         }

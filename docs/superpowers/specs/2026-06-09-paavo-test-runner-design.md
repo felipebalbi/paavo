@@ -823,15 +823,21 @@ behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
 
 ### 10.1 Developer workflow subcommands
 
-- `paavo-cli run <path> [--board-kind mcxa266] [--instance mcxa266-02] [--timeout 1h] [--inactivity 60s] [--priority interactive]`
+- `paavo-cli run <path> [--board-kind mcxa266] [--instance mcxa266-02] [--timeout 1h] [--inactivity 60s] [--priority interactive] [--follow|-f]`
   - `<path>` may be a `.rs` file, a crate directory, or a pre-built ELF.
   - If `.rs`: detect parent test-crate (walk up looking for `Cargo.toml`); if
     none, refuse with a hint to run `paavo-cli new` first.
   - If directory: tar the crate.
   - If `.elf`: skip build (paavod accepts a pre-built ELF as a degenerate
     crate tar with a single ELF + marker file).
-  - Streams the NDJSON log to the terminal until terminal outcome; exit code
-    reflects outcome (0 = Passed, non-zero per outcome class).
+  - **Default (fire-and-forget)**: submit the tar, print the assigned
+    ULID to stdout, exit 0 as soon as paavod acknowledges the upload.
+    A stderr hint shows the `paavo-cli logs <id> --follow` command for
+    operators who want to tail. This keeps `paavo-cli run` from blocking
+    a terminal across a multi-minute cold-cache build.
+  - **With `--follow` / `-f`**: stream the NDJSON log to stdout until
+    the terminal frame; exit code reflects the outcome (0 = Passed,
+    non-zero per outcome class).
 - `paavo-cli new <crate-name> --board-kind mcxa266 [--kind quick|soak]`
   - Thin wrapper around `cargo generate` against the paavo repo's
     templates. Requires `cargo-generate` on the user's `PATH`; if

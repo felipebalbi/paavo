@@ -37,6 +37,13 @@ pub enum Cmd {
         /// Priority class.
         #[arg(long, default_value = "interactive")]
         priority: PriorityArg,
+        /// Stream the NDJSON log until the job terminates, and use the
+        /// terminal outcome as the exit code (0 = passed, non-zero
+        /// otherwise). Without this, `run` is fire-and-forget: submit
+        /// the tar, print the job id, exit 0. Tail later with
+        /// `paavo-cli logs <id> --follow`.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Scaffold a new test crate via cargo-generate templates.
     New {

@@ -7,6 +7,14 @@ use paavo_proto::{BoardSelector, JobSpec, Priority};
 use std::path::Path;
 
 /// Entry point for `paavo-cli run`.
+///
+/// Behaviour: tar the crate, POST to `/jobs`, print the assigned ULID.
+/// Default is fire-and-forget — exits 0 once the upload is accepted.
+/// With `--follow / -f` (`follow=true`), keep the terminal open and
+/// stream the NDJSON log until the terminal frame, exiting with a
+/// status code that reflects the outcome (0 = Passed, non-zero
+/// otherwise). Spec §10.1.
+#[allow(clippy::too_many_arguments)] // mirrors the clap surface 1:1 by intent
 pub async fn run(
     client: &Client,
     path: &Path,
@@ -15,6 +23,7 @@ pub async fn run(
     timeout: Option<&str>,
     inactivity: Option<&str>,
     priority: PriorityArg,
+    follow: bool,
 ) -> Result<()> {
     let kind = board_kind.ok_or_else(|| anyhow::anyhow!("--board-kind is required for `run`"))?;
     let crate_dir = resolve_crate_dir(path)?;
@@ -40,7 +49,16 @@ pub async fn run(
 
     let job_id = client.submit_job(&spec, tar_bytes).await?;
     println!("submitted: {job_id}");
-    stream_logs(client, &job_id).await
+
+    if follow {
+        stream_logs(client, &job_id).await
+    } else {
+        // Fire-and-forget: hint at the follow command so the operator
+        // doesn't have to remember the syntax. Hint goes to stderr so
+        // scripts piping stdout for the job id stay clean.
+        eprintln!("tail with: paavo-cli logs {job_id} --follow");
+        Ok(())
+    }
 }
 
 fn resolve_crate_dir(path: &Path) -> Result<std::path::PathBuf> {
@@ -76,14 +94,77 @@ fn resolve_crate_dir(path: &Path) -> Result<std::path::PathBuf> {
     anyhow::bail!("not a file or dir: {path:?}")
 }
 
+/// Tar the crate directory, skipping build output and editor scratch
+/// that paavod doesn't need (and would push the upload over its body
+/// cap — a stale `target/` from a local `cargo build` can easily be
+/// 500+ MiB).
+///
+/// Skipped path components (matched on the entry's name, anywhere in
+/// the tree): `target`, `.git`, `.cargo` (because the daemon imposes
+/// its own; rely on `paavo.toml` instead), `node_modules`, `.idea`,
+/// `.vscode`, plus the local `Cargo.lock` file (paavod resolves deps
+/// fresh per spec §8.1; shipping the lock would override that).
+///
+/// The tar entries are prefixed with the crate's directory name so
+/// paavod's `unpack_into` produces `<sandbox>/<crate>/Cargo.toml`,
+/// matching what `build_or_cache::walkdir` looks for.
 fn make_tar(dir: &Path) -> Result<Vec<u8>> {
+    let prefix = dir.file_name().unwrap_or_default();
     let mut buf = Vec::new();
+    let mut t = tar::Builder::new(&mut buf);
+
+    for entry in walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(should_keep)
     {
-        let mut t = tar::Builder::new(&mut buf);
-        t.append_dir_all(dir.file_name().unwrap_or_default(), dir)?;
-        t.finish()?;
+        let entry = entry.context("walking crate dir")?;
+        let relative = entry.path().strip_prefix(dir).unwrap();
+        let in_tar = std::path::Path::new(prefix).join(relative);
+        let ft = entry.file_type();
+        if ft.is_dir() {
+            t.append_dir(&in_tar, entry.path())
+                .with_context(|| format!("tar append_dir {}", entry.path().display()))?;
+        } else if ft.is_file() {
+            t.append_path_with_name(entry.path(), &in_tar)
+                .with_context(|| format!("tar append_path {}", entry.path().display()))?;
+        }
+        // Symlinks and other special entries silently skipped — they'd
+        // bloat the tar with redundant content and paavod's
+        // unpack_into doesn't promise to honor them.
     }
+    t.finish().context("tar finalize")?;
+    drop(t);
     Ok(buf)
+}
+
+/// Filter for `walkdir::WalkDir::filter_entry`. Returning `false`
+/// prunes the entry AND (for directories) its entire subtree.
+fn should_keep(e: &walkdir::DirEntry) -> bool {
+    let Some(name) = e.file_name().to_str() else {
+        return true;
+    };
+    // Build output + VCS + editor scratch. Listed explicitly so a
+    // future contributor can grep the rationale for each.
+    const SKIP: &[&str] = &[
+        "target",       // cargo build output
+        ".git",         // VCS
+        ".cargo",       // paavod has its own .cargo/config; don't override
+        "node_modules", // unlikely but cheap to exclude
+        ".idea",        // JetBrains
+        ".vscode",      // VS Code
+    ];
+    if e.file_type().is_dir() && SKIP.contains(&name) {
+        return false;
+    }
+    // Skip Cargo.lock at the crate root only. paavod resolves deps
+    // fresh (spec §8.1); a checked-in lock would override that. We
+    // can't easily tell "root" here, but Cargo.lock anywhere in a
+    // test-crate tree is unusual enough to safely skip globally.
+    if e.file_type().is_file() && name == "Cargo.lock" {
+        return false;
+    }
+    true
 }
 
 fn whoami() -> Option<String> {
