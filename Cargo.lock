@@ -2307,6 +2307,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "defmt-decoder",
+ "defmt-parser",
  "object 0.36.7",
  "paavo-proto",
  "parking_lot",

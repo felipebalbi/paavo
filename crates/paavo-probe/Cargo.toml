@@ -11,6 +11,7 @@ description = "Low-level probe-rs + defmt-decoder driver for paavo."
 paavo-proto    = { workspace = true }
 probe-rs       = { workspace = true }
 defmt-decoder  = { workspace = true }
+defmt-parser   = { workspace = true }
 object         = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
