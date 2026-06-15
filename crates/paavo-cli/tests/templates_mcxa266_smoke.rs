@@ -67,6 +67,25 @@ fn templates_mcxa266_smoke_renders_corrected_feature_flags() {
          see memory.x). Cargo.toml.liquid:\n{cargo_toml}"
     );
 
+    // ─── Manual-smoke correction: cortex-m must enable `inline-asm`
+    // for thumbv8m.main-none-eabihf. Without it, cortex-m 0.7.7's
+    // `__basepri_r/w/max` and `__faultmask_r` functions resolve to a
+    // stale code path that doesn't have a thumbv8m flavour, breaking
+    // the build with E0425 ("cannot find function `__basepri_r` in
+    // module `crate::asm::inline`"). embassy-mcxa requires this same
+    // feature on its own cortex-m dep but cargo feature unification
+    // doesn't reliably propagate it across the workspace boundary
+    // when we add cortex-m as a direct dep at the test crate level.
+    // Surfaced during the M7.7 manual smoke; lock it in here so no
+    // future template refresh accidentally drops it.
+    assert!(
+        cargo_toml
+            .lines()
+            .any(|l| l.contains("cortex-m ") && l.contains(r#""inline-asm""#)),
+        "cortex-m must enable the inline-asm feature (required for \
+         thumbv8m.main-none-eabihf). Cargo.toml.liquid:\n{cargo_toml}"
+    );
+
     // ─── M7.1 correction #4: defmt family moves to 1.x.
     // The version string is open-ended (`"1"` matches anything ≥ 1.0
     // by cargo's caret semantics), so we negate the stale 0.x pins
