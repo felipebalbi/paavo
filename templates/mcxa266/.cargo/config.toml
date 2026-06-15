@@ -1,6 +1,26 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
 
+[env]
+# defmt's log-level filter is COMPILE-TIME, controlled by this env var
+# read at build time by the defmt proc-macros. Without it, defmt
+# defaults to filtering everything below ERROR for release builds —
+# which strips `info!("Test OK")` and `info!("hello from ...")` from
+# the ELF entirely. paavo's pass-detection contract requires the
+# info-level `Test OK` frame to be present and decodable, so the
+# minimum needed level is "info". We use "trace" so user `debug!` /
+# `trace!` calls also flow through during development.
+#
+# Symptom if missing: paavod's defmt-decoder reports "malformed
+# frame skipped" warnings because the RTT byte stream contains
+# panic-probe's error-level frames (which DO compile in) but no
+# info-level frames matching the test's pass contract, and the
+# decoder's symbol table is empty for the missing strings.
+#
+# See https://defmt.ferrous-systems.com/filtering for the full
+# filter syntax (e.g. "info,nxp_pac=warn" to silence noisy crates).
+DEFMT_LOG = "trace"
+
 [target.thumbv8m.main-none-eabihf]
 rustflags = [
   # NOTE: -Tlink_ram.x is emitted by build.rs (cargo:rustc-link-arg),

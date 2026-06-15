@@ -162,3 +162,118 @@ fn templates_mcxa266_smoke_renders_corrected_feature_flags() {
         "defmt must be pinned to 1.x. Cargo.toml.liquid:\n{cargo_toml}"
     );
 }
+
+/// `.cargo/config.toml` carries settings that paavod's build path
+/// cannot work without. This test guards each one with a focused
+/// assertion + a comment naming the exact symptom if it's missing,
+/// so the next regression doesn't take another 5-hour debugging
+/// session to root-cause.
+#[test]
+fn templates_mcxa266_smoke_renders_dot_cargo_config() {
+    let template = std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|p| p.join("templates/mcxa266/cargo-generate.toml").exists())
+        .expect("templates/mcxa266 not found from any ancestor of CWD")
+        .join("templates/mcxa266");
+
+    let cargo_config = std::fs::read_to_string(template.join(".cargo/config.toml"))
+        .expect("read .cargo/config.toml — required by paavod's build (see make_tar)");
+
+    // ─── #1: `[build] target = "thumbv8m.main-none-eabihf"`.
+    // paavod's build path runs `cargo build --release` with NO
+    // `--target` flag (paavo_build::build.rs). cargo picks the
+    // host triple unless `.cargo/config.toml` overrides it. Without
+    // this line, the host-compile of cortex-m fails with 6 errors
+    // (E0425 ×4 for __basepri_{r,w,max} + __faultmask_r, plus 2
+    // "invalid register" errors for r0/r1).
+    assert!(
+        cargo_config.contains(r#"target = "thumbv8m.main-none-eabihf""#),
+        ".cargo/config.toml must set `target = \"thumbv8m.main-none-eabihf\"` \
+         under `[build]`. Without it, paavod's `cargo build --release` \
+         defaults to the host triple and the cortex-m host build fails \
+         with E0425. .cargo/config.toml:\n{cargo_config}"
+    );
+
+    // ─── #2: `DEFMT_LOG = "trace"` (or at minimum "info").
+    // defmt's log-level filter is COMPILE-TIME, controlled by the
+    // DEFMT_LOG env var read at build time by defmt's proc-macros.
+    // Without it, defmt defaults to filtering everything below
+    // ERROR for release builds — which strips `info!("Test OK")`
+    // from the ELF entirely. paavo's pass-detection contract
+    // requires the info-level `Test OK` frame; if it's missing,
+    // paavod's decoder reports "malformed frame skipped" warnings
+    // because the only frames in the RTT stream are error-level
+    // panics (from panic-probe / embassy-executor) whose symbols
+    // don't match the pass contract.
+    //
+    // Surfaced during the M7.7 manual smoke as 5 "defmt malformed
+    // frame skipped" warnings in a row, exactly matching the
+    // count of error-level frames that DID compile in.
+    assert!(
+        cargo_config.contains("DEFMT_LOG"),
+        ".cargo/config.toml must set `DEFMT_LOG` under `[env]`. \
+         Without it, defmt's compile-time filter strips info-level \
+         frames from the ELF and the pass-detection contract's \
+         `Test OK` frame never makes it into the binary. \
+         .cargo/config.toml:\n{cargo_config}"
+    );
+    // Permit any level that includes "info" or higher verbosity.
+    // The string "info" appears as a prefix of both "info" and
+    // (less interestingly) other words, so check the actual setting.
+    assert!(
+        cargo_config.contains(r#"DEFMT_LOG = "trace""#)
+            || cargo_config.contains(r#"DEFMT_LOG = "debug""#)
+            || cargo_config.contains(r#"DEFMT_LOG = "info""#),
+        "DEFMT_LOG must be set to \"trace\", \"debug\", or \"info\" \
+         (anything more restrictive strips the `Test OK` frame from \
+         the ELF). .cargo/config.toml:\n{cargo_config}"
+    );
+
+    // ─── #3: `-Tdefmt.x` link arg.
+    // defmt.x carries defmt-decoder's symbol-relocation section.
+    // Without it the ELF has no `.defmt` section at all and the
+    // decoder has no symbol table to interpret RTT bytes.
+    assert!(
+        cargo_config.contains(r#""link-arg=-Tdefmt.x""#),
+        ".cargo/config.toml must pass `-Tdefmt.x` to the linker. \
+         Without it, the ELF has no `.defmt` section and defmt-decoder \
+         can't interpret any RTT frames. .cargo/config.toml:\n{cargo_config}"
+    );
+
+    // ─── #4: `--nmagic` link arg.
+    // cortex-m-rt's link scripts assume the RAM origin is 0x10000-
+    // aligned; without --nmagic the linker emits page-aligned
+    // sections that overflow into adjacent regions or leave gaps
+    // that confuse cortex-m-rt's startup code.
+    assert!(
+        cargo_config.contains(r#""link-arg=--nmagic""#),
+        ".cargo/config.toml must pass `--nmagic` to the linker \
+         (see rust-embedded/cortex-m-quickstart#95). \
+         .cargo/config.toml:\n{cargo_config}"
+    );
+
+    // ─── #5: `[net] git-fetch-with-cli = true`.
+    // libgit2's GitHub clone fails on Windows when a git credential
+    // helper is configured. Telling cargo to shell out to `git` for
+    // fetches sidesteps the issue and is harmless on Linux.
+    assert!(
+        cargo_config.contains("git-fetch-with-cli = true"),
+        ".cargo/config.toml must set `git-fetch-with-cli = true` \
+         under `[net]` (libgit2's GitHub clone fails on Windows when \
+         a git credential helper is configured). \
+         .cargo/config.toml:\n{cargo_config}"
+    );
+
+    // ─── #6: must NOT pass `-Tlink.x`.
+    // link.x and link_ram.x both `INCLUDE memory.x` and so both
+    // define the same regions — passing both produces "region FLASH
+    // already defined" linker errors. build.rs emits -Tlink_ram.x,
+    // so .cargo/config.toml must NOT also pass -Tlink.x.
+    assert!(
+        !cargo_config.contains(r#""link-arg=-Tlink.x""#),
+        "stale `-Tlink.x` must not be passed (build.rs already emits \
+         `-Tlink_ram.x`; both INCLUDE memory.x and conflict). \
+         .cargo/config.toml:\n{cargo_config}"
+    );
+}
