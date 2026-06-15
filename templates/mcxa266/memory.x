@@ -1,17 +1,25 @@
-/* NXP MCX-A266 (MCXA2xx family, Cortex-M33).
+/* NXP MCX-A266 (MCXA2xx family, Cortex-M33) — RAM-resident layout.
  *
- * Reference: embassy-rs/embassy examples/mcxa2xx/memory.x.
- * The same map works for MCX-A256 and MCX-A266 — both have 1 MiB
- * flash at 0x00000000 and 128 KiB SRAM at 0x20000000 (the M266
- * exposes extra RAM banks above this but cortex-m-rt only needs
- * the contiguous primary bank).
+ * paavo tests run from RAM (teleprobe convention): probe-rs loads the
+ * ELF directly into SRAM, sets PC + SP, and runs. There is no FLASH
+ * stage — `link_ram_cortex_m.x` (wired via build.rs) puts the vector
+ * table, .text, .rodata, .data, and .bss all into RAM, so memory.x
+ * defines only RAM. Defining FLASH here would collide with link_ram.x
+ * which assumes ORIGIN(RAM) is the only region.
+ *
+ * Real silicon RAM (per `probe-rs chip info MCXA276`):
+ *   Primary contiguous bank: 240 KiB at 0x20000000.
+ *   (Family also has 8 KiB Generic at 0x03000000 and two 8 KiB RAM
+ *   banks at 0x04000000/0x04002000, used for ROM/TrustZone scratch;
+ *   cortex-m-rt only needs the contiguous main bank.)
  *
  * cortex-m-rt's `set-sp` + `set-vtor` features (enabled in
  * Cargo.toml) are required so this map works without a bootloader
- * pre-initialising SP and VTOR.
+ * pre-initialising SP and VTOR — `link_ram_cortex_m.x` writes the
+ * vector table to ORIGIN(RAM) and cortex-m-rt's startup uses VTOR
+ * to point the CPU there at runtime.
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x00000000, LENGTH = 1M
-    RAM   : ORIGIN = 0x20000000, LENGTH = 128K
+    RAM : ORIGIN = 0x20000000, LENGTH = 240K
 }
