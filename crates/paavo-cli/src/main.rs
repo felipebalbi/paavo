@@ -1,6 +1,6 @@
 //! paavo-cli entry point.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 mod cli;
@@ -54,9 +54,11 @@ async fn main() -> Result<()> {
                 cli::TestKindArg::Soak => "soak",
             }
             .to_string();
-            let into = into.unwrap_or_else(|| {
-                std::env::current_dir().expect("current_dir for default --into")
-            });
+            let into = match into {
+                Some(p) => p,
+                None => std::env::current_dir()
+                    .context("resolving current directory for default --into")?,
+            };
             let code = cmd_new::run(cmd_new::NewArgs {
                 crate_name: name,
                 board_kind,

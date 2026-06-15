@@ -4,16 +4,39 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// Build a PATH that does NOT contain cargo-generate, so the missing-
+/// dependency pre-flight path is exercised deterministically regardless
+/// of whether the developer has `cargo install cargo-generate`-ed.
+///
+/// Strategy: find every cargo-generate binary on PATH, collect the
+/// containing directories, and build a new PATH with those directories
+/// removed. On Windows this is `;`-separated; on Unix, `:`.
+fn path_without_cargo_generate() -> std::ffi::OsString {
+    use std::collections::HashSet;
+    let cg_binaries: HashSet<std::path::PathBuf> = which::which_all("cargo-generate")
+        .map(|it| {
+            it.filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<_> = std::env::split_paths(&path)
+        .filter(|d| !cg_binaries.contains(d))
+        .collect();
+    std::env::join_paths(kept).expect("rejoin PATH")
+}
+
 #[test]
 fn new_without_cargo_generate_errors_clearly() {
-    // Skip if cargo-generate IS available — this test covers the
-    // "missing dependency" branch only.
-    if which::which("cargo-generate").is_ok() {
-        eprintln!("cargo-generate IS installed; skipping missing-dep test");
-        return;
-    }
+    // Exercise the missing-binary pre-flight by stripping cargo-generate
+    // from PATH for this one subprocess. This is the only way to make
+    // the test reliable on every dev box: a bare `which::which` check
+    // would self-skip when cargo-generate is installed (i.e. precisely
+    // the environment where 7.2 was developed and where regressions
+    // are most likely).
     Command::cargo_bin("paavo-cli")
         .unwrap()
+        .env("PATH", path_without_cargo_generate())
         .args(["new", "hello", "--board-kind", "mcxa266"])
         .assert()
         .failure()
@@ -31,6 +54,20 @@ fn new_with_unknown_board_kind_errors_with_kinds_list() {
         .failure()
         .stderr(predicate::str::contains("unknown board kind: bogus-xyz"))
         .stderr(predicate::str::contains("mcxa266"));
+}
+
+#[test]
+fn new_with_non_kebab_name_errors_before_touching_filesystem() {
+    // cargo-generate would silently kebab `MyTest` to `my-test` and
+    // our success-print would lie about `cd MyTest`. The fix is to
+    // refuse non-kebab names up front. See cmd_new::validate_kebab_name.
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["new", "MyTest", "--board-kind", "mcxa266"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("lowercase letter"))
+        .stderr(predicate::str::contains("MyTest"));
 }
 
 #[test]

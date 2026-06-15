@@ -877,17 +877,27 @@ repo. Behaviour contract:
 
 - Required flags: `<crate-name>`, `--board-kind {mcxa266|rt685-evk}`.
   Optional: `--kind {quick|soak}` (defaults to `quick`), `--into <dir>`
-  (defaults to `./<crate-name>`), `--templates-path <path>` (defaults
-  to the paavo repo root if `paavo-cli` is invoked from inside the
-  repo, otherwise to a checkout under `$XDG_CACHE_HOME/paavo/templates`).
-- Pre-flight: probe `cargo-generate --version`. If the binary is
-  missing or returns non-zero, exit with status 2 and the message
-  `cargo-generate not found on PATH. Install with: cargo install
-  cargo-generate`. Do NOT auto-install. Operators install once;
-  paavo's CLI stays simple.
-- Pre-flight: probe that the requested template subdir
-  (`<templates>/<board-kind>`) exists. If absent, list available
-  board-kinds and exit non-zero.
+  (defaults to the current working directory; the scaffolded crate
+  always lands at `<into>/<crate-name>/`), `--templates-path <path>`
+  (defaults to walking up from CWD for a paavo checkout signature —
+  `templates/` AND `Cargo.toml` AND `crates/` — and erroring out if
+  no such ancestor is found; M7 does NOT implement an XDG-style
+  fallback, that's an M8 follow-up if operators end up wanting it).
+- `<crate-name>` must be valid kebab-case (lowercase letters / digits /
+  hyphens, must start with a letter, no trailing or consecutive
+  hyphens). Non-kebab names are rejected up front instead of relying
+  on cargo-generate's silent kebab-conversion (which would make the
+  post-success `cd <crate-name>` hint lie — see §10.5.1).
+- Pre-flights (independent; the order is implementation-defined):
+  - Validate `<crate-name>` per the rule above.
+  - Probe `cargo-generate --version`. If the binary is missing or
+    returns non-zero, exit with status 2 and the message
+    `cargo-generate not found on PATH. Install with: cargo install
+    cargo-generate`. Do NOT auto-install. Operators install once;
+    paavo's CLI stays simple.
+  - Probe that the requested template subdir
+    (`<templates>/<board-kind>`) exists. If absent, list available
+    board-kinds and exit non-zero.
 - Invocation: `cargo generate --path <templates>/<board-kind> --name
   <crate-name> --destination <into> --define test-kind=<kind>
   --vcs none --silent` with output streamed to the user's terminal.
@@ -898,7 +908,9 @@ repo. Behaviour contract:
   by hand after scaffolding. (Per-scaffold `--embassy-rev <sha>` is
   deferred to M8 — see spec §17 "Deferred from M7".)
 - Post-success: print one line summarising the next step
-  (`cd <name> && cargo build --release && paavo-cli run -p .`).
+  (`cd <crate-name> && cargo build --release && paavo-cli run -p .`).
+  Because non-kebab names are rejected up front, this hint is always
+  accurate (cargo-generate's silent kebab-conversion can't surprise us).
 
 Hardware-only chip names go in the scaffolded crate's docs, NOT in
 the CLI surface — operators copy them into `boards.toml` once per

@@ -13,7 +13,8 @@ pub const EXIT_MISSING_CARGO_GENERATE: i32 = 2;
 /// Arguments to `paavo-cli new`. Spec §10.5.
 pub struct NewArgs {
     /// Crate name to scaffold (becomes both the directory and the
-    /// `[package].name` in the generated `Cargo.toml`).
+    /// `[package].name` in the generated `Cargo.toml`). Must be valid
+    /// kebab-case — see [`validate_kebab_name`] for why.
     pub crate_name: String,
     /// Board kind (e.g. `mcxa266`). Must match a directory under
     /// `<templates>/<board-kind>/` containing a `cargo-generate.toml`.
@@ -27,10 +28,57 @@ pub struct NewArgs {
     pub templates_path: Option<PathBuf>,
 }
 
+/// Validate that a crate name is in kebab-case (lowercase letters,
+/// digits, and ASCII hyphens; must start with a letter; must not end
+/// with a hyphen; no consecutive hyphens).
+///
+/// We refuse non-kebab names rather than auto-convert them because
+/// cargo-generate's silent kebab-conversion would make our post-success
+/// `cd <name>` hint lie (cargo-generate would write `./my-test/`, but
+/// we'd print `cd MyTest`). Explicit failure with a clear remediation
+/// is friendlier than that.
+fn validate_kebab_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("crate name is empty");
+    }
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_lowercase() {
+        bail!(
+            "crate name must start with a lowercase letter (got {first:?} in {name:?}). \
+             Use kebab-case: a-z, 0-9, hyphens only — e.g. `hello-mcxa266`."
+        );
+    }
+    if name.ends_with('-') {
+        bail!("crate name must not end with a hyphen (got {name:?})");
+    }
+    let mut last_was_hyphen = false;
+    for c in name.chars() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+        if !ok {
+            bail!(
+                "crate name must be kebab-case (a-z, 0-9, hyphens only). \
+                 Invalid character {c:?} in {name:?}. \
+                 cargo-generate would silently rename this; paavo-cli refuses \
+                 to so the `cd <name>` hint in the success message stays accurate."
+            );
+        }
+        if c == '-' && last_was_hyphen {
+            bail!("crate name must not contain consecutive hyphens (got {name:?})");
+        }
+        last_was_hyphen = c == '-';
+    }
+    Ok(())
+}
+
 /// Run the `new` verb. Returns a process exit code (not a Result-as-exit
 /// — Ok(non-zero) is a clean reportable failure; Err is an unexpected
 /// internal error).
 pub fn run(args: NewArgs) -> Result<i32> {
+    // 0. Validate the crate name BEFORE we touch the filesystem or
+    //    shell out. See validate_kebab_name for the rationale.
+    validate_kebab_name(&args.crate_name)
+        .with_context(|| format!("validating --name {:?}", args.crate_name))?;
+
     // 1. Resolve templates root.
     let templates_root = resolve_templates_root(args.templates_path.as_deref())
         .context("resolving templates root")?;
@@ -143,4 +191,68 @@ fn list_available_kinds(root: &Path) -> Vec<String> {
     }
     kinds.sort();
     kinds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_kebab_name_accepts_canonical_examples() {
+        // These are the shapes we promise to accept in the README and
+        // in the post-success "next step" hint.
+        for name in [
+            "hello",
+            "hello-world",
+            "hello-mcxa266",
+            "smoke-test",
+            "a",                                     // shortest valid name
+            "x1",                                    // letter + digit
+            "x1-y2",                                 // segments with digits
+            "abcdefghijklmnopqrstuvwxyz0123456789-", // would-be valid if not for trailing hyphen
+        ]
+        .iter()
+        .filter(|s| !s.ends_with('-'))
+        {
+            assert!(validate_kebab_name(name).is_ok(), "should accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_uppercase() {
+        // The headline bug: cargo-generate would kebab `MyTest` to
+        // `my-test` silently, then our "cd MyTest" hint would lie.
+        let err = validate_kebab_name("MyTest").unwrap_err().to_string();
+        assert!(err.contains("lowercase letter"), "msg = {err}");
+        assert!(err.contains("MyTest"), "msg = {err}");
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_underscores_and_spaces() {
+        for bad in ["my_test", "my test", "my.test", "my/test"] {
+            assert!(validate_kebab_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_leading_digit_or_hyphen() {
+        for bad in ["1abc", "-abc"] {
+            assert!(validate_kebab_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_trailing_hyphen() {
+        assert!(validate_kebab_name("abc-").is_err());
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_consecutive_hyphens() {
+        assert!(validate_kebab_name("a--b").is_err());
+    }
+
+    #[test]
+    fn validate_kebab_name_rejects_empty() {
+        assert!(validate_kebab_name("").is_err());
+    }
 }
