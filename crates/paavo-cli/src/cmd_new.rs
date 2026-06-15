@@ -25,8 +25,6 @@ pub struct NewArgs {
     pub into: PathBuf,
     /// Explicit templates root. Overrides auto-discovery.
     pub templates_path: Option<PathBuf>,
-    /// Override the `embassy-rev` cargo-generate placeholder.
-    pub embassy_rev: Option<String>,
 }
 
 /// Run the `new` verb. Returns a process exit code (not a Result-as-exit
@@ -84,10 +82,6 @@ pub fn run(args: NewArgs) -> Result<i32> {
         .arg("--vcs")
         .arg("none")
         .arg("--silent");
-    if let Some(rev) = &args.embassy_rev {
-        cg.arg("--define").arg(format!("embassy-rev={rev}"));
-    }
-    // else: cargo-generate.toml in the template supplies the pinned default.
 
     let status = cg.status().context("invoking cargo-generate")?;
     if !status.success() {

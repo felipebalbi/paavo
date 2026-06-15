@@ -48,7 +48,6 @@ async fn main() -> Result<()> {
             kind,
             into,
             templates_path,
-            embassy_rev,
         } => {
             let kind_str = match kind {
                 cli::TestKindArg::Quick => "quick",
@@ -64,7 +63,6 @@ async fn main() -> Result<()> {
                 kind: kind_str,
                 into,
                 templates_path,
-                embassy_rev,
             })?;
             std::process::exit(code);
         }

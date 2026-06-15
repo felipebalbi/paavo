@@ -890,11 +890,13 @@ repo. Behaviour contract:
   board-kinds and exit non-zero.
 - Invocation: `cargo generate --path <templates>/<board-kind> --name
   <crate-name> --destination <into> --define test-kind=<kind>
-  --define embassy-rev=<pinned-rev>` with output streamed to the
-  user's terminal. `embassy-rev` is pinned in the template's
-  `cargo-generate.toml` defaults; paavo-cli only overrides it when
-  the user passes `--embassy-rev <sha>`. The pinned rev MUST resolve
-  to a commit that has the published `embassy-mcxa 0.1.0`.
+  --vcs none --silent` with output streamed to the user's terminal.
+  The templates intentionally use `git = "..."` (with no
+  `rev`/`branch`/`tag`) for `embassy-rs/embassy`, so cargo follows
+  the remote's default-branch HEAD on every `cargo update`. Operators
+  who want a reproducible build pin a SHA in the generated `Cargo.toml`
+  by hand after scaffolding. (Per-scaffold `--embassy-rev <sha>` is
+  deferred to M8 — see spec §17 "Deferred from M7".)
 - Post-success: print one line summarising the next step
   (`cd <name> && cargo build --release && paavo-cli run -p .`).
 
@@ -1196,6 +1198,14 @@ below is deliberately out of M7's scope and rolled to M8:
 - **`paavod` running on Linux + udev rules** — M7's smoke is Windows-host
   by user choice. The contrib/ systemd + udev assets shipped in M6 are
   unchanged; validating them against a real Linux lab box is M8.
+- **`paavo-cli new --embassy-rev <sha>` per-scaffold pin** — templates
+  default to bare `git = "..."` (no `rev`/`branch`/`tag`) so cargo
+  follows the remote default-branch HEAD. Operators wanting
+  reproducibility pin a SHA by hand in the scaffolded `Cargo.toml`.
+  Adding a `--embassy-rev` flag that injects `rev = "<sha>"` across
+  every embassy dep line (without breaking the bare-default shape)
+  needs more careful cargo-generate placeholder design than M7's
+  scope allows. M8.
 
 ---
 

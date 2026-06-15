@@ -13,7 +13,8 @@ prompt = "Test kind: quick or soak?"
 choices = ["quick", "soak"]
 default = "quick"
 
-[placeholders.embassy-rev]
-type = "string"
-prompt = "embassy-rs/embassy revision (branch, tag, or SHA)"
-default = "main"
+# embassy-rs/embassy is pulled via `git = "..."` with no `rev`/`branch`/
+# `tag`, so cargo follows the remote's default-branch HEAD on every
+# `cargo update`. Operators who want a reproducible build pin a SHA in
+# their generated Cargo.toml after scaffolding (M7 keeps it simple;
+# proper per-scaffold pin support is M8 — see spec §17 "Deferred from M7").

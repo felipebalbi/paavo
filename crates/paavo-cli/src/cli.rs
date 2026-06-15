@@ -56,10 +56,6 @@ pub enum Cmd {
         /// auto-discovery (walking up from CWD for a paavo checkout).
         #[arg(long)]
         templates_path: Option<PathBuf>,
-        /// Override the `embassy-rev` template placeholder. Defaults
-        /// to the pinned value in the template's cargo-generate.toml.
-        #[arg(long)]
-        embassy_rev: Option<String>,
     },
     /// Cancel a queued or running job.
     Cancel {
