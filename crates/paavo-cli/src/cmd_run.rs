@@ -100,10 +100,21 @@ fn resolve_crate_dir(path: &Path) -> Result<std::path::PathBuf> {
 /// 500+ MiB).
 ///
 /// Skipped path components (matched on the entry's name, anywhere in
-/// the tree): `target`, `.git`, `.cargo` (because the daemon imposes
-/// its own; rely on `paavo.toml` instead), `node_modules`, `.idea`,
-/// `.vscode`, plus the local `Cargo.lock` file (paavod resolves deps
-/// fresh per spec §8.1; shipping the lock would override that).
+/// the tree): `target`, `.git`, `node_modules`, `.idea`, `.vscode`,
+/// plus the local `Cargo.lock` file (paavod resolves deps fresh per
+/// spec §8.1; shipping the lock would override that).
+///
+/// `.cargo/` is INTENTIONALLY kept. The scaffold's `.cargo/config.toml`
+/// carries load-bearing settings: `[build] target =
+/// "thumbv8m.main-none-eabihf"` (without it, paavod runs `cargo build
+/// --release` from the sandbox with no `--target` flag and cargo
+/// defaults to the host triple — which then host-compiles cortex-m
+/// and fails because its inline asm references thumb-only registers);
+/// `[target.thumbv8m.main-none-eabihf] rustflags = ["-C",
+/// "link-arg=-Tdefmt.x", "-C", "link-arg=--nmagic"]`; and
+/// `[net] git-fetch-with-cli = true` (libgit2's GitHub clone fails
+/// on Windows when a git credential helper is configured). All three
+/// surfaced during the M7.7 manual smoke.
 ///
 /// The tar entries are prefixed with the crate's directory name so
 /// paavod's `unpack_into` produces `<sandbox>/<crate>/Cargo.toml`,
@@ -146,10 +157,15 @@ fn should_keep(e: &walkdir::DirEntry) -> bool {
     };
     // Build output + VCS + editor scratch. Listed explicitly so a
     // future contributor can grep the rationale for each.
+    //
+    // NOTE: `.cargo` is INTENTIONALLY NOT in this list. The scaffold's
+    // `.cargo/config.toml` carries load-bearing settings (target
+    // triple, rustflags, net.git-fetch-with-cli) that paavod does NOT
+    // inject and that the build will fail without. See `make_tar`
+    // doc comment for the full rationale.
     const SKIP: &[&str] = &[
         "target",       // cargo build output
         ".git",         // VCS
-        ".cargo",       // paavod has its own .cargo/config; don't override
         "node_modules", // unlikely but cheap to exclude
         ".idea",        // JetBrains
         ".vscode",      // VS Code
@@ -249,5 +265,100 @@ fn handle_ndjson_line(line: &str) {
         None => {
             eprintln!("paavo-cli: stream line missing `type`: {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Read as _;
+
+    /// Regression for the M7.7 manual smoke: `.cargo/config.toml`
+    /// MUST survive the tar. Stripping it (as an earlier version of
+    /// `should_keep` did, on the now-invalidated theory that paavod
+    /// injects its own config) makes paavod's `cargo build --release`
+    /// fall back to the host triple — which then host-compiles
+    /// cortex-m and fails with 6 cortex-m errors (E0425 ×4 for
+    /// __basepri_{r,w,max} + __faultmask_r, plus 2 "invalid register"
+    /// errors for r0/r1).
+    #[test]
+    fn make_tar_preserves_dot_cargo_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let crate_dir = tmp.path().join("hello-mcxa266");
+        fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+        fs::create_dir_all(crate_dir.join("src")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"hello-mcxa266\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(crate_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            crate_dir.join(".cargo/config.toml"),
+            "[build]\ntarget = \"thumbv8m.main-none-eabihf\"\n",
+        )
+        .unwrap();
+
+        let buf = make_tar(&crate_dir).expect("make_tar");
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut names = Vec::new();
+        let mut dot_cargo_config_contents: Option<String> = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            // Normalize to forward slashes so the assertion works on
+            // Windows where tar may emit backslashes.
+            let path = path.replace('\\', "/");
+            if path == "hello-mcxa266/.cargo/config.toml" {
+                let mut s = String::new();
+                entry.read_to_string(&mut s).unwrap();
+                dot_cargo_config_contents = Some(s);
+            }
+            names.push(path);
+        }
+
+        assert!(
+            names.contains(&"hello-mcxa266/.cargo/config.toml".to_string()),
+            ".cargo/config.toml missing from tar; entries: {names:?}"
+        );
+        assert_eq!(
+            dot_cargo_config_contents.as_deref(),
+            Some("[build]\ntarget = \"thumbv8m.main-none-eabihf\"\n"),
+            "config.toml contents mangled in tar"
+        );
+    }
+
+    /// Sibling positive assertion: `target/` is still stripped. If
+    /// this ever flips, multi-GB tar uploads come back.
+    #[test]
+    fn make_tar_strips_target_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let crate_dir = tmp.path().join("hello-mcxa266");
+        fs::create_dir_all(crate_dir.join("src")).unwrap();
+        fs::create_dir_all(crate_dir.join("target/release")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"hello-mcxa266\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(crate_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        // A large-ish file under target/ to make a regression obvious
+        // in the tar size, not just the entry list.
+        fs::write(crate_dir.join("target/release/some.elf"), vec![0u8; 4096]).unwrap();
+
+        let buf = make_tar(&crate_dir).expect("make_tar");
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(
+            !names.iter().any(|n| n.contains("/target/")),
+            "target/ should be stripped from tar; entries: {names:?}"
+        );
     }
 }
