@@ -123,6 +123,17 @@ dev workstation                       lab machine (Linux)
                                       └──────────────────────────────────────┘
 ```
 
+**Runner wiring** (M2 stub → M7 real): the `BoardWorker` box above is
+`paavo-runner::run_job` and has been real since M2.2 against a mock
+`ProbeSession`. The probe-rs adapter behind it — `paavo-probe::RealSession`
+— was stubbed at M2.1 (and the `RealRunner` in `paavod::main` was a unit
+struct returning `InfraErr` until M7). M7 replaces both: `RealSession`
+gets a real probe-rs `Session` + RTT + defmt-decoder; `RealRunner`
+becomes a struct that owns the DB handle, the job-logs broker, the
+cancellation registry, and the config, so it can fish the ELF path off
+the job row and stream `LogFrame`s into the live broker without the
+dispatch layer needing new params.
+
 ### 3.2 Why two-binary daemon/UI split (not one binary)
 
 - The daemon must stay up to honor the nightly schedule; the UI is
@@ -822,7 +833,10 @@ behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
   - Streams the NDJSON log to the terminal until terminal outcome; exit code
     reflects outcome (0 = Passed, non-zero per outcome class).
 - `paavo-cli new <crate-name> --board-kind mcxa266 [--kind quick|soak]`
-  - Thin wrapper around `cargo generate` against the paavo repo's templates.
+  - Thin wrapper around `cargo generate` against the paavo repo's
+    templates. Requires `cargo-generate` on the user's `PATH`; if
+    missing, fails with a clear message ("install with `cargo install
+    cargo-generate`") rather than trying to download it. See §10.5.
 - `paavo-cli cancel <job_id>`
 - `paavo-cli logs <job_id> [--follow]`
 - `paavo-cli jobs [--state running] [--limit 20]`
@@ -854,6 +868,39 @@ behavior (the daemon's logs, the web UI) is operator-facing, not dev-facing.
 - `PAAVO_HOST` env var (e.g. `http://lab.local:8080`).
 - `--host` flag overrides.
 - Per-user `~/.config/paavo/cli.toml` for persistent defaults.
+
+### 10.5 `paavo-cli new` template scaffolding (M7)
+
+`paavo-cli new` shells out to `cargo generate` to materialise a test
+crate from one of the templates shipped under `templates/` in the paavo
+repo. Behaviour contract:
+
+- Required flags: `<crate-name>`, `--board-kind {mcxa266|rt685-evk}`.
+  Optional: `--kind {quick|soak}` (defaults to `quick`), `--into <dir>`
+  (defaults to `./<crate-name>`), `--templates-path <path>` (defaults
+  to the paavo repo root if `paavo-cli` is invoked from inside the
+  repo, otherwise to a checkout under `$XDG_CACHE_HOME/paavo/templates`).
+- Pre-flight: probe `cargo-generate --version`. If the binary is
+  missing or returns non-zero, exit with status 2 and the message
+  `cargo-generate not found on PATH. Install with: cargo install
+  cargo-generate`. Do NOT auto-install. Operators install once;
+  paavo's CLI stays simple.
+- Pre-flight: probe that the requested template subdir
+  (`<templates>/<board-kind>`) exists. If absent, list available
+  board-kinds and exit non-zero.
+- Invocation: `cargo generate --path <templates>/<board-kind> --name
+  <crate-name> --destination <into> --define test-kind=<kind>
+  --define embassy-rev=<pinned-rev>` with output streamed to the
+  user's terminal. `embassy-rev` is pinned in the template's
+  `cargo-generate.toml` defaults; paavo-cli only overrides it when
+  the user passes `--embassy-rev <sha>`. The pinned rev MUST resolve
+  to a commit that has the published `embassy-mcxa 0.1.0`.
+- Post-success: print one line summarising the next step
+  (`cd <name> && cargo build --release && paavo-cli run -p .`).
+
+Hardware-only chip names go in the scaffolded crate's docs, NOT in
+the CLI surface — operators copy them into `boards.toml` once per
+lab. See §13 for `boards.toml` shape.
 
 ---
 
@@ -1068,9 +1115,13 @@ Document the probe-rs udev rules in `contrib/99-probes.rules`. paavo does
 - **`paavod`** — end-to-end with `axum`'s `TestServer`; cover full job
   lifecycle with fake runner.
 - **`paavo-cli`** — assert_cmd-style tests against `paavod` test server.
-- **Hardware-in-the-loop smoke test** — manual, run once per release: spin
-  up paavod against a real mcxa266 + rt685-evk, submit one passing test and
-  one panicking test, confirm outcomes and log capture.
+- **Hardware-in-the-loop smoke test** — manual, run by hand on the dev
+  workstation any time the RealRunner / RealSession code changes. Spin
+  up paavod against a real mcxa266 (and rt685-evk once supported),
+  submit one passing test, confirm `Passed` outcome and decoded defmt
+  output in the NDJSON tail. Gated in CI under `PAAVO_HW=1` with
+  `#[ignore]` so the default `cargo test --workspace` stays
+  hardware-free.
 
 ---
 
@@ -1113,6 +1164,38 @@ convention. The teleprobe binary is not modified.
 - `paavo-test-prelude` shared crate (§12.5).
 - Web UI write actions.
 - Per-board subprocess workers (Approach C from brainstorming).
+
+### Deferred from M7 (RealRunner happy-path is in scope; these are not)
+
+M7 ships the **minimum viable** real-hardware loop: one happy-path
+"Test OK" against a real MCX-A266 EVK with defmt decoding. Everything
+below is deliberately out of M7's scope and rolled to M8:
+
+- **Cancellation mid-flash / mid-run**: `paavo-cli cancel <job_id>`
+  during `download_file` or during RTT polling. M7's RealRunner reads
+  the cancellation receiver but does not act on it; the watchdog
+  still enforces hard-max and inactivity timeouts so the job will
+  always terminate, just not on user demand.
+- **Drain interrupting a running session**: SIGTERM during a flash
+  today waits for the worker thread to finish naturally (which it
+  always will inside the hard-max budget). Explicit mid-flash abort
+  is M8.
+- **Hard-max watchdog killing a stuck probe**: today, if probe-rs
+  itself wedges (deadlock inside `download_file`, lost USB), the
+  watchdog cannot interrupt it. The watchdog thread will mark the
+  job `TimedOut{HardMax}` in the DB, but the actual probe-owning
+  thread may continue to occupy the probe for as long as probe-rs
+  takes to error out. Spec §6.1 envisions a `probe_unresponsive`
+  flag for this case; M8 wires it.
+- **Multi-probe selection by selector** when more than one matching
+  probe is plugged in (M7 errors with "ambiguous selector"; M8 picks
+  by `BoardSpec.instance_id`).
+- **rt685-evk RealSession parity** — same code path, different chip
+  name + RAM-only memory map. Adds a second template + a second
+  ProbeSelector path. M8.
+- **`paavod` running on Linux + udev rules** — M7's smoke is Windows-host
+  by user choice. The contrib/ systemd + udev assets shipped in M6 are
+  unchanged; validating them against a real Linux lab box is M8.
 
 ---
 

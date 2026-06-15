@@ -21,6 +21,9 @@
 - **M4** — Daemon + CLI: `paavod`, `paavo-cli`
 - **M5** — Web UI: `paavo-web` (server-side HTML via axum + UnoCSS CDN runtime, read-only)
 - **M6** — Templates, soak tests, ops (systemd, udev, README)
+- **M7** — End-to-end real-hardware smoke (mcxa266 / Windows): RealRunner +
+  RealSession wired against real probe-rs; `paavo-cli new` scaffolds; one
+  happy-path "Test OK" against a real MCX-A266 EVK from the dev desk
 
 Every task within a milestone is one of:
 - Write failing test → run → confirm FAIL
@@ -15615,6 +15618,1647 @@ Surfaced from the M6 exit-criteria review:
 
 ---
 
+## Milestone 7 — End-to-end real-hardware smoke (mcxa266 / Windows)
+
+**Goal**: from Felipe's Windows desk, `paavo-cli run -p ./hello-mcxa266`
+flashes onto a real MCX-A266 EVK via probe-rs over the MCU-Link
+CMSIS-DAP, streams decoded defmt back, and reports `Passed`. **One**
+board kind (mcxa266). **One** happy path. Everything else (cancel
+mid-run, drain mid-flash, hard-max kill of a stuck probe, rt685-evk
+parity, Linux+udev) deferred to M8 — see spec §17 "Deferred from M7".
+
+**Hard prerequisites** (all met before M7 starts):
+- M6 closed (`b6232a7`).
+- probe-rs 0.31 API spike completed against real HW (`82d0934`).
+  See `dev/probe-rs-spike/FINDINGS.md` for the locked-in API decisions
+  and the chip-name trap (`MCXA276`, not `MCXA266`).
+- Operator has `cargo-generate` on `PATH`. Tests gate hardware-only
+  paths under `PAAVO_HW=1` + `#[ignore]`.
+
+### Task 7.1: Refresh `templates/mcxa266` to the embassy-mcxa 0.1.0 reality
+
+The template shipped in M6.2 (`249a1d1`) was written before embassy-mcxa
+0.1.0 released. Four corrections, all driven by the M7.0 spike +
+upstream embassy examples:
+
+1. **Feature flag**: `mcxa266vfl` (made up) → `mcxa2xx` (real).
+2. **Embassy executor feature**: `arch-cortex-m` → `platform-cortex-m`.
+3. **`embassy-rev` placeholder**: leave as a placeholder, but document
+   in the template README that the only known-good rev as of M7 is the
+   tip of `embassy-rs/embassy` `main` that has `embassy-mcxa = 0.1.0`
+   in tree. (Per user decision during M7 brainstorming: pin to a
+   current main rev rather than the `embassy-mcxa-v0.1.0` tag — the
+   upside of seeing the as-released crate behaviour outweighs the
+   breakage cost.)
+4. **cortex-m-rt features**: add `["set-sp", "set-vtor"]` (required
+   for the MCXA RAM layout). Match what `examples/mcxa2xx/Cargo.toml`
+   ships.
+5. **defmt versions**: bump `defmt = "0.3"` → `"1.0"`, `defmt-rtt =
+   "0.4"` → `"1.0"`, `panic-probe = "0.3"` → `"1.0"`.
+6. **Template README**: add a `## probe-rs chip name` section noting
+   that the MCX-A266 attaches as `MCXA276` in probe-rs's built-in
+   target registry, NOT as `MCXA266` or `MCXA256`. Operators wiring
+   `boards.toml` need this.
+
+#### Step 7.1.a — Write failing template-render test
+
+`crates/paavo-cli/tests/templates_mcxa266_smoke.rs` (new):
+
+```rust
+//! Template-render smoke for templates/mcxa266. Scaffolds into a
+//! tempdir and asserts the resulting Cargo.toml contains the corrected
+//! feature flags. Does NOT cross-compile (that happens in 7.2 via the
+//! `paavo-cli new` integration test, gated under PAAVO_HW=1).
+
+#[test]
+fn mcxa266_template_renders_with_corrected_feature_flags() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let template = std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|p| p.join("templates/mcxa266/cargo-generate.toml").exists())
+        .expect("templates/mcxa266 not found from any ancestor of CWD")
+        .join("templates/mcxa266");
+
+    // Render with cargo-generate as a library call would be ideal, but
+    // for the smoke we just textually re-read Cargo.toml.liquid and
+    // assert the feature-flag strings we care about. The actual liquid
+    // substitution is tested by 7.2's end-to-end shell-out test.
+    let cargo_toml = std::fs::read_to_string(template.join("Cargo.toml.liquid"))
+        .expect("read Cargo.toml.liquid");
+
+    assert!(
+        cargo_toml.contains(r#"features = ["mcxa2xx""#)
+            || cargo_toml.contains(r#"features = ["defmt", "mcxa2xx""#)
+            || cargo_toml.contains(r#"features = ["mcxa2xx", "defmt""#),
+        "embassy-mcxa must enable the mcxa2xx feature (not mcxa266vfl). \
+         Cargo.toml.liquid:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("mcxa266vfl"),
+        "stale mcxa266vfl feature flag must be removed"
+    );
+    assert!(
+        cargo_toml.contains(r#""platform-cortex-m""#),
+        "embassy-executor must use platform-cortex-m (not arch-cortex-m)"
+    );
+    assert!(
+        !cargo_toml.contains(r#""arch-cortex-m""#),
+        "stale arch-cortex-m feature flag must be removed"
+    );
+    assert!(
+        cargo_toml.contains(r#"defmt          = "1"#)
+            || cargo_toml.contains(r#"defmt = "1"#),
+        "defmt must be 1.x (was 0.3 in M6)"
+    );
+}
+```
+
+Run: `cargo test -p paavo-cli templates_mcxa266 --no-run` to confirm
+compile, then `cargo test -p paavo-cli templates_mcxa266 -- --nocapture`
+to see it FAIL (no `mcxa2xx`, has `mcxa266vfl`, has `arch-cortex-m`,
+has `defmt = "0.3"`).
+
+#### Step 7.1.b — Apply template corrections
+
+Edit `templates/mcxa266/Cargo.toml.liquid`:
+
+```toml
+[package]
+name = "{{crate_name}}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m       = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt    = { version = "0.7", features = ["set-sp", "set-vtor"] }
+defmt          = "1"
+defmt-rtt      = "1"
+panic-probe    = { version = "1", features = ["print-defmt"] }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "{{embassy-rev}}", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { git = "https://github.com/embassy-rs/embassy", rev = "{{embassy-rev}}", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-mcxa     = { git = "https://github.com/embassy-rs/embassy", rev = "{{embassy-rev}}", features = ["defmt", "unstable-pac", "mcxa2xx", "embedded-mcu-hal"] }
+paavo-meta       = { git = "https://github.com/felipebalbi/paavo" }
+
+[profile.release]
+lto = true
+debug = 2          # full debug info — required for defmt-decoder
+                   # to find function names + .defmt section
+codegen-units = 1
+opt-level = "s"
+overflow-checks = false
+```
+
+Edit `templates/mcxa266/memory.x` (the M6.2 version was speculative;
+replace with the verified-against-embassy-examples reference):
+
+```
+/* NXP MCX-A266 (MCXA2xx family, Cortex-M33).
+ *
+ * Reference: embassy-rs/embassy examples/mcxa2xx/memory.x.
+ * The same map works for MCX-A256 and MCX-A266 — both have 1 MiB
+ * flash at 0x00000000 and 128 KiB SRAM at 0x20000000 (the M266
+ * exposes extra RAM banks above this but cortex-m-rt only needs
+ * the contiguous primary bank).
+ *
+ * cortex-m-rt's `set-sp` + `set-vtor` features (enabled in
+ * Cargo.toml) are required so this map works without a bootloader
+ * pre-initialising SP and VTOR.
+ */
+MEMORY
+{
+    FLASH : ORIGIN = 0x00000000, LENGTH = 1M
+    RAM   : ORIGIN = 0x20000000, LENGTH = 128K
+}
+```
+
+Edit `templates/mcxa266/src/main.rs` — the M6.2 marker pattern stays,
+but tighten the comment to match the actual contract:
+
+```rust
+//! {{crate_name}} — paavo test crate for MCX-A266.
+//!
+//! The pass-detection contract is fixed: paavo-runner's worker.rs
+//! looks for an info-level defmt frame whose body, after trim, is
+//! EXACTLY `Test OK`, immediately followed by a software breakpoint.
+//! No other format is accepted. See `paavo-runner/src/worker.rs::drive_session`.
+
+#![no_std]
+#![no_main]
+
+use defmt::*;
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use {defmt_rtt as _, panic_probe as _};
+
+paavo_meta::target!(b"frdm-mcx-a266");
+paavo_meta::timeout!(60);
+paavo_meta::inactivity_timeout!(30);
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let _p = embassy_mcxa::init(Default::default());
+    info!("hello from {{crate_name}}");
+    // TODO: write your test here. Replace the timer with whatever
+    // hardware exercise this test crate is for.
+    Timer::after(Duration::from_secs(1)).await;
+    info!("Test OK");
+    cortex_m::asm::bkpt();
+}
+```
+
+Edit `templates/mcxa266/README.md` (or create if missing) — append a
+section documenting the chip-name trap:
+
+```markdown
+## probe-rs chip name
+
+Operators wiring `boards.toml` for the FRDM-MCX-A266 EVK must use
+`chip_name = "MCXA276"`. Despite the part being marketed as MCX-A266
+(266 MHz dual-core variant), probe-rs's built-in target registry
+contains `MCXA275` and `MCXA276` but NOT `MCXA266` or `MCXA256`. The
+MCXA276 target's flash + RAM map matches the A266; attaching as
+MCXA276 works for flashing, RTT, defmt, the full pipeline. (Verified
+against real hardware in M7.0; see `dev/probe-rs-spike/FINDINGS.md`.)
+```
+
+#### Step 7.1.c — Run the test, confirm PASS
+
+```pwsh
+cargo test -p paavo-cli templates_mcxa266 -- --nocapture
+```
+
+Expected: PASS.
+
+#### Step 7.1.d — Workspace gates
+
+```pwsh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+All green.
+
+#### Step 7.1.e — Commit
+
+```
+templates(mcxa266): refresh feature flags for embassy-mcxa 0.1.0
+
+Four corrections driven by the M7.0 probe-rs spike + upstream
+embassy examples:
+
+  1. embassy-mcxa feature: mcxa266vfl (made up) -> mcxa2xx (real)
+  2. embassy-executor: arch-cortex-m -> platform-cortex-m
+  3. cortex-m-rt features: add set-sp + set-vtor (RAM layout needs them)
+  4. defmt deps: 0.3 -> 1.0 (paired with panic-probe 1.0)
+
+memory.x replaced with the embassy/examples/mcxa2xx reference
+(0x0 1M flash + 0x20000000 128K SRAM). README adds a section
+documenting the MCX-A266 -> MCXA276 chip-name trap for boards.toml.
+
+Tests: crates/paavo-cli/tests/templates_mcxa266_smoke.rs renders
+the template textually and asserts the four corrected flags are
+present and the four stale strings are gone.
+```
+
+---
+
+### Task 7.2: Wire `paavo-cli new` to scaffold from `templates/mcxa266`
+
+Today the `new` verb exists in clap and errors at runtime. Wire it to
+shell out to `cargo generate` per spec §10.5.
+
+#### Step 7.2.a — Failing assert_cmd test
+
+`crates/paavo-cli/tests/cli_new.rs` (new):
+
+```rust
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+#[test]
+fn new_without_cargo_generate_errors_clearly() {
+    // Skip if cargo-generate IS available — this test covers the
+    // "missing dependency" branch only.
+    if which::which("cargo-generate").is_ok() {
+        eprintln!("cargo-generate IS installed; skipping missing-dep test");
+        return;
+    }
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["new", "hello", "--board-kind", "mcxa266"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cargo-generate not found on PATH"))
+        .stderr(predicate::str::contains("cargo install cargo-generate"));
+}
+
+#[test]
+fn new_with_unknown_board_kind_errors_with_kinds_list() {
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["new", "hello", "--board-kind", "bogus-xyz"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown board kind: bogus-xyz"))
+        .stderr(predicate::str::contains("mcxa266"));
+}
+
+#[test]
+#[ignore] // gated under PAAVO_HW=1 because it does a real cargo-generate +
+          // real cargo check against thumbv8m.main-none-eabihf, which is
+          // slow and requires the target to be installed.
+fn new_mcxa266_scaffolds_and_typechecks() {
+    if std::env::var("PAAVO_HW").is_err() {
+        eprintln!("PAAVO_HW not set; skipping");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args([
+            "new",
+            "smoke-test",
+            "--board-kind", "mcxa266",
+            "--into", tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let scaffolded = tmp.path().join("smoke-test");
+    assert!(scaffolded.join("Cargo.toml").is_file(), "Cargo.toml missing");
+    assert!(scaffolded.join("src/main.rs").is_file(), "main.rs missing");
+    assert!(scaffolded.join("memory.x").is_file(), "memory.x missing");
+
+    // `cargo check` (not build) against thumbv8m.main-none-eabihf.
+    // We don't link or download crates we don't need; check stops at
+    // typeck which exercises feature-flag correctness.
+    let out = std::process::Command::new("cargo")
+        .args(["check", "--target", "thumbv8m.main-none-eabihf"])
+        .current_dir(&scaffolded)
+        .output()
+        .expect("spawn cargo check");
+    assert!(
+        out.status.success(),
+        "cargo check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+```
+
+Add `which = "7"` to `crates/paavo-cli/Cargo.toml` dev-dependencies.
+
+Run: `cargo test -p paavo-cli cli_new --no-run` (compile fails because
+the test asserts behaviour the handler doesn't implement yet, then
+runtime fails when the test runs).
+
+#### Step 7.2.b — Implement `paavo-cli new` handler
+
+`crates/paavo-cli/src/cmd_new.rs` (new):
+
+```rust
+//! `paavo-cli new` — scaffold a test crate from one of the templates
+//! shipped under `templates/` in the paavo repo. Thin wrapper around
+//! `cargo generate`; see spec §10.5 for the behaviour contract.
+
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Exit code 2: cargo-generate not on PATH. Distinct from 1 (generic
+/// failure) so wrapper scripts can detect "needs install" vs "real bug".
+pub const EXIT_MISSING_CARGO_GENERATE: i32 = 2;
+
+pub struct NewArgs {
+    pub crate_name: String,
+    pub board_kind: String,
+    pub kind: String,          // "quick" | "soak"; spec §10.1
+    pub into: PathBuf,
+    pub templates_path: Option<PathBuf>,
+    pub embassy_rev: Option<String>,
+}
+
+pub fn run(args: NewArgs) -> Result<i32> {
+    // 1. Resolve templates root.
+    let templates_root = resolve_templates_root(args.templates_path.as_deref())
+        .context("resolving templates root")?;
+
+    // 2. Check the requested board kind exists.
+    let template_dir = templates_root.join(&args.board_kind);
+    if !template_dir.join("cargo-generate.toml").is_file() {
+        let kinds = list_available_kinds(&templates_root);
+        bail!(
+            "unknown board kind: {}. Available: {}",
+            args.board_kind,
+            kinds.join(", ")
+        );
+    }
+
+    // 3. Check cargo-generate is on PATH.
+    let cg_check = Command::new("cargo-generate")
+        .arg("--version")
+        .output();
+    if cg_check.is_err()
+        || cg_check.as_ref().map(|o| !o.status.success()).unwrap_or(true)
+    {
+        eprintln!(
+            "cargo-generate not found on PATH. \
+             Install with: cargo install cargo-generate"
+        );
+        return Ok(EXIT_MISSING_CARGO_GENERATE);
+    }
+
+    // 4. Build the cargo-generate invocation.
+    let mut cg = Command::new("cargo-generate");
+    cg.arg("generate")
+        .arg("--path").arg(&template_dir)
+        .arg("--name").arg(&args.crate_name)
+        .arg("--destination").arg(&args.into)
+        .arg("--define").arg(format!("test-kind={}", args.kind))
+        .arg("--vcs").arg("none");
+    if let Some(rev) = &args.embassy_rev {
+        cg.arg("--define").arg(format!("embassy-rev={rev}"));
+    }
+    // else: cargo-generate.toml in the template supplies the pinned default.
+
+    let status = cg
+        .status()
+        .context("invoking cargo-generate")?;
+    if !status.success() {
+        bail!("cargo-generate exited non-zero: {status}");
+    }
+
+    let scaffolded = args.into.join(&args.crate_name);
+    println!(
+        "\nScaffolded {} at {}.\nNext: cd {} && cargo build --release && paavo-cli run -p .",
+        args.crate_name,
+        scaffolded.display(),
+        args.crate_name
+    );
+    Ok(0)
+}
+
+fn resolve_templates_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        if !p.is_dir() {
+            bail!("--templates-path does not exist: {}", p.display());
+        }
+        return Ok(p.to_path_buf());
+    }
+    // Walk up from CWD looking for a directory that contains a
+    // `templates/` subdir AND `Cargo.toml` AND a `crates/` subdir.
+    // That's the paavo repo root signature; we'll never false-positive
+    // on a random parent.
+    let cwd = std::env::current_dir()?;
+    for ancestor in cwd.ancestors() {
+        let templates = ancestor.join("templates");
+        if templates.is_dir()
+            && ancestor.join("Cargo.toml").is_file()
+            && ancestor.join("crates").is_dir()
+        {
+            return Ok(templates);
+        }
+    }
+    bail!(
+        "cannot find a `templates/` directory; pass --templates-path \
+         or run from inside a paavo checkout"
+    );
+}
+
+fn list_available_kinds(root: &Path) -> Vec<String> {
+    let mut kinds = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            if e.path().join("cargo-generate.toml").is_file() {
+                if let Some(name) = e.file_name().to_str() {
+                    kinds.push(name.to_string());
+                }
+            }
+        }
+    }
+    kinds.sort();
+    kinds
+}
+```
+
+Wire from `crates/paavo-cli/src/main.rs`:
+
+```rust
+Commands::New { crate_name, board_kind, kind, into, templates_path, embassy_rev } => {
+    let into = into.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let code = cmd_new::run(cmd_new::NewArgs {
+        crate_name,
+        board_kind,
+        kind: kind.unwrap_or_else(|| "quick".into()),
+        into,
+        templates_path,
+        embassy_rev,
+    })?;
+    std::process::exit(code);
+}
+```
+
+Update the `New` clap variant to accept `--kind`, `--into`,
+`--templates-path`, `--embassy-rev`.
+
+#### Step 7.2.c — Run tests, confirm PASS
+
+```pwsh
+cargo test -p paavo-cli cli_new -- --nocapture
+# Then on the dev box:
+$env:PAAVO_HW = "1"
+cargo test -p paavo-cli cli_new -- --nocapture --ignored
+```
+
+The `#[ignore]`-gated test scaffolds into `%TEMP%`, then runs
+`cargo check --target thumbv8m.main-none-eabihf`. If embassy's main
+has drifted such that `mcxa2xx` no longer compiles, that's where
+we find out.
+
+#### Step 7.2.d — Commit
+
+```
+paavo-cli: wire `new` verb to cargo-generate against templates/
+
+Implements spec §10.5 — paavo-cli new <name> --board-kind <kind>
+shells out to `cargo generate --path templates/<kind> --name <name>
+--destination <into> --define test-kind=<kind>`. Pre-flight checks:
+
+  1. `cargo-generate --version` must succeed; otherwise exit 2 with
+     a clear "install with `cargo install cargo-generate`" message.
+     Do NOT auto-install.
+  2. `templates/<kind>/cargo-generate.toml` must exist; otherwise
+     list available kinds and exit non-zero.
+
+Templates root is auto-discovered by walking up from CWD looking for
+a paavo-repo signature (templates/ + Cargo.toml + crates/), or
+overridden by --templates-path. The embassy-rev default comes from
+the template's cargo-generate.toml; --embassy-rev <sha> overrides.
+
+Tests: crates/paavo-cli/tests/cli_new.rs covers both pre-flight
+error paths under normal `cargo test`, plus an #[ignore]-gated
+end-to-end test under PAAVO_HW=1 that scaffolds + cross-compiles
+the result with `cargo check --target thumbv8m.main-none-eabihf`.
+```
+
+---
+
+### Task 7.3: RealRunner struct skeleton with DB / broker / cancellation / config
+
+Before touching probe-rs, reshape `paavod::main::RealRunner` from a unit
+struct to a proper struct that owns the four pieces of state RealRunner
+will need: DB handle (to read `elf_path` off the job row), JobLogsBroker
+(to publish frames), CancellationRegistry (to read the cancel rx —
+M7-stubbed; M8 acts on it), and config (timeouts + probe defaults).
+
+Decision recap from M7 brainstorming (option B): extend RealRunner's
+*constructor*, not the `Runner` trait. FakeRunner stays unchanged.
+
+#### Step 7.3.a — Failing unit test
+
+`crates/paavod/tests/real_runner_skeleton.rs` (new):
+
+```rust
+//! M7.3 — RealRunner skeleton tests. The probe-rs adapter is NOT yet
+//! wired (M7.4-5); these tests cover the DB-read + InfraErr-shape
+//! contract so callers see a clear, structured error pointing at the
+//! actual elf_path that would have been flashed.
+
+use paavo_core::Runner;
+use paavo_db::{Db, JobRow, NewJobRow};
+use paavo_proto::{JobId, JobOutcome, JobState, TerminalOutcome, Priority, BoardSelector};
+use paavod::{
+    app_state::DrainState,
+    cancellation::CancellationRegistry,
+    config::Config,
+    job_logs::JobLogsBroker,
+    real_runner::RealRunner,
+};
+use parking_lot::Mutex;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+fn boot(tmp: &TempDir) -> (Arc<Mutex<Db>>, Arc<Config>) {
+    let db = Db::open(&tmp.path().join("p.sqlite")).expect("open db");
+    let mut cfg = Config::default_for_tests();
+    cfg.server.state_dir = tmp.path().to_path_buf();
+    (Arc::new(Mutex::new(db)), Arc::new(cfg))
+}
+
+#[test]
+fn real_runner_reports_unimplemented_with_elf_path_from_db() {
+    let tmp = TempDir::new().unwrap();
+    let (db, cfg) = boot(&tmp);
+
+    // Seed a job row already in Running state, with a synthetic elf_path
+    // a real RealRunner would have read from.
+    let job_id = JobId::new();
+    {
+        let conn = db.lock();
+        JobRow::insert(
+            conn.raw_conn(),
+            &NewJobRow {
+                id: job_id,
+                priority: Priority::Interactive,
+                selector: BoardSelector::Kind("mcxa266".into()),
+                tar_path: tmp.path().join("dummy.tar").display().to_string(),
+                tar_blake3: "0".repeat(64),
+                cargo_update_packages: vec![],
+            },
+            chrono::Utc::now().timestamp_millis(),
+        ).unwrap();
+        JobRow::transition_to_building(conn.raw_conn(), &job_id, "mcxa266-01", 0).unwrap();
+        JobRow::transition_to_running(
+            conn.raw_conn(),
+            &job_id,
+            "/tmp/elf-from-cache/smoke.elf",
+        ).unwrap();
+    }
+
+    let runner = RealRunner::new(
+        db.clone(),
+        JobLogsBroker::new(),
+        CancellationRegistry::default(),
+        cfg.clone(),
+    );
+
+    let out = runner.run(job_id, "mcxa266-01");
+    match out.outcome {
+        JobOutcome::Failed(TerminalOutcome::InfraErr { stage, message }) => {
+            assert!(stage.contains("real_session") || stage.contains("real_runner"),
+                "stage = {stage}");
+            assert!(message.contains("/tmp/elf-from-cache/smoke.elf"),
+                "message must include resolved elf_path. msg = {message}");
+        }
+        other => panic!("expected InfraErr; got {other:?}"),
+    }
+    assert!(out.probe_released_cleanly, "no probe touched yet");
+}
+
+#[test]
+fn real_runner_with_missing_job_row_returns_infraerr_about_missing_job() {
+    let tmp = TempDir::new().unwrap();
+    let (db, cfg) = boot(&tmp);
+    let runner = RealRunner::new(
+        db.clone(),
+        JobLogsBroker::new(),
+        CancellationRegistry::default(),
+        cfg.clone(),
+    );
+    let bogus = JobId::new();
+
+    let out = runner.run(bogus, "mcxa266-01");
+    match out.outcome {
+        JobOutcome::Failed(TerminalOutcome::InfraErr { stage, message }) => {
+            assert!(stage.contains("real_runner") || stage.contains("db"),
+                "stage = {stage}");
+            assert!(message.to_lowercase().contains("not found")
+                    || message.to_lowercase().contains("missing"),
+                "msg = {message}");
+        }
+        other => panic!("expected InfraErr; got {other:?}"),
+    }
+}
+```
+
+Run: `cargo test -p paavod real_runner_skeleton --no-run` → fails
+(no `paavod::real_runner` module). Once moved, `cargo test ...` → fails
+on assertions (unit struct still returns hardcoded message).
+
+#### Step 7.3.b — Add `Config::default_for_tests()` and the module
+
+`crates/paavod/src/real_runner.rs` (new):
+
+```rust
+//! Real probe-rs-backed runner. Replaces the M2.1 unit-struct stub.
+//!
+//! Owns the four pieces of state needed to drive a real BoardWorker:
+//! - DB handle: read `elf_path` from the job row (dispatch already
+//!   wrote it via `transition_to_running`).
+//! - JobLogsBroker: stream decoded defmt frames to live tail listeners.
+//! - CancellationRegistry: read the cancel rx for the job (M7 stub;
+//!   M8 acts on it inside the inner loop).
+//! - Config: timeouts (hard_max, inactivity, probe_release_grace) and
+//!   probe defaults.
+//!
+//! M7 sub-tasks:
+//!   7.3 - this skeleton (current step). `run()` reads the elf_path,
+//!         returns InfraErr citing it. No probe-rs calls yet.
+//!   7.4 - `RealSession::connect` lands; `run()` calls it and returns
+//!         InfraErr citing connect failure (no run loop yet).
+//!   7.6 - stitches `paavo_runner::run_job` and returns real outcomes.
+
+use crate::app_state::AppState;
+use crate::cancellation::CancellationRegistry;
+use crate::config::Config;
+use crate::job_logs::JobLogsBroker;
+use paavo_core::{RunOutcome, Runner};
+use paavo_db::{Db, JobRow};
+use paavo_proto::{JobId, JobOutcome, TerminalOutcome};
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+pub struct RealRunner {
+    db: Arc<Mutex<Db>>,
+    #[allow(dead_code)] // wired in 7.6
+    job_logs: JobLogsBroker,
+    #[allow(dead_code)] // wired in 7.6 (read rx); used by M8 to abort
+    cancellation: CancellationRegistry,
+    #[allow(dead_code)] // wired in 7.4 (probe defaults) + 7.6 (timeouts)
+    config: Arc<Config>,
+}
+
+impl RealRunner {
+    pub fn new(
+        db: Arc<Mutex<Db>>,
+        job_logs: JobLogsBroker,
+        cancellation: CancellationRegistry,
+        config: Arc<Config>,
+    ) -> Self {
+        Self { db, job_logs, cancellation, config }
+    }
+
+    /// Construct from `AppState`. The state pieces are all `Clone`
+    /// (Arc-wrapped), so no extra plumbing needed in main.rs.
+    pub fn from_state(state: &AppState) -> Self {
+        Self::new(
+            state.db.clone(),
+            state.job_logs.clone(),
+            state.cancellation.clone(),
+            state.config.clone(),
+        )
+    }
+}
+
+impl Runner for RealRunner {
+    fn run(&self, job_id: JobId, _board_id: &str) -> RunOutcome {
+        // Read elf_path off the job row. Dispatch already wrote it via
+        // `transition_to_running`. If the row is missing (race we don't
+        // expect, but be defensive), report InfraErr with stage=db_lookup.
+        let elf_path = {
+            let db = self.db.lock();
+            match JobRow::find(db.raw_conn(), &job_id) {
+                Ok(Some(row)) => row.elf_path,
+                Ok(None) => {
+                    return RunOutcome {
+                        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
+                            stage: "real_runner.db_lookup".into(),
+                            message: format!("job row missing: {job_id}"),
+                        }),
+                        probe_released_cleanly: true,
+                    };
+                }
+                Err(e) => {
+                    return RunOutcome {
+                        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
+                            stage: "real_runner.db_lookup".into(),
+                            message: format!("DB error reading job row: {e}"),
+                        }),
+                        probe_released_cleanly: true,
+                    };
+                }
+            }
+        };
+        let elf_display = elf_path
+            .as_deref()
+            .unwrap_or("(elf_path column was NULL in job row)");
+
+        // M7 sub-tasks 7.4-7.6 replace this with: RealSession::connect →
+        // paavo_runner::run_job → outcome mapping. Until then we return
+        // an InfraErr that names the resolved elf_path, so operators
+        // see exactly what would have been flashed and can sanity-check
+        // build_or_cache before the runner lands.
+        RunOutcome {
+            outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
+                stage: "real_session.connect_unwired".into(),
+                message: format!(
+                    "RealSession is wired in Milestone 7.4. Would have flashed: {elf_display}"
+                ),
+            }),
+            probe_released_cleanly: true,
+        }
+    }
+}
+```
+
+Export from `crates/paavod/src/lib.rs`:
+
+```rust
+pub mod real_runner;
+```
+
+Replace the unit struct in `crates/paavod/src/main.rs`:
+
+```rust
+let runner: Arc<dyn paavo_core::Runner> = if std::env::var("PAAVO_FAKE_RUNNER").is_ok() {
+    tracing::warn!("PAAVO_FAKE_RUNNER=1: using FakeRunner; every job returns Passed");
+    Arc::new(FakeRunner)
+} else {
+    Arc::new(paavod::real_runner::RealRunner::from_state(&state))
+};
+```
+
+Remove the unit struct `RealRunner` + its impl from `main.rs`.
+
+Add `Config::default_for_tests()` in `crates/paavod/src/config.rs`:
+
+```rust
+#[cfg(test)]
+impl Config {
+    /// Minimum-viable config for unit tests: bind to an ephemeral
+    /// localhost port, point state_dir at a temp dir the caller will
+    /// override, default timeouts.
+    pub fn default_for_tests() -> Self {
+        Self {
+            server: crate::config::ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                state_dir: std::env::temp_dir(),
+            },
+            // ... fill remaining sub-configs with their existing defaults.
+        }
+    }
+}
+```
+
+(Concrete `ServerConfig`/`SchedulerConfig`/etc shape is per the M4.1
+config schema; copy default values from `paavo.toml.example`.)
+
+#### Step 7.3.c — Confirm PASS
+
+```pwsh
+cargo test -p paavod real_runner_skeleton -- --nocapture
+cargo test --workspace
+```
+
+#### Step 7.3.d — Workspace gates + commit
+
+```pwsh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Commit:
+
+```
+paavod: extract RealRunner from main.rs to its own module with state
+
+Replaces the M2.1 unit-struct RealRunner that returned a hard-coded
+InfraErr with a real struct owning db/job_logs/cancellation/config.
+This is the foundation M7.4-7.6 build on: each successive sub-task
+fills in more of the run() body without touching dispatch or the
+Runner trait.
+
+For M7.3 the run() body still returns InfraErr, but now:
+  - it reads the elf_path off the JobRow (proving the DB plumbing
+    works under the same lock dispatch holds)
+  - the error message NAMES the elf_path, so operators running paavod
+    without 7.4 see exactly what would have been flashed
+  - missing job rows surface as a distinct stage=real_runner.db_lookup
+
+main.rs shrinks: the unit-struct RealRunner + its impl Runner block
+go away; in their place, `paavod::real_runner::RealRunner::from_state`.
+FakeRunner stays exactly as it was.
+
+Tests: crates/paavod/tests/real_runner_skeleton.rs covers the happy
+DB-read path (asserts the InfraErr message contains the elf_path
+written by transition_to_running) and the missing-row path (asserts
+stage=real_runner.db_lookup).
+```
+
+---
+
+### Task 7.4: `RealSession::connect` — probe-rs flash + reset + RTT attach + .defmt parse
+
+The first sub-task that actually talks to probe-rs. Locked-in from the
+M7.0 spike (`dev/probe-rs-spike/FINDINGS.md`):
+
+- `DebugProbeSelector { vendor_id, product_id, interface: None, serial_number }`.
+- `Lister::new().open(selector)` returns a `Probe`.
+- `Probe::attach(chip_name_str, Permissions::default()) -> Session`.
+- `download_file(&mut session, &elf_path, FormatKind::Elf)`.
+- `Session::core(0)?.reset_and_halt(Duration::from_secs(2)) + .run()`.
+- 200 ms sleep, then `Rtt::attach(&mut core)`.
+- `defmt_decoder::Table::parse(&elf_bytes)?` to build the decode table.
+
+#### Step 7.4.a — Failing PAAVO_HW test
+
+`crates/paavo-probe/tests/real_session_connect.rs` (new):
+
+```rust
+//! Hardware-only test for RealSession::connect. Requires a real
+//! probe + board; gated under PAAVO_HW=1. CI never runs this.
+
+use paavo_probe::{RealSession, RealSessionOptions};
+use paavo_proto::ProbeSelector;
+use std::path::PathBuf;
+
+fn hw_or_skip() -> bool {
+    if std::env::var("PAAVO_HW").is_err() {
+        eprintln!("PAAVO_HW not set; skipping hardware test");
+        return false;
+    }
+    true
+}
+
+fn elf_fixture() -> PathBuf {
+    // The spike fixture ships a known-good thumbv8m ELF.
+    let here = std::env::current_dir().unwrap();
+    let repo = here.ancestors()
+        .find(|p| p.join("dev/spike-fixture-mcxa266/Cargo.toml").is_file())
+        .expect("can't find repo root from CWD");
+    let elf = repo.join("dev/spike-fixture-mcxa266/target/thumbv8m.main-none-eabihf/release/spike-fixture-mcxa266");
+    assert!(
+        elf.is_file(),
+        "spike fixture ELF not built. Run:\n  cargo build --release \
+         --manifest-path {}/dev/spike-fixture-mcxa266/Cargo.toml",
+        repo.display()
+    );
+    elf
+}
+
+#[test]
+#[ignore]
+fn connect_flashes_and_returns_live_session() {
+    if !hw_or_skip() { return; }
+    let opts = RealSessionOptions {
+        probe_selector: ProbeSelector {
+            vendor_id: 0x1fc9,
+            product_id: 0x0143,
+            serial_number: Some("EDFHUAFM4J5ZJ".into()),
+        },
+        chip_name: "MCXA276".into(),
+        elf_path: elf_fixture(),
+        skip_post_load_reset: false,
+    };
+    let session = RealSession::connect(opts)
+        .expect("connect must succeed against the MCX-A266 EVK");
+    // Session struct is returned; drop releases the probe.
+    drop(session);
+}
+```
+
+Run with `$env:PAAVO_HW = "1"; cargo test -p paavo-probe real_session_connect -- --nocapture --ignored`
+→ FAIL (`RealSession::connect` still stubbed to return error).
+
+#### Step 7.4.b — Implement RealSession::connect
+
+`crates/paavo-probe/Cargo.toml`: add workspace deps:
+
+```toml
+[dependencies]
+# ... existing
+probe-rs       = { workspace = true }
+defmt-decoder  = { workspace = true }
+```
+
+Rewrite `crates/paavo-probe/src/session.rs`:
+
+```rust
+use crate::error::{ProbeError, Result};
+use crate::event::Event;
+use defmt_decoder::Table;
+use probe_rs::{
+    flashing::{download_file, FormatKind},
+    probe::{list::Lister, DebugProbeSelector},
+    rtt::Rtt,
+    Permissions, Session,
+};
+use std::path::PathBuf;
+use std::time::Duration;
+
+// Public trait + RealSessionOptions struct UNCHANGED — see M2.1.
+
+pub trait ProbeSession: Send {
+    fn next_event(&mut self, timeout_ms: u32) -> Result<Option<Event>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct RealSessionOptions {
+    pub probe_selector: paavo_proto::ProbeSelector,
+    pub chip_name: String,
+    pub elf_path: PathBuf,
+    pub skip_post_load_reset: bool,
+}
+
+/// Real probe-rs + defmt-decoder backed session.
+///
+/// Ownership: the probe-rs `Session` is `Send` but `!Sync` (we
+/// verified in the M7.0 spike — see dev/probe-rs-spike/FINDINGS.md).
+/// We hold it owned, on the BoardWorker thread. The `Rtt` handle is
+/// `Send + Sync` but borrows `&mut Core` per read, which is why we
+/// re-take `session.core(0)` each `next_event` call.
+pub struct RealSession {
+    session: Session,
+    rtt: Rtt,
+    /// defmt decode table parsed from the ELF's `.defmt` section.
+    /// Decoder state is per-channel; we currently consume one up channel.
+    table: Table,
+    decoder: Box<dyn defmt_decoder::StreamDecoder + Send>,
+    /// Reusable read buffer; sized to the up-channel's buffer.
+    rtt_buf: Vec<u8>,
+    /// True once we've emitted `Bkpt`. Used to debounce repeated halts.
+    seen_bkpt: bool,
+}
+
+impl RealSession {
+    pub fn connect(opts: RealSessionOptions) -> Result<Self> {
+        // 1. Open the probe by selector.
+        let lister = Lister::new();
+        let selector = DebugProbeSelector {
+            vendor_id: opts.probe_selector.vendor_id,
+            product_id: opts.probe_selector.product_id,
+            interface: None,
+            serial_number: opts.probe_selector.serial_number.clone(),
+        };
+        let probe = lister.open(selector).map_err(|e| {
+            ProbeError::ProbeRs(format!(
+                "open probe vid={:04x} pid={:04x} serial={:?}: {e}",
+                opts.probe_selector.vendor_id,
+                opts.probe_selector.product_id,
+                opts.probe_selector.serial_number,
+            ))
+        })?;
+
+        // 2. Attach to the chip.
+        let mut session = probe
+            .attach(opts.chip_name.as_str(), Permissions::default())
+            .map_err(|e| ProbeError::ProbeRs(format!(
+                "attach chip={}: {e}", opts.chip_name
+            )))?;
+
+        // 3. Flash.
+        download_file(&mut session, &opts.elf_path, FormatKind::Elf)
+            .map_err(|e| ProbeError::ProbeRs(format!(
+                "flash {}: {e}", opts.elf_path.display()
+            )))?;
+
+        // 4. Reset + run (unless caller asked to skip — RT685S quirk).
+        if !opts.skip_post_load_reset {
+            let mut core = session.core(0)
+                .map_err(|e| ProbeError::ProbeRs(format!("session.core(0): {e}")))?;
+            core.reset_and_halt(Duration::from_secs(2))
+                .map_err(|e| ProbeError::ProbeRs(format!("reset_and_halt: {e}")))?;
+            core.run()
+                .map_err(|e| ProbeError::ProbeRs(format!("core.run: {e}")))?;
+        }
+
+        // 5. Parse .defmt for the decoder table BEFORE the RTT attach
+        // so a malformed ELF surfaces here, not deep in next_event.
+        let elf_bytes = std::fs::read(&opts.elf_path)
+            .map_err(|e| ProbeError::ProbeRs(format!(
+                "read elf for .defmt: {e}"
+            )))?;
+        let table = Table::parse(&elf_bytes)
+            .map_err(|e| ProbeError::ProbeRs(format!(
+                ".defmt section parse: {e}"
+            )))?
+            .ok_or_else(|| ProbeError::ProbeRs(
+                "ELF has no .defmt section — test crate must link defmt".into()
+            ))?;
+        let decoder = table.new_stream_decoder();
+
+        // 6. Wait briefly for firmware to initialise RTT, then attach.
+        std::thread::sleep(Duration::from_millis(200));
+        let rtt = {
+            let mut core = session.core(0)
+                .map_err(|e| ProbeError::ProbeRs(format!("session.core(0) for rtt: {e}")))?;
+            Rtt::attach(&mut core).map_err(|e| ProbeError::ProbeRs(format!(
+                "rtt attach: {e} (firmware probably hasn't initialised RTT yet — \
+                 link defmt-rtt and ensure main() touches it before doing anything slow)"
+            )))?
+        };
+
+        // Size the read buffer to the up-channel's buffer; default to
+        // 1024 (what defmt-rtt uses) if there are no up channels (we'll
+        // never read in that case anyway).
+        let buf_size = rtt.up_channels.first()
+            .map(|c| c.buffer_size().max(256))
+            .unwrap_or(1024);
+
+        Ok(Self {
+            session,
+            rtt,
+            table,
+            decoder,
+            rtt_buf: vec![0u8; buf_size],
+            seen_bkpt: false,
+        })
+    }
+}
+
+// `impl ProbeSession for RealSession` lands in 7.5.
+impl ProbeSession for RealSession {
+    fn next_event(&mut self, _timeout_ms: u32) -> Result<Option<Event>> {
+        Err(ProbeError::ProbeRs(
+            "RealSession::next_event is wired in Milestone 7.5".into(),
+        ))
+    }
+}
+```
+
+#### Step 7.4.c — Confirm PASS on HW
+
+```pwsh
+# Build the spike fixture first (the test depends on its ELF).
+cargo build --release --manifest-path dev/spike-fixture-mcxa266/Cargo.toml
+
+$env:PAAVO_HW = "1"
+cargo test -p paavo-probe real_session_connect -- --nocapture --ignored
+```
+
+Expected: PASS (probe attaches, ELF flashes, RTT attaches, session drops cleanly).
+
+#### Step 7.4.d — Workspace gates + commit
+
+```pwsh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace    # the new test is #[ignore]'d
+```
+
+Commit:
+
+```
+paavo-probe: RealSession::connect — real probe-rs flash + RTT attach
+
+Replaces the M2.1 stub with the full happy-path connect flow:
+
+  1. Lister::new().open(DebugProbeSelector) — by VID/PID/serial
+  2. Probe::attach(chip, Permissions::default()) -> Session
+  3. flashing::download_file(&mut session, &elf, FormatKind::Elf)
+  4. core(0)?.reset_and_halt(2s) + .run()   (unless skip_post_load_reset)
+  5. defmt_decoder::Table::parse(elf_bytes) for the decode table
+  6. 200ms sleep, then Rtt::attach(&mut core)
+
+Findings from the M7.0 spike are locked in: DebugProbeSelector needs
+the `interface: None` field (easy to forget); Format is NOT a unit
+enum, use FormatKind::Elf and let the From impl wrap with defaults;
+the 200ms pre-RTT-attach delay is empirically necessary.
+
+next_event is still stubbed (lands in M7.5). The Session, Rtt, Table,
+and StreamDecoder are wired and stored; only the read loop is missing.
+
+paavo-probe gains workspace deps probe-rs + defmt-decoder. The trait
+shape (ProbeSession: Send) is unchanged from M2.1 — verified during
+spike that Session is Send + !Sync.
+
+Tests: crates/paavo-probe/tests/real_session_connect.rs is gated under
+PAAVO_HW=1 + #[ignore]. CI never runs it. On the dev workstation
+with an MCX-A266 EVK plugged in, runs through the full attach+flash+
+RTT-attach sequence and exits clean. Depends on dev/spike-fixture-
+mcxa266 having been built first.
+```
+
+---
+
+### Task 7.5: `RealSession::next_event` — RTT poll + defmt decode + bkpt detect
+
+The other hardware half. RTT polling + defmt decoding produces
+`Event::LogFrame` with decoded `frame.message`. Core status polling
+produces `Event::Bkpt`. paavo-runner's existing `drive_session` already
+recognises both.
+
+#### Step 7.5.a — Failing PAAVO_HW test
+
+`crates/paavo-probe/tests/real_session_drive.rs` (new):
+
+```rust
+use paavo_probe::{Event, ProbeSession, RealSession, RealSessionOptions};
+use paavo_proto::{LogLevel, ProbeSelector};
+use std::time::{Duration, Instant};
+
+fn hw_or_skip() -> bool { std::env::var("PAAVO_HW").is_ok() }
+
+#[test]
+#[ignore]
+fn next_event_streams_decoded_test_ok_then_bkpt() {
+    if !hw_or_skip() { eprintln!("skip; no PAAVO_HW"); return; }
+    let here = std::env::current_dir().unwrap();
+    let repo = here.ancestors()
+        .find(|p| p.join("dev/spike-fixture-mcxa266/Cargo.toml").is_file())
+        .expect("repo root");
+    let elf = repo.join("dev/spike-fixture-mcxa266/target/thumbv8m.main-none-eabihf/release/spike-fixture-mcxa266");
+
+    let mut session = RealSession::connect(RealSessionOptions {
+        probe_selector: ProbeSelector {
+            vendor_id: 0x1fc9, product_id: 0x0143,
+            serial_number: Some("EDFHUAFM4J5ZJ".into()),
+        },
+        chip_name: "MCXA276".into(),
+        elf_path: elf,
+        skip_post_load_reset: false,
+    }).expect("connect");
+
+    let mut got_test_ok = false;
+    let mut got_bkpt = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !(got_test_ok && got_bkpt) {
+        match session.next_event(500).expect("next_event") {
+            Some(Event::LogFrame(f)) => {
+                eprintln!("frame: {:?} {:?}", f.level, f.message);
+                if f.level == LogLevel::Info && f.message.trim() == "Test OK" {
+                    got_test_ok = true;
+                }
+            }
+            Some(Event::Bkpt) => { got_bkpt = true; }
+            Some(Event::Panic { message }) => panic!("unexpected panic frame: {message}"),
+            Some(Event::Disconnect) => panic!("unexpected disconnect"),
+            None => {}
+        }
+    }
+    assert!(got_test_ok, "never decoded a `Test OK` info frame within 10s");
+    assert!(got_bkpt, "never observed bkpt within 10s");
+}
+```
+
+Run: FAIL (next_event still stubbed).
+
+#### Step 7.5.b — Implement next_event
+
+Replace the stub in `crates/paavo-probe/src/session.rs`:
+
+```rust
+impl ProbeSession for RealSession {
+    fn next_event(&mut self, timeout_ms: u32) -> Result<Option<Event>> {
+        // 1. Check core status first — if the target hit bkpt we want
+        //    to surface that BEFORE draining any more RTT (so the
+        //    runner's pass-detection sees LogFrame(Test OK) → Bkpt in
+        //    order).
+        if !self.seen_bkpt {
+            // Drain any pending RTT first so an in-flight Test OK
+            // frame doesn't get hidden by a too-eager bkpt return.
+            if let Some(evt) = self.poll_rtt_once()? {
+                return Ok(Some(evt));
+            }
+            let mut core = self.session.core(0)
+                .map_err(|e| ProbeError::ProbeRs(format!("core(0): {e}")))?;
+            let status = core.status()
+                .map_err(|e| ProbeError::ProbeRs(format!("core.status: {e}")))?;
+            if status.is_halted() {
+                self.seen_bkpt = true;
+                return Ok(Some(Event::Bkpt));
+            }
+        }
+
+        // 2. If we've already emitted Bkpt, drain any remaining RTT
+        //    so post-bkpt info frames (rare) aren't lost, then return
+        //    Ok(None) which signals "nothing more right now."
+        if let Some(evt) = self.poll_rtt_once()? {
+            return Ok(Some(evt));
+        }
+
+        // 3. No RTT data + not halted → wait up to timeout_ms / 10
+        //    in 50ms slices so we stay responsive to watchdog stop.
+        let slice = std::cmp::min(50, timeout_ms.max(50));
+        std::thread::sleep(Duration::from_millis(slice as u64));
+        Ok(None)
+    }
+}
+
+impl RealSession {
+    /// Read one chunk of bytes off the first up channel, feed into the
+    /// defmt decoder, and emit the first decoded frame (if any) as a
+    /// `LogFrame`. Returns `Ok(None)` if the channel had no bytes OR
+    /// if the bytes received did not yet produce a complete frame.
+    ///
+    /// Implementation note: defmt's StreamDecoder buffers internally;
+    /// we MAY emit multiple `Event::LogFrame`s across multiple calls
+    /// before consuming another chunk of RTT bytes. The next call
+    /// always drains the decoder first before fetching new bytes.
+    fn poll_rtt_once(&mut self) -> Result<Option<Event>> {
+        // First, try to pull an already-decoded frame from the decoder.
+        match self.decoder.decode() {
+            Ok(frame) => return Ok(Some(self.frame_to_event(&frame))),
+            Err(defmt_decoder::DecodeError::UnexpectedEof) => {
+                // Need more bytes; fall through to read RTT.
+            }
+            Err(defmt_decoder::DecodeError::Malformed) => {
+                // Skip malformed; the decoder advances past the bad
+                // frame internally. Don't surface as an error — defmt
+                // 1.0 can produce these during framing-buffer wrap.
+                tracing::warn!("defmt malformed frame skipped");
+            }
+        }
+
+        // Read more bytes from the up channel.
+        let n = {
+            let Some(ch) = self.rtt.up_channels.first_mut() else {
+                return Ok(None);
+            };
+            let mut core = self.session.core(0)
+                .map_err(|e| ProbeError::ProbeRs(format!("core(0) for rtt: {e}")))?;
+            ch.read(&mut core, &mut self.rtt_buf)
+                .map_err(|e| ProbeError::ProbeRs(format!("rtt read: {e}")))?
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        self.decoder.received(&self.rtt_buf[..n]);
+
+        // Try to decode again now that we have more bytes.
+        match self.decoder.decode() {
+            Ok(frame) => Ok(Some(self.frame_to_event(&frame))),
+            Err(defmt_decoder::DecodeError::UnexpectedEof) => Ok(None),
+            Err(defmt_decoder::DecodeError::Malformed) => Ok(None),
+        }
+    }
+
+    fn frame_to_event(&self, frame: &defmt_decoder::Frame<'_>) -> Event {
+        use paavo_proto::{LogFrame, LogLevel};
+        let level = match frame.level() {
+            Some(defmt_decoder::Level::Trace) => LogLevel::Trace,
+            Some(defmt_decoder::Level::Debug) => LogLevel::Debug,
+            Some(defmt_decoder::Level::Info)  => LogLevel::Info,
+            Some(defmt_decoder::Level::Warn)  => LogLevel::Warn,
+            Some(defmt_decoder::Level::Error) => LogLevel::Error,
+            None => LogLevel::Info,
+        };
+        let message = frame.display_message().to_string();
+        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        Event::LogFrame(LogFrame { level, message, timestamp_ms })
+    }
+}
+```
+
+(`Frame::display_message()` may be called `display(false)` or similar
+in defmt-decoder 1.1; verify exact name during implementation and
+adjust. The spike confirmed `Frame::display(false).to_string()` works.)
+
+#### Step 7.5.c — Confirm PASS on HW
+
+```pwsh
+$env:PAAVO_HW = "1"
+cargo test -p paavo-probe real_session_drive -- --nocapture --ignored
+```
+
+#### Step 7.5.d — Workspace gates + commit
+
+```
+paavo-probe: RealSession::next_event — defmt decode + bkpt detect
+
+Implements the streaming side of the M7 happy path:
+
+  1. poll_rtt_once: drains the first up channel into the defmt
+     StreamDecoder, emits Event::LogFrame for each decoded frame.
+     LogLevel mapping: defmt Trace/Debug/Info/Warn/Error -> paavo
+     LogLevel; absent level defaults to Info.
+  2. Core status: when core.status().is_halted(), emit Event::Bkpt.
+     Drain RTT first so an in-flight "Test OK" doesn't get hidden
+     by an over-eager bkpt return.
+  3. Idle: sleep 50ms slice + Ok(None) so the calling worker stays
+     responsive to its watchdog.
+
+Malformed defmt frames (framing-buffer wrap artifacts) are skipped
+with a tracing::warn; not surfaced as errors. The RTT read buffer is
+sized to the up-channel's buffer size (typically 1024 B).
+
+Tests: real_session_drive.rs (PAAVO_HW=1 + #[ignore]) flashes the
+spike fixture, polls next_event in a 10s budget, asserts BOTH a
+decoded `Test OK` info frame AND a Bkpt event arrive — i.e. the
+happy-path pair that paavo-runner's drive_session needs to map to
+JobOutcome::Passed.
+```
+
+---
+
+### Task 7.6: Stitch `RealRunner` to `paavo_runner::run_job`
+
+The final wiring. RealRunner constructs `JobInputs` + `JobOutputs`,
+hands `paavo_runner::run_job` a `make_session` closure that calls
+`RealSession::connect`, spawns a forwarder that publishes each
+`LogFrame` from the runner's `log_tx` into the live broker, joins the
+worker, maps the outcome.
+
+#### Step 7.6.a — Failing test
+
+`crates/paavod/tests/real_runner_end_to_end.rs` (new):
+
+```rust
+//! PAAVO_HW=1 end-to-end: paavod -> RealRunner -> RealSession ->
+//! real MCX-A266 -> Passed. The other RealRunner tests stub the
+//! probe layer; this one closes the loop.
+
+use paavo_core::Runner;
+use paavo_proto::JobOutcome;
+// ... boot a paavod state on a tempdir, seed a board that matches the
+// MCU-Link selector, insert a job whose tar contains the spike
+// fixture's tar (or just point elf_path at the pre-built ELF and
+// transition_to_running), then call runner.run() and assert
+// JobOutcome::Passed.
+
+#[test]
+#[ignore]
+fn real_runner_passes_against_real_mcxa266() {
+    if std::env::var("PAAVO_HW").is_err() { return; }
+    // ... boilerplate to insert a board + a Running job whose elf_path
+    // points at dev/spike-fixture-mcxa266/.../spike-fixture-mcxa266
+    let outcome = real_runner.run(job_id, "mcxa266-01");
+    assert_eq!(outcome.outcome, JobOutcome::Passed);
+    assert!(outcome.probe_released_cleanly);
+}
+```
+
+(Full boilerplate spelled out during execution; spec'd as a sketch
+here because the exact JobRow setup depends on whatever helpers
+M4.3's dispatch tests already provide.)
+
+#### Step 7.6.b — Replace the RealRunner stub body
+
+In `crates/paavod/src/real_runner.rs`, replace the `InfraErr` body
+with a real run:
+
+```rust
+impl Runner for RealRunner {
+    fn run(&self, job_id: JobId, board_id: &str) -> RunOutcome {
+        // 1. Read elf_path + board spec.
+        let (elf_path, board_spec) = {
+            let db = self.db.lock();
+            let job = match JobRow::find(db.raw_conn(), &job_id) {
+                Ok(Some(j)) => j,
+                _ => return infraerr("real_runner.db_lookup", "job row missing"),
+            };
+            let board = match paavo_db::BoardRow::find(db.raw_conn(), board_id) {
+                Ok(Some(b)) => b,
+                _ => return infraerr("real_runner.db_lookup",
+                    &format!("board {board_id} missing")),
+            };
+            (job.elf_path, board.spec)
+        };
+        let elf_path = match elf_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return infraerr("real_runner.elf",
+                "elf_path NULL on job row — build pipeline did not set it"),
+        };
+
+        // 2. Build JobInputs/Outputs.
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+        let cancel_rx = self.cancellation
+            .take_receiver(&job_id)
+            .unwrap_or_else(|| crossbeam_channel::unbounded().1);
+        let inputs = paavo_runner::JobInputs {
+            job_id,
+            inactivity_timeout_ms: self.config.timeouts.inactivity_s * 1_000,
+            hard_max_ms: self.config.timeouts.hard_max_s * 1_000,
+            probe_release_grace_ms: self.config.timeouts.probe_release_grace_ms,
+            cancel_rx,
+        };
+        let outputs = paavo_runner::JobOutputs { log_tx };
+
+        // 3. Spawn forwarder: log_rx -> JobLogsBroker.
+        let broker = self.job_logs.clone();
+        let fwd = std::thread::spawn(move || {
+            while let Ok(frame) = log_rx.recv() {
+                broker.publish(job_id, crate::job_logs::LiveEvent::Frame(frame));
+            }
+        });
+
+        // 4. Build the make_session closure. RealSession::connect is
+        //    fallible; the runner's worker handles errors via
+        //    JobOutcome::Failed(InfraErr{ stage: "probe_attach" }).
+        let opts = paavo_probe::RealSessionOptions {
+            probe_selector: board_spec.probe_selector.clone(),
+            chip_name: board_spec.chip_name.clone(),
+            elf_path: elf_path.clone(),
+            skip_post_load_reset: board_spec.skip_post_load_reset,
+        };
+        let make_session = move || -> paavo_probe::Result<Box<dyn paavo_probe::ProbeSession>> {
+            let s = paavo_probe::RealSession::connect(opts)?;
+            Ok(Box::new(s) as Box<dyn paavo_probe::ProbeSession>)
+        };
+
+        // 5. Run the worker to completion.
+        let handle = paavo_runner::run_job(inputs, outputs, make_session);
+        let outcome = handle.join();
+        // Forwarder exits when log_tx is dropped (which happens when
+        // the worker thread exits, which has already happened by the
+        // time `join()` returns).
+        let _ = fwd.join();
+
+        RunOutcome { outcome, probe_released_cleanly: true }
+    }
+}
+
+fn infraerr(stage: &str, message: &str) -> RunOutcome {
+    RunOutcome {
+        outcome: JobOutcome::Failed(TerminalOutcome::InfraErr {
+            stage: stage.into(),
+            message: message.into(),
+        }),
+        probe_released_cleanly: true,
+    }
+}
+```
+
+Add `CancellationRegistry::take_receiver(&JobId) -> Option<Receiver<RunCommand>>`
+in `crates/paavod/src/cancellation.rs` (new method; preserves the
+sender for `cancel` to use, hands the receiver to RealRunner). Test
+the new method in `cancellation.rs`'s unit tests.
+
+#### Step 7.6.c — Confirm PASS on HW
+
+```pwsh
+cargo build --release --manifest-path dev/spike-fixture-mcxa266/Cargo.toml
+$env:PAAVO_HW = "1"
+cargo test -p paavod real_runner_end_to_end -- --nocapture --ignored
+```
+
+#### Step 7.6.d — Workspace gates + commit
+
+```
+paavod: RealRunner stitches paavo_runner::run_job + RealSession
+
+Closes the M7 happy path. RealRunner::run now:
+
+  1. Reads elf_path + board spec from DB.
+  2. Builds JobInputs (timeouts from config) + JobOutputs (a fresh
+     log channel) + takes the cancel rx from the registry (M7-stub:
+     the rx is consumed but the inner loop doesn't act on it; M8).
+  3. Spawns a forwarder thread that pumps each LogFrame from the
+     runner's log_rx into the live JobLogsBroker, so live tailers
+     see decoded defmt as it streams.
+  4. Builds a make_session closure that calls RealSession::connect
+     with the board's probe_selector + chip_name + the job's
+     elf_path. The runner handles connect-time errors via its own
+     InfraErr{stage: "probe_attach"} path.
+  5. Calls paavo_runner::run_job, joins, returns RunOutcome.
+
+CancellationRegistry gains `take_receiver(&JobId)` — preserves the
+sender (so `cancel` still works post-take) and hands the rx half
+to whoever consumes it. New unit test covers the take semantics.
+
+Tests: crates/paavod/tests/real_runner_end_to_end.rs (PAAVO_HW=1
++ #[ignore]) is THE M7 demo. Seeds a real Board row matching the
+MCU-Link selector, inserts a Running JobRow whose elf_path points
+at the spike fixture, calls runner.run(), asserts JobOutcome::Passed.
+This is the test that proves the whole pipeline closes.
+```
+
+---
+
+### Task 7.7: Manual smoke from the dev desk + docs flip
+
+The pipeline now closes end-to-end programmatically (7.6's test
+proves it). 7.7 walks through the *user-facing* path from Felipe's
+terminal — `paavo-cli new` → `paavo-cli run` → see Passed — and
+flips the validated callout in `hw-smoke-checklist.md`.
+
+#### Step 7.7.a — Run the documented quickstart against real HW
+
+In a fresh terminal:
+
+```pwsh
+# 1. Start paavod against a clean state dir.
+$env:PAAVO_STATE_DIR = "$env:TEMP\paavo-m7-smoke"
+Remove-Item -LiteralPath $env:PAAVO_STATE_DIR -Recurse -Force -ErrorAction Ignore
+cargo run --release -p paavod -- --config dev/m7-paavo.toml &
+
+# 2. Add the MCX-A266 EVK to the inventory.
+$env:PAAVO_HOST = "http://127.0.0.1:8090"
+cargo run --release -p paavo-cli -- board add `
+    --kind mcxa266 `
+    --instance mcxa266-felipe `
+    --probe "1fc9:0143:EDFHUAFM4J5ZJ" `
+    --chip MCXA276 `
+    --target frdm-mcx-a266
+
+# 3. Scaffold a test crate.
+cargo run --release -p paavo-cli -- new hello-mcxa266 --board-kind mcxa266
+cd hello-mcxa266
+
+# 4. Build + submit + tail.
+cargo run --release -p paavo-cli -- run -p .
+```
+
+Expected: NDJSON tail prints decoded defmt frames as the test runs,
+ending with the terminal frame:
+
+```json
+{"terminal":"passed"}
+```
+
+If anything in this sequence fails, fix it in the relevant code
+crate and re-run. The "fix" commits get folded into whichever
+prior 7.x sub-task they touch — do not let 7.7 become a junk
+drawer of unrelated patches.
+
+#### Step 7.7.b — Flip the hw-smoke-checklist Status callout
+
+`docs/hw-smoke-checklist.md`:
+
+```diff
+-> **Status**: not yet validated on real HW. The checklist below is
+-> the contract; expect minor wording adjustments once 7.7 runs through
+-> it end-to-end against an MCX-A266.
++> **Status**: validated on Windows host + MCX-A266 EVK + MCU-Link on
++> 2026-06-?? (Felipe's dev box). Linux + rt685-evk remain unvalidated;
++> see spec §17 "Deferred from M7" for the M8 follow-up list.
+```
+
+Add a Windows-host subsection if not already present:
+
+```markdown
+## Windows host notes
+
+probe-rs on Windows talks to the MCU-Link via WinUSB; no driver
+install is needed for CMSIS-DAP v2. The `contrib/99-probes.rules`
+udev file is Linux-only and irrelevant on Windows.
+
+The MCU-Link enumerates as `1fc9:0143` with a per-board serial. Use
+`paavo-cli board add --probe 1fc9:0143:<serial>` to select a specific
+probe when multiple are plugged in. (Felipe's MCX-A266 EVK ships
+with serial `EDFHUAFM4J5ZJ`.)
+
+The probe-rs vendor sequence for MCX-A276 emits a one-time WARN
+during attach + reset (`unknown variant, using default watchpoint
+configuration`). Cosmetic. paavod's tracing filter
+(`probe_rs=warn`) lets it through; that's intentional so the
+operator can spot real probe-rs warnings.
+```
+
+#### Step 7.7.c — Commit
+
+```
+docs: M7 validated on real MCX-A266; flip hw-smoke-checklist Status
+
+Walked the documented quickstart end to end on the Windows dev box
+with the MCX-A266 EVK + MCU-Link on-board CMSIS-DAP v3.172. Sequence:
+
+  paavod up
+  paavo-cli board add (1fc9:0143:EDFHUAFM4J5ZJ, chip=MCXA276)
+  paavo-cli new hello-mcxa266 --board-kind mcxa266
+  cd hello-mcxa266 && paavo-cli run -p .
+  → NDJSON tail prints decoded defmt frames
+  → {"terminal":"passed"}
+
+Status callout in hw-smoke-checklist.md flipped from "not yet
+validated" to "validated on Windows host + MCX-A266 + MCU-Link
+on <date>". Added a Windows host subsection covering: no udev
+needed; selector by serial; expected one-time vendor-sequence
+WARN.
+
+rt685-evk + Linux remain unvalidated; per spec §17 "Deferred from
+M7", they roll to M8.
+```
+
+### Milestone 7 exit criteria
+
+- [x] M7.0 spike committed with API findings (`82d0934`)
+- [ ] `templates/mcxa266` compiles via `cargo check --target thumbv8m.main-none-eabihf` against `embassy-mcxa 0.1.0`
+- [ ] `paavo-cli new --board-kind mcxa266 --name X` scaffolds a buildable crate
+- [ ] `paavod::real_runner::RealRunner` reads `elf_path` from DB; reports clear errors with stage prefixes
+- [ ] `paavo-probe::RealSession::connect` flashes + RTT-attaches against real MCX-A266
+- [ ] `paavo-probe::RealSession::next_event` emits decoded `LogFrame` events + `Bkpt` event
+- [ ] End-to-end `paavo-cli run -p ./hello-mcxa266` against real HW returns `Passed`
+- [ ] `docs/hw-smoke-checklist.md` Status callout flipped to validated
+- [ ] `cargo test --workspace` green (PAAVO_HW=1 tests stay `#[ignore]`'d in CI)
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` green
+- [ ] `cargo fmt --all -- --check` green
+
+---
+
 ## Whole-workspace exit criteria
 
 - [ ] `cargo build --workspace` green
@@ -15623,7 +17267,7 @@ Surfaced from the M6 exit-criteria review:
 - [ ] `cargo fmt --all -- --check` green
 - [ ] CI workflow (`.github/workflows/ci.yml`) green on push
 - [ ] Every section §1–§17 of the spec has at least one task implementing it (see self-review section below)
-- [ ] HW smoke checklist (`docs/hw-smoke-checklist.md`) passes on real mcxa266 + rt685-evk
+- [ ] HW smoke checklist (`docs/hw-smoke-checklist.md`) passes on real mcxa266 (M7 closes this for mcxa266 / Windows; rt685-evk + Linux remain deferred per spec §17 "Deferred from M7")
 
 ---
 
@@ -15649,9 +17293,10 @@ Done after writing the plan, applied inline. Captured here for the executor's re
 | §12 cargo-generate templates, §12.4 shared linker | M6.1 (linker), M6.2 (mcxa266), M6.3 (rt685-evk) |
 | §13 Configuration | M4.1 (config schema + loader) |
 | §14 Deployment, §14.1 systemd, §14.2 udev, §14.3 security | M6.5 (contrib) |
-| §15 Testing strategy | applied throughout — every public function has a TDD test |
+| §15 Testing strategy | applied throughout — every public function has a TDD test; M7 adds PAAVO_HW=1 gate convention |
 | §16 Prerequisite work (inactivity_timeout!() upstream) | M1.2 (lives in paavo-meta until upstreamed; spec §16.1) |
-| §17 Deferred-to-v2 | n/a (no tasks) |
+| §17 Deferred-to-v2 + §17 Deferred-from-M7 | n/a (no tasks) |
+| §3.1 RealRunner wiring note + §10.5 paavo-cli new contract | M7 (RealRunner+RealSession+cli new) |
 
 **Type consistency notes (resolved during write):**
 
