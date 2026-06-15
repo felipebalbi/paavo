@@ -1,0 +1,14 @@
+[template]
+description = "paavo test crate for the mcxa266 board kind"
+ignore = ["target", "Cargo.lock"]
+
+[placeholders.test-kind]
+type = "string"
+prompt = "Test kind: quick or soak?"
+choices = ["quick", "soak"]
+default = "quick"
+
+[placeholders.embassy-rev]
+type = "string"
+prompt = "embassy-rs/embassy revision (branch, tag, or SHA)"
+default = "main"
