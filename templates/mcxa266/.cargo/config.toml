@@ -22,6 +22,26 @@ target = "thumbv8m.main-none-eabihf"
 DEFMT_LOG = "trace"
 
 [target.thumbv8m.main-none-eabihf]
+# `cargo run --release` flashes the ELF onto the attached MCX-A266 EVK
+# via probe-rs and streams defmt frames to the terminal. The chip name
+# must be `MCXA276` — NOT MCXA266 or MCXA256. probe-rs's NXP support
+# advertises the MCX-A2xx family under that name regardless of the
+# specific SKU silkscreen; using anything else fails with "chip not
+# found in built-in target list". Confirmed against MCU-Link
+# CMSIS-DAP V3.172 (VID 0x1fc9, PID 0x0143) on the FRDM-MCXA266 EVK
+# during the M7.0 spike; see dev/probe-rs-spike/FINDINGS.md.
+#
+# `--catch-reset` halts the core at the reset vector before running so
+# RTT comes up cleanly, mirroring what paavod does. Drop it if you'd
+# rather see boot-time defmt frames at the cost of occasionally
+# missing the first frame.
+#
+# This runner makes `cargo run --release` the local-validation
+# equivalent of `paavo-cli run --follow .`: the scaffold runs against
+# the same hardware, with the same ELF, without paavod in the path.
+# Useful for isolating "is this paavo's bug or my code's bug" during
+# debugging.
+runner = "probe-rs run --chip MCXA276 --catch-reset"
 rustflags = [
   # NOTE: -Tlink_ram.x is emitted by build.rs (cargo:rustc-link-arg),
   # NOT here. paavo tests run from RAM (teleprobe convention); link_ram.x

@@ -276,4 +276,28 @@ fn templates_mcxa266_smoke_renders_dot_cargo_config() {
          `-Tlink_ram.x`; both INCLUDE memory.x and conflict). \
          .cargo/config.toml:\n{cargo_config}"
     );
+
+    // ─── #7: `runner = "probe-rs run --chip MCXA276 ..."`.
+    // Without a runner, `cargo run --release` from the scaffold
+    // crate fails with "binary file not executable" — cargo doesn't
+    // know how to invoke a thumbv8m ELF on the host. Setting probe-rs
+    // run as the runner makes the scaffold locally runnable without
+    // paavo in the loop ("does the scaffold itself work on the
+    // hardware?" is the first question to answer when paavod fails
+    // and the user wants to isolate). MCXA276 (NOT MCXA266) is the
+    // probe-rs target name for the whole MCX-A2xx family.
+    assert!(
+        cargo_config.contains("runner = \"probe-rs run"),
+        ".cargo/config.toml must set a `runner` invoking probe-rs run \
+         so `cargo run --release` works as a local-validation \
+         equivalent of `paavo-cli run --follow .`. \
+         .cargo/config.toml:\n{cargo_config}"
+    );
+    assert!(
+        cargo_config.contains("--chip MCXA276"),
+        ".cargo/config.toml's runner must target chip MCXA276 (NOT \
+         MCXA266 / MCXA256 — probe-rs advertises the whole MCX-A2xx \
+         family under MCXA276; see dev/probe-rs-spike/FINDINGS.md). \
+         .cargo/config.toml:\n{cargo_config}"
+    );
 }
