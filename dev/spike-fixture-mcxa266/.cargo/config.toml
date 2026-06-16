@@ -1,7 +1,18 @@
 [target.thumbv8m.main-none-eabihf]
 rustflags = [
-  "-C", "link-arg=-Tlink.x",
-  "-C", "link-arg=-Tdefmt.x",
+  # NOTE: -Tlink_ram.x is emitted by build.rs (cargo:rustc-link-arg),
+  # NOT here. The spike fixture runs from RAM (teleprobe convention);
+  # link_ram.x is mutually exclusive with cortex-m-rt's flash-resident
+  # `link.x`, so don't pass `-Tlink.x` here — both would `INCLUDE
+  # memory.x` and produce duplicate-region errors. Mirrors the
+  # templates/mcxa266/.cargo/config.toml comment block on this same
+  # point.
+  "-C", "link-arg=-Tdefmt.x",      # defmt's relocation section
+  # --nmagic disables page alignment of sections. cortex-m-rt's link
+  # scripts assume the RAM origin is 0x10000-aligned; without --nmagic
+  # the linker may produce broken outputs when sections aren't aligned.
+  # See https://github.com/rust-embedded/cortex-m-quickstart/pull/95
+  "-C", "link-arg=--nmagic",
 ]
 
 [build]
