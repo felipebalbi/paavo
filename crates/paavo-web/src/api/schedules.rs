@@ -31,8 +31,10 @@ pub async fn list(
         .clamp(1, 100);
     let err = |e: paavo_db::DbError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     let total = s.db.schedules_count().map_err(err)?;
+    // saturating_mul: guards an unclamped `page` from overflowing u32
+    // (see api/boards.rs for the rationale).
     let rows =
-        s.db.schedules_page((page - 1) * per_page, per_page)
+        s.db.schedules_page((page - 1).saturating_mul(per_page), per_page)
             .map_err(err)?;
     Ok(Json(Page {
         items: rows.into_iter().map(schedule_view).collect(),

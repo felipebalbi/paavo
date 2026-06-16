@@ -13,7 +13,9 @@
 //!   client-side routing (`/jobs/:id` etc. are virtual routes the WASM
 //!   resolves, not server paths);
 //! - if the UI was never built (`dist/` absent at compile time, e.g. a
-//!   backend-only checkout), a placeholder explains how to build it.
+//!   backend-only checkout), `#[allow_missing]` lets the crate still
+//!   compile and every request falls through to a placeholder that
+//!   explains how to build it.
 //!
 //! `dist/` is git-ignored and produced out of band (`just build-ui` /
 //! `trunk build`), so the embedded set reflects whatever was present
@@ -23,8 +25,15 @@ use axum::response::{Html, IntoResponse, Response};
 
 /// Compile-time snapshot of `paavo-web-ui/dist`. The path is relative
 /// to this crate's `CARGO_MANIFEST_DIR` (`crates/paavo-web`).
+///
+/// `allow_missing` keeps `paavo-web` compilable on a fresh checkout/CI
+/// where `dist/` has not been produced yet: rust-embed normally hard-
+/// errors on an absent `#[folder]`. With it absent the generated asset
+/// set is empty and [`serve`] returns the not-built placeholder; a
+/// later `just build-ui` populates the real bundle.
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../paavo-web-ui/dist"]
+#[allow_missing = true]
 struct Assets;
 
 /// Shown when no `index.html` was embedded (the UI bundle was never

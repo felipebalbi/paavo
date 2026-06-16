@@ -32,8 +32,11 @@ pub async fn list(
         .clamp(1, 100);
     let err = |e: paavo_db::DbError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     let total = s.db.boards_count().map_err(err)?;
+    // saturating_mul: `page` is unclamped above, so a hostile
+    // `?page=4000000000` would overflow u32 (panic in debug, wrap in
+    // release). Saturating to u32::MAX yields an empty page instead.
     let rows =
-        s.db.boards_page((page - 1) * per_page, per_page)
+        s.db.boards_page((page - 1).saturating_mul(per_page), per_page)
             .map_err(err)?;
     Ok(Json(Page {
         items: rows.into_iter().map(board_view).collect(),

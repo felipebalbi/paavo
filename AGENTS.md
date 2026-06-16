@@ -255,10 +255,11 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
     WASM SPA** (`paavo-web-ui`) via `rust-embed` over
     `../paavo-web-ui/dist`, **not** server-rendered HTML. The `dist/`
     bundle is git-ignored and built out of band (`trunk build` /
-    `just build-ui`); rust-embed does **not** generate its accessors when
-    `dist/` is absent, so `paavo-web` won't compile until the UI bundle
-    exists. CI/fresh checkouts must build the UI before
-    `cargo build/test --workspace`.
+    `just build-ui`). The `rust-embed` derive uses `#[allow_missing =
+    true]`, so `paavo-web` still **compiles without `dist/`** (every
+    request then serves a "UI not built" placeholder) — a fresh
+    checkout/CI passes `cargo build/test --workspace` without the UI,
+    but you must run `just build-ui` to serve the real SPA.
   - `paavo-meta` is **self-contained `macro_rules!` macros**, not a
     re-export of any upstream `*-meta` crate.
   - `insta`, `proptest`, and `mockall` are pinned in
