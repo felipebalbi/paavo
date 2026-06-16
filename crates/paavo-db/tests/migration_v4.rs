@@ -14,9 +14,12 @@ fn v4_preserves_data_and_allows_awaiting_board() {
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
     // Apply the full pre-V4 schema (V1 + V2 + V3).
-    conn.execute_batch(include_str!("../migrations/V1__initial.sql")).unwrap();
-    conn.execute_batch(include_str!("../migrations/V2__cargo_update_packages.sql")).unwrap();
-    conn.execute_batch(include_str!("../migrations/V3__skip_cache.sql")).unwrap();
+    conn.execute_batch(include_str!("../migrations/V1__initial.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("../migrations/V2__cargo_update_packages.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("../migrations/V3__skip_cache.sql"))
+        .unwrap();
 
     // Seed a board + a running job + two log frames. cargo_update_packages
     // and skip_cache fall back to their column defaults.
@@ -30,7 +33,8 @@ fn v4_preserves_data_and_allows_awaiting_board() {
     ).unwrap();
 
     // Apply V4.
-    conn.execute_batch(include_str!("../migrations/V4__awaiting_board.sql")).unwrap();
+    conn.execute_batch(include_str!("../migrations/V4__awaiting_board.sql"))
+        .unwrap();
 
     // Job survived (state + the V2/V3 columns).
     let (state, pkgs, skip): (String, String, i64) = conn
@@ -46,7 +50,11 @@ fn v4_preserves_data_and_allows_awaiting_board() {
 
     // Logs survived (no cascade loss).
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM log_frame WHERE job_id='j1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM log_frame WHERE job_id='j1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 2, "log_frame rows must survive the job rebuild");
 
@@ -67,7 +75,11 @@ fn v4_preserves_data_and_allows_awaiting_board() {
     // ON DELETE CASCADE still wired: deleting a job clears its frames.
     conn.execute("DELETE FROM job WHERE id='j1'", []).unwrap();
     let n2: i64 = conn
-        .query_row("SELECT COUNT(*) FROM log_frame WHERE job_id='j1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM log_frame WHERE job_id='j1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n2, 0, "cascade delete must still fire after rebuild");
 }

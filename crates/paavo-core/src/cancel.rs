@@ -61,11 +61,7 @@ pub fn cancel_if_submitted(
 /// Single-writer assumption matches `cancel_if_submitted`: the dispatch
 /// thread is the only other writer, and `JobRow::finalize`'s WHERE-state
 /// guard catches a racing terminal transition.
-pub fn cancel_if_pending(
-    conn: &Connection,
-    id: &JobId,
-    now_ms: i64,
-) -> Result<Option<JobOutcome>> {
+pub fn cancel_if_pending(conn: &Connection, id: &JobId, now_ms: i64) -> Result<Option<JobOutcome>> {
     let row = paavo_db::JobRow::get(conn, id)?;
     if !matches!(row.state, JobState::Submitted | JobState::AwaitingBoard) {
         return Err(CoreError::NotCancellable { state: row.state });

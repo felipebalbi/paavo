@@ -338,7 +338,8 @@ fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
     );
 
     // AwaitingBoard still holds no board → still eligible.
-    paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job_id, "/elf").unwrap();
+    paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job_id, "/elf")
+        .unwrap();
     let rows = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel).unwrap();
     assert_eq!(
         rows.len(),

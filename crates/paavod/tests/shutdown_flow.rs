@@ -47,7 +47,8 @@ fn make_state(tmp: &std::path::Path) -> AppState {
             timeouts: TimeoutsConfig::default(),
             scheduler: SchedulerConfig {
                 nightly_cron: "0 0 19 * * *".into(),
-                starvation_threshold_s: 21_600, max_concurrent_builds: 5,
+                starvation_threshold_s: 21_600,
+                max_concurrent_builds: 5,
             },
             build_cache: BuildCacheConfig::default(),
             retention: RetentionConfig::default(),
@@ -56,7 +57,8 @@ fn make_state(tmp: &std::path::Path) -> AppState {
         }),
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
+        cancellation: CancellationRegistry::default(),
+        build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     }
 }

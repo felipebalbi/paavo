@@ -106,7 +106,12 @@ fn cancel_if_pending_aborts_submitted() {
     insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
     let id = enqueue_with(&db, NOW, |_| {});
     let out = paavo_core::cancel_if_pending(db.raw_conn(), &id, NOW + 1).unwrap();
-    assert_eq!(out, Some(JobOutcome::Aborted { by: AbortReason::User }));
+    assert_eq!(
+        out,
+        Some(JobOutcome::Aborted {
+            by: AbortReason::User
+        })
+    );
     assert_eq!(
         paavo_db::JobRow::get(db.raw_conn(), &id).unwrap().state,
         JobState::Aborted
@@ -122,7 +127,12 @@ fn cancel_if_pending_aborts_awaiting_board() {
     paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &id, "/e.elf").unwrap();
 
     let out = paavo_core::cancel_if_pending(db.raw_conn(), &id, NOW + 2).unwrap();
-    assert_eq!(out, Some(JobOutcome::Aborted { by: AbortReason::User }));
+    assert_eq!(
+        out,
+        Some(JobOutcome::Aborted {
+            by: AbortReason::User
+        })
+    );
     assert_eq!(
         paavo_db::JobRow::get(db.raw_conn(), &id).unwrap().state,
         JobState::Aborted

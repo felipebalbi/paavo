@@ -45,7 +45,8 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
+            starvation_threshold_s: 21_600,
+            max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
@@ -62,7 +63,8 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
         inventory: Arc::new(Mutex::new(inv)),
         drain: DrainState::default(),
         job_logs: paavod::job_logs::JobLogsBroker::new(),
-        cancellation: paavod::cancellation::CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
+        cancellation: paavod::cancellation::CancellationRegistry::default(),
+        build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
     }
 }
 
@@ -154,8 +156,7 @@ async fn ten_submits_are_all_accepted() {
     let mut ids = std::collections::HashSet::new();
     for i in 0..10 {
         let app = build_router(s.clone());
-        let body =
-            make_multipart_body(format!("tar-{i}").as_bytes(), &default_meta().to_string());
+        let body = make_multipart_body(format!("tar-{i}").as_bytes(), &default_meta().to_string());
         let resp = app.oneshot(submit_request(body)).await.unwrap();
         assert_eq!(
             resp.status(),

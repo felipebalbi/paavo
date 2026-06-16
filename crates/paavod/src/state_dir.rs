@@ -77,6 +77,9 @@ mod tests {
         for i in 0..3 {
             assert!(sd.build_slot_dir(i).is_dir(), "slot {i} dir must exist");
         }
-        assert_eq!(sd.build_slot_dir(0), tmp.path().join("build-slots").join("0"));
+        assert_eq!(
+            sd.build_slot_dir(0),
+            tmp.path().join("build-slots").join("0")
+        );
     }
 }

@@ -22,7 +22,13 @@ fn pick_buildable_returns_submitted_and_skips_in_flight_blake3() {
 
     // A distinct-blake3 job IS buildable.
     let c = enqueue_with(&db, 300, |req| req.tar_blake3 = "y".into());
-    assert_eq!(pick_buildable(db.raw_conn(), CFG, 1000).unwrap().unwrap().id, c);
+    assert_eq!(
+        pick_buildable(db.raw_conn(), CFG, 1000)
+            .unwrap()
+            .unwrap()
+            .id,
+        c
+    );
 }
 
 #[test]
@@ -44,7 +50,9 @@ fn pick_runnable_returns_awaiting_with_free_board_else_none() {
     JobRow::transition_submitted_to_building(db.raw_conn(), &b, 210).unwrap();
     JobRow::transition_building_to_awaiting_board(db.raw_conn(), &b, "/e2.elf").unwrap();
     assert_eq!(
-        pick_runnable(db.raw_conn(), CFG, 1000).unwrap().map(|p| p.job.id),
+        pick_runnable(db.raw_conn(), CFG, 1000)
+            .unwrap()
+            .map(|p| p.job.id),
         None
     );
     assert_eq!(

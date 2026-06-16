@@ -426,7 +426,10 @@ fn two_stage_transitions_submitted_to_running() {
         },
     )
     .unwrap();
-    assert_eq!(JobRow::get(db.raw_conn(), &id).unwrap().state, JobState::Passed);
+    assert_eq!(
+        JobRow::get(db.raw_conn(), &id).unwrap().state,
+        JobState::Passed
+    );
 }
 
 #[test]
@@ -450,5 +453,8 @@ fn finalize_allowed_from_awaiting_board() {
         },
     )
     .unwrap();
-    assert_eq!(JobRow::get(db.raw_conn(), &id).unwrap().state, JobState::Aborted);
+    assert_eq!(
+        JobRow::get(db.raw_conn(), &id).unwrap().state,
+        JobState::Aborted
+    );
 }

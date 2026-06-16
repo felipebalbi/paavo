@@ -124,7 +124,8 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
+            starvation_threshold_s: 21_600,
+            max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
@@ -142,7 +143,8 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
         config: cfg,
         inventory: Arc::new(Mutex::new(inventory)),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
+        cancellation: CancellationRegistry::default(),
+        build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
     (state, job_id, tmp)
@@ -315,7 +317,8 @@ async fn dispatch_exits_loop_on_drain_when_no_jobs_in_flight() {
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
+            starvation_threshold_s: 21_600,
+            max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
@@ -327,7 +330,8 @@ async fn dispatch_exits_loop_on_drain_when_no_jobs_in_flight() {
         config: cfg,
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
+        cancellation: CancellationRegistry::default(),
+        build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
@@ -602,7 +606,10 @@ async fn build_stage_respects_cap_and_builds_without_a_board() {
     );
     let peak = max.load(Ordering::SeqCst);
     assert!(peak <= 2, "cap exceeded: peak concurrent builds = {peak}");
-    assert_eq!(peak, 2, "cap should actually be reached with 4 jobs / 2 slots");
+    assert_eq!(
+        peak, 2,
+        "cap should actually be reached with 4 jobs / 2 slots"
+    );
 
     state.drain.set_draining();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;

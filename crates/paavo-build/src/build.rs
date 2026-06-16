@@ -194,8 +194,13 @@ pub fn build_release_streaming_cancellable(
     // operators scripting against it expect it not to drift on update
     // failures. Tail returned from these calls is therefore discarded.
     for pkg in &plan.cargo_update_packages {
-        let _tail =
-            run_cargo_streaming(&cargo, &["update", "-p", pkg], plan, lines.clone(), &cancel_rx)?;
+        let _tail = run_cargo_streaming(
+            &cargo,
+            &["update", "-p", pkg],
+            plan,
+            lines.clone(),
+            &cancel_rx,
+        )?;
     }
 
     let stderr_tail =
@@ -470,7 +475,10 @@ mod tests {
             c.args(["-c", "sleep 30"]);
             c
         };
-        c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        c.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     #[test]

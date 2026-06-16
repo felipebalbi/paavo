@@ -213,12 +213,12 @@ fn build_inner(
                 &elf_path.display().to_string(),
             ) {
                 Ok(()) => BuildStageOutcome::Advanced,
-                Err(e) => BuildStageOutcome::Terminal(JobOutcome::Failed(
-                    TerminalOutcome::InfraErr {
+                Err(e) => {
+                    BuildStageOutcome::Terminal(JobOutcome::Failed(TerminalOutcome::InfraErr {
                         stage: "transition_awaiting_board".into(),
                         message: e.to_string(),
-                    },
-                )),
+                    }))
+                }
             };
         }
     }
@@ -243,7 +243,11 @@ fn build_inner(
                         paavo_build::BuildStream::Stdout => "cargo:stdout",
                         paavo_build::BuildStream::Stderr => "cargo:stderr",
                     };
-                    sink.push(paavo_proto::LogLevel::Info, Some(target.to_string()), bl.text);
+                    sink.push(
+                        paavo_proto::LogLevel::Info,
+                        Some(target.to_string()),
+                        bl.text,
+                    );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => sink.tick(),
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -281,22 +285,23 @@ fn build_inner(
             if let Err(e) = cache_store(db.raw_conn(), &job.tar_blake3, &stable, now2) {
                 warn!(error = %e, job_id = %job.id, "dispatch: cache_store failed; continuing");
             }
-            match JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job.id, &stable_str) {
+            match JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job.id, &stable_str)
+            {
                 Ok(()) => BuildStageOutcome::Advanced,
-                Err(e) => BuildStageOutcome::Terminal(JobOutcome::Failed(
-                    TerminalOutcome::InfraErr {
+                Err(e) => {
+                    BuildStageOutcome::Terminal(JobOutcome::Failed(TerminalOutcome::InfraErr {
                         stage: "transition_awaiting_board".into(),
                         message: e.to_string(),
-                    },
-                )),
+                    }))
+                }
             }
         }
         BuildOutcome::Failed(stderr) => {
             BuildStageOutcome::Terminal(JobOutcome::Failed(TerminalOutcome::BuildErr { stderr }))
         }
-        BuildOutcome::Cancelled => {
-            BuildStageOutcome::Terminal(JobOutcome::Aborted { by: AbortReason::User })
-        }
+        BuildOutcome::Cancelled => BuildStageOutcome::Terminal(JobOutcome::Aborted {
+            by: AbortReason::User,
+        }),
     }
 }
 
@@ -374,7 +379,9 @@ fn finalize_run(
             warn!(error = %e, board_id, "dispatch: apply_outcome_to_board failed");
         }
     }
-    state.job_logs.publish(*job_id, LiveEvent::Terminal(outcome));
+    state
+        .job_logs
+        .publish(*job_id, LiveEvent::Terminal(outcome));
     state.job_logs.finalize(*job_id);
     state.cancellation.unregister(job_id);
 }
@@ -398,7 +405,9 @@ fn finalize_terminal(state: &AppState, job_id: &JobId, outcome: JobOutcome) {
             warn!(error = %e, %job_id, "dispatch: finalize_terminal failed");
         }
     }
-    state.job_logs.publish(*job_id, LiveEvent::Terminal(outcome));
+    state
+        .job_logs
+        .publish(*job_id, LiveEvent::Terminal(outcome));
     state.job_logs.finalize(*job_id);
 }
 
