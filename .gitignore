@@ -10,6 +10,9 @@ Cargo.lock.bak
 # Git worktrees for isolated feature work (using-git-worktrees skill).
 /.worktrees/
 
+# Brainstorming visual-companion mockups (superpowers skill scratch space).
+/.superpowers/
+
 # paavod runtime state (when run locally for dev)
 /var-paavo/
 *.sqlite
