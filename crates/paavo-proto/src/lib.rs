@@ -17,6 +17,7 @@ mod board;
 mod ids;
 mod job;
 mod log;
+mod stream;
 
 pub use board::{BoardHealth, BoardSelector, BoardSpec, BoardView, ProbeSelector};
 pub use ids::JobId;
@@ -25,3 +26,4 @@ pub use job::{
     TimeoutReason,
 };
 pub use log::{LogFrame, LogLevel};
+pub use stream::{JobPhase, WireMessage};

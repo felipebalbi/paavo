@@ -2,6 +2,7 @@
 
 use crate::client::Client;
 use anyhow::Result;
+use paavo_proto::WireMessage;
 use serde_json::Value;
 
 /// `paavo-cli cancel <id>`.
@@ -15,11 +16,18 @@ pub async fn cancel(client: &Client, job_id: &str) -> Result<()> {
 
 /// `paavo-cli logs <id> [--follow]`.
 ///
-/// Parses NDJSON lines per spec §9.2: one JSON object per line, with
-/// `type` in {frame, terminal, lagged, truncated}. Frame messages
-/// print to stdout; the terminal line prints a summary and returns.
-/// Lagged/truncated markers print to stderr so they don't pollute
-/// command-output capture.
+/// Parses NDJSON lines per spec §9.2 / `paavo_proto::WireMessage`:
+/// one JSON object per line, with `type` in {frame, terminal,
+/// lagged, truncated, phase}. Frame messages print to stdout; the
+/// terminal line prints a summary and returns. Lagged/truncated/
+/// phase markers print to stderr so they don't pollute command-
+/// output capture.
+///
+/// Forward-compat: a future paavod variant that adds a new `type`
+/// fails `serde_json::from_str::<WireMessage>`, surfaces here as a
+/// "skipping malformed stream line" stderr note, and the loop
+/// continues. Older paavo-cli builds will not panic on a daemon
+/// upgrade.
 pub async fn logs(client: &Client, job_id: &str, _follow: bool) -> Result<()> {
     let mut resp = client.stream(job_id).await?;
     let mut buf = String::new();
@@ -31,32 +39,34 @@ pub async fn logs(client: &Client, job_id: &str, _follow: bool) -> Result<()> {
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                eprintln!("paavo-cli: skipping malformed stream line: {line}");
-                continue;
-            };
-            match v["type"].as_str() {
-                Some("frame") => {
-                    let msg = v["frame"]["message"].as_str().unwrap_or("");
-                    println!("{msg}");
+            let msg = match serde_json::from_str::<WireMessage>(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("paavo-cli: skipping malformed stream line: {e}: {line}");
+                    continue;
                 }
-                Some("terminal") => {
-                    println!("--- terminal: {}", v["outcome"]);
+            };
+            match msg {
+                WireMessage::Frame { frame } => println!("{}", frame.message),
+                WireMessage::Terminal { outcome } => {
+                    // Use serde_json to render the outcome verbatim so
+                    // operators see the same JSON the daemon emitted —
+                    // no Display reimplementation drift.
+                    let outcome_json = serde_json::to_string(&outcome).unwrap_or_default();
+                    println!("--- terminal: {outcome_json}");
                     return Ok(());
                 }
-                Some("lagged") => {
+                WireMessage::Lagged { missed } => {
                     eprintln!(
-                        "paavo-cli: log stream lagged ({} frames missed)",
-                        v["missed"].as_u64().unwrap_or(0),
+                        "paavo-cli: log stream lagged ({missed} frames missed)"
                     );
                 }
-                Some("truncated") => {
-                    eprintln!(
-                        "paavo-cli: log stream truncated: {}",
-                        v["reason"].as_str().unwrap_or("<no reason>"),
-                    );
+                WireMessage::Truncated { reason } => {
+                    eprintln!("paavo-cli: log stream truncated: {reason}");
                 }
-                _ => {}
+                WireMessage::Phase { phase } => {
+                    eprintln!("paavo-cli: phase = {phase:?}");
+                }
             }
         }
     }

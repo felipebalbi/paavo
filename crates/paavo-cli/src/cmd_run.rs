@@ -222,50 +222,52 @@ async fn stream_logs(client: &Client, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse one NDJSON line from `/jobs/:id/stream` (spec §9.2). Frames
-/// print as `<message>`; the terminal line prints a summary and exits
-/// with 0 for Passed, 1 otherwise. `lagged` and `truncated` markers
-/// print to stderr so they don't pollute the test-output capture.
+/// Parse one NDJSON line from `/jobs/:id/stream` (spec §9.2 /
+/// `paavo_proto::WireMessage`). Frames print as `<message>`; the
+/// terminal line prints a summary and exits with 0 for Passed, 1
+/// otherwise. `lagged`/`truncated`/`phase` markers print to stderr so
+/// they don't pollute the test-output capture.
+///
+/// Forward-compat: a future paavod variant that adds a new `type`
+/// fails `serde_json::from_str::<WireMessage>` and surfaces here as
+/// a "skipping malformed stream line" stderr note. Older paavo-cli
+/// builds never panic on a daemon upgrade — the daemon's wire
+/// shape is additive-only by contract (see `paavo-proto`'s
+/// `WireMessage` rustdoc).
 fn handle_ndjson_line(line: &str) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        eprintln!("paavo-cli: skipping malformed stream line: {line}");
-        return;
+    use paavo_proto::{JobOutcome, WireMessage};
+    let msg = match serde_json::from_str::<WireMessage>(line) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("paavo-cli: skipping malformed stream line: {e}: {line}");
+            return;
+        }
     };
-    match v["type"].as_str() {
-        Some("frame") => {
-            let msg = v["frame"]["message"].as_str().unwrap_or("");
-            println!("{msg}");
+    match msg {
+        WireMessage::Frame { frame } => println!("{}", frame.message),
+        WireMessage::Terminal { outcome } => {
+            // Render the outcome JSON so it matches what the daemon
+            // emitted byte-for-byte; avoids hand-written Display drift.
+            let outcome_json = serde_json::to_string(&outcome).unwrap_or_default();
+            println!("--- terminal: {outcome_json}");
+            // Exit 0 only on Passed; everything else is a non-zero
+            // exit so CI scripts can chain on success.
+            std::process::exit(if matches!(outcome, JobOutcome::Passed) { 0 } else { 1 });
         }
-        Some("terminal") => {
-            let outcome = &v["outcome"];
-            // `outcome` is either the string "passed" or a single-key
-            // object like {"failed": {...}} / {"timed_out": {...}} /
-            // {"aborted": {...}}.
-            let tag = outcome
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| outcome.as_object().and_then(|m| m.keys().next().cloned()))
-                .unwrap_or_default();
-            println!("--- terminal: {outcome}");
-            std::process::exit(if tag == "passed" { 0 } else { 1 });
-        }
-        Some("lagged") => {
+        WireMessage::Lagged { missed } => {
             eprintln!(
-                "paavo-cli: log stream lagged ({} frames missed); refetch /jobs/:id for the full log",
-                v["missed"].as_u64().unwrap_or(0),
+                "paavo-cli: log stream lagged ({missed} frames missed); refetch /jobs/:id for the full log"
             );
         }
-        Some("truncated") => {
-            eprintln!(
-                "paavo-cli: log stream truncated: {}",
-                v["reason"].as_str().unwrap_or("<no reason>"),
-            );
+        WireMessage::Truncated { reason } => {
+            eprintln!("paavo-cli: log stream truncated: {reason}");
         }
-        Some(other) => {
-            eprintln!("paavo-cli: unknown stream line type: {other}");
-        }
-        None => {
-            eprintln!("paavo-cli: stream line missing `type`: {line}");
+        WireMessage::Phase { phase } => {
+            // Phase is a UI hint for live viewers (paavo-web's banner).
+            // CLI tail surfaces it on stderr so it doesn't show up in
+            // captured test output, but the operator can still see
+            // "build → run" transitions on a manual `paavo-cli run --follow`.
+            eprintln!("paavo-cli: phase = {phase:?}");
         }
     }
 }

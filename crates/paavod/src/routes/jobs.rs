@@ -585,6 +585,11 @@ pub async fn stream_job(
 
     // 5. Live: stream paged historical frames, then live frames from
     //    rx until Terminal or rx closes.
+    //
+    //    Wire shape: every NDJSON line is `serde_json::to_string` of
+    //    a `paavo_proto::WireMessage`. Locked into byte-compat with
+    //    the prior hand-rolled `serde_json::json!` macros by
+    //    `paavo-proto/tests/wire_compat.rs`.
     let s_for_stream = s.clone();
     let live = async_stream::stream! {
         // Page historical in chunks so memory stays bounded even for
@@ -600,20 +605,15 @@ pub async fn stream_job(
         while let Some(item) = rx.next().await {
             match item {
                 Ok(crate::job_logs::LiveEvent::Frame(f)) => {
-                    yield Ok(ndjson_line(&serde_json::json!({"type":"frame","frame": f})));
+                    yield Ok(wire_line(&paavo_proto::WireMessage::Frame { frame: f }));
                 }
                 Ok(crate::job_logs::LiveEvent::Terminal(o)) => {
-                    yield Ok(ndjson_line(
-                        &serde_json::json!({"type":"terminal","outcome": o}),
-                    ));
+                    yield Ok(wire_line(&paavo_proto::WireMessage::Terminal { outcome: o }));
                     saw_terminal = true;
                     break;
                 }
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    yield Ok(ndjson_line(&serde_json::json!({
-                        "type": "lagged",
-                        "missed": n,
-                    })));
+                    yield Ok(wire_line(&paavo_proto::WireMessage::Lagged { missed: n }));
                 }
             }
         }
@@ -632,21 +632,17 @@ pub async fn stream_job(
             match recovered {
                 Some(row) if row.state.is_terminal() => {
                     if let Some(o) = row.outcome {
-                        yield Ok(ndjson_line(
-                            &serde_json::json!({"type":"terminal","outcome": o}),
-                        ));
+                        yield Ok(wire_line(&paavo_proto::WireMessage::Terminal { outcome: o }));
                     } else {
-                        yield Ok(ndjson_line(&serde_json::json!({
-                            "type": "truncated",
-                            "reason": "terminal DB row has NULL outcome",
-                        })));
+                        yield Ok(wire_line(&paavo_proto::WireMessage::Truncated {
+                            reason: "terminal DB row has NULL outcome".into(),
+                        }));
                     }
                 }
                 _ => {
-                    yield Ok(ndjson_line(&serde_json::json!({
-                        "type": "truncated",
-                        "reason": "live stream ended before terminal",
-                    })));
+                    yield Ok(wire_line(&paavo_proto::WireMessage::Truncated {
+                        reason: "live stream ended before terminal".into(),
+                    }));
                 }
             }
         }
@@ -676,9 +672,7 @@ fn terminal_response(
         for line in historical_lines(&s, &id) {
             yield Ok::<_, Infallible>(line);
         }
-        yield Ok(ndjson_line(
-            &serde_json::json!({"type":"terminal","outcome": outcome}),
-        ));
+        yield Ok(wire_line(&paavo_proto::WireMessage::Terminal { outcome }));
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -705,7 +699,7 @@ fn historical_lines(s: &AppState, id: &JobId) -> Vec<bytes::Bytes> {
             Ok(chunk) => {
                 let n = chunk.len();
                 for f in chunk {
-                    lines.push(ndjson_line(&serde_json::json!({"type":"frame","frame": f})));
+                    lines.push(wire_line(&paavo_proto::WireMessage::Frame { frame: f }));
                 }
                 if n < PAGE as usize {
                     break;
@@ -714,10 +708,9 @@ fn historical_lines(s: &AppState, id: &JobId) -> Vec<bytes::Bytes> {
             }
             Err(e) => {
                 error!(error = %e, %id, "stream_job: db error paging historical frames");
-                lines.push(ndjson_line(&serde_json::json!({
-                    "type": "truncated",
-                    "reason": "db error reading historical frames",
-                })));
+                lines.push(wire_line(&paavo_proto::WireMessage::Truncated {
+                    reason: "db error reading historical frames".into(),
+                }));
                 break;
             }
         }
@@ -725,8 +718,22 @@ fn historical_lines(s: &AppState, id: &JobId) -> Vec<bytes::Bytes> {
     lines
 }
 
-fn ndjson_line(v: &serde_json::Value) -> bytes::Bytes {
-    let mut s = v.to_string();
+/// Serialise a `WireMessage` to one NDJSON line (`"…"\n`) ready to
+/// hand to `Body::from_stream`. The newline terminator is part of
+/// the wire shape — paavo-cli and paavo-web split incoming bytes on
+/// `\n` to recover individual frames.
+///
+/// Replaces the historical `ndjson_line(&serde_json::Value)`. Both
+/// produce byte-identical bytes for the four pre-existing variants;
+/// the new path picks up structural validation (a wrong field name
+/// fails at compile time, not as silent client-side parse failure).
+fn wire_line(msg: &paavo_proto::WireMessage) -> bytes::Bytes {
+    // serde_json::to_string can only fail on Display impls panicking,
+    // which `WireMessage`'s field types don't. unwrap is consistent
+    // with the prior code path which also unwrapped `to_string` on
+    // an inline json! Value.
+    let mut s = serde_json::to_string(msg)
+        .expect("WireMessage serialisation cannot fail (no custom Display panics)");
     s.push('\n');
     bytes::Bytes::from(s)
 }
