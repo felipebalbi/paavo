@@ -265,6 +265,71 @@ impl JobRow {
         Ok(())
     }
 
+    /// `Submitted → Building` for the build-pool stage. Unlike the legacy
+    /// `transition_to_building`, claims NO board (the build holds no
+    /// hardware); only records `started_at`. The board is claimed later
+    /// by `transition_awaiting_to_running`.
+    pub fn transition_submitted_to_building(
+        conn: &Connection,
+        id: &JobId,
+        now_ms: i64,
+    ) -> Result<()> {
+        let n = conn.execute(
+            "UPDATE job SET state = 'building', started_at = ?1
+             WHERE id = ?2 AND state = 'submitted'",
+            params![now_ms, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(DbError::UnknownEnum {
+                column: "job.state",
+                value: "expected 'submitted' for transition_submitted_to_building".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `Building → AwaitingBoard`, recording the stable ELF path. The
+    /// caller releases the build slot after this returns.
+    pub fn transition_building_to_awaiting_board(
+        conn: &Connection,
+        id: &JobId,
+        elf_path: &str,
+    ) -> Result<()> {
+        let n = conn.execute(
+            "UPDATE job SET state = 'awaiting_board', elf_path = ?1
+             WHERE id = ?2 AND state = 'building'",
+            params![elf_path, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(DbError::UnknownEnum {
+                column: "job.state",
+                value: "expected 'building' for transition_building_to_awaiting_board".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `AwaitingBoard → Running`, claiming `board_id` (the run claim).
+    /// `elf_path` was set at the awaiting-board transition.
+    pub fn transition_awaiting_to_running(
+        conn: &Connection,
+        id: &JobId,
+        board_id: &str,
+    ) -> Result<()> {
+        let n = conn.execute(
+            "UPDATE job SET state = 'running', board_id = ?1
+             WHERE id = ?2 AND state = 'awaiting_board'",
+            params![board_id, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(DbError::UnknownEnum {
+                column: "job.state",
+                value: "expected 'awaiting_board' for transition_awaiting_to_running".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Apply a terminal-state transition with outcome. Errors if the job
     /// id does not exist, or if the job is already in a terminal state (no
     /// re-finalize).
@@ -281,7 +346,7 @@ impl JobRow {
         let detail_json = serde_json::to_string(&rec.outcome)?;
         let n = conn.execute(
             "UPDATE job SET state = ?1, outcome_detail = ?2, finished_at = ?3
-             WHERE id = ?4 AND state IN ('submitted','building','running')",
+             WHERE id = ?4 AND state IN ('submitted','building','awaiting_board','running')",
             params![
                 state_to_str(rec.state),
                 detail_json,

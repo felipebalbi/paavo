@@ -387,3 +387,68 @@ fn abort_interrupted_jobs_terminalizes_in_flight_only() {
         "no new frames on re-run"
     );
 }
+
+#[test]
+fn two_stage_transitions_submitted_to_running() {
+    let db = fresh_db();
+    insert_default_board(&db);
+    let id = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(id), 0).unwrap();
+
+    // Submitted -> Building: no board claimed, started_at set.
+    JobRow::transition_submitted_to_building(db.raw_conn(), &id, 10).unwrap();
+    let r = JobRow::get(db.raw_conn(), &id).unwrap();
+    assert_eq!(r.state, JobState::Building);
+    assert_eq!(r.board_id, None);
+    assert_eq!(r.started_at, Some(10));
+
+    // Building -> AwaitingBoard: elf recorded, still no board.
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &id, "/elf/aaa.elf").unwrap();
+    let r = JobRow::get(db.raw_conn(), &id).unwrap();
+    assert_eq!(r.state, JobState::AwaitingBoard);
+    assert_eq!(r.elf_path.as_deref(), Some("/elf/aaa.elf"));
+    assert_eq!(r.board_id, None);
+
+    // AwaitingBoard -> Running: board claimed now.
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &id, "mcxa266-01").unwrap();
+    let r = JobRow::get(db.raw_conn(), &id).unwrap();
+    assert_eq!(r.state, JobState::Running);
+    assert_eq!(r.board_id.as_deref(), Some("mcxa266-01"));
+
+    // finalize is valid from running.
+    JobRow::finalize(
+        db.raw_conn(),
+        &id,
+        &OutcomeRecord {
+            state: JobState::Passed,
+            outcome: JobOutcome::Passed,
+            finished_at_ms: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(JobRow::get(db.raw_conn(), &id).unwrap().state, JobState::Passed);
+}
+
+#[test]
+fn finalize_allowed_from_awaiting_board() {
+    let db = fresh_db();
+    insert_default_board(&db);
+    let id = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(id), 0).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &id, 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &id, "/e.elf").unwrap();
+    // Cancel an AwaitingBoard job: finalize must accept it.
+    JobRow::finalize(
+        db.raw_conn(),
+        &id,
+        &OutcomeRecord {
+            state: JobState::Aborted,
+            outcome: JobOutcome::Aborted {
+                by: paavo_proto::AbortReason::User,
+            },
+            finished_at_ms: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(JobRow::get(db.raw_conn(), &id).unwrap().state, JobState::Aborted);
+}
