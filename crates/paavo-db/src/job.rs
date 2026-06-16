@@ -1,7 +1,7 @@
 //! Job table typed helpers.
 
 use crate::error::{DbError, Result};
-use paavo_proto::{BoardSelector, JobId, JobOutcome, JobSource, JobState, Priority};
+use paavo_proto::{AbortReason, BoardSelector, JobId, JobOutcome, JobSource, JobState, Priority};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::str::FromStr;
 
@@ -296,6 +296,72 @@ impl JobRow {
             });
         }
         Ok(())
+    }
+
+    /// Terminalize every job still in `building`/`running` as
+    /// `Aborted { by: Interrupted }`, appending a forensic `Warn`
+    /// log frame to each. Returns the count reconciled.
+    ///
+    /// Intended to run ONCE at daemon startup, before the dispatch
+    /// loop: any in-flight row at that point is provably orphaned (a
+    /// fresh process has no worker thread for it; single-writer
+    /// assumption, spec §7). The whole sweep runs in one transaction,
+    /// so a crash mid-sweep commits nothing and a re-run is clean;
+    /// the operation is idempotent (a second call finds nothing and
+    /// returns 0).
+    pub fn abort_interrupted_jobs(conn: &Connection, now_ms: i64) -> Result<u64> {
+        let outcome_json = serde_json::to_string(&JobOutcome::Aborted {
+            by: AbortReason::Interrupted,
+        })?;
+        const MSG: &str = "job interrupted: paavod restarted while this \
+             job was in-flight; any output above is partial";
+
+        let tx = conn.unchecked_transaction()?;
+        // Snapshot the orphaned rows (id + started_at). Collected into a
+        // Vec so the prepared statement is dropped before the writes.
+        let orphans: Vec<(String, Option<i64>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, started_at FROM job
+                 WHERE state IN ('building','running')",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for (id, started_at) in &orphans {
+            // `started_at` is `&Option<i64>`; copy it out (Option<i64>
+            // is Copy) so we can `.map` it by value below.
+            let started_at = *started_at;
+            // Next seq after whatever was captured before the crash.
+            let next_seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM log_frame
+                 WHERE job_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            // Continue the job's relative timeline from started_at.
+            let ts_us: i64 = started_at
+                .map(|s| (now_ms - s).max(0).saturating_mul(1000))
+                .unwrap_or(0);
+            tx.execute(
+                "INSERT INTO log_frame
+                   (job_id, seq, ts_us, level, target, message)
+                 VALUES (?1, ?2, ?3, 'warn', NULL, ?4)",
+                params![id, next_seq, ts_us, MSG],
+            )?;
+            tx.execute(
+                "UPDATE job
+                 SET state = 'aborted', outcome_detail = ?1, finished_at = ?2
+                 WHERE id = ?3",
+                params![outcome_json, now_ms, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(orphans.len() as u64)
     }
 
     /// Delete a job; `ON DELETE CASCADE` clears its log_frames.
