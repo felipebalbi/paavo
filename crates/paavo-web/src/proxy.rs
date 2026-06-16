@@ -118,6 +118,7 @@ pub struct AppState {
 pub async fn stream_job(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     // 1. Validate the job id format. paavod also validates, but
     //    bouncing here saves an upstream round trip and keeps the
@@ -127,6 +128,12 @@ pub async fn stream_job(
         Ok(i) => i,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
     };
+
+    // Absent param => no filtering. Present => drop frames with
+    // seq <= since_seq (the SSR-covered prefix). Client-side lastSeq
+    // dedup is the correctness backbone; this just saves bytes on the
+    // initial connect. See the C2 spec §5.2.
+    let since_seq: Option<u64> = q.get("since_seq").and_then(|v| v.parse().ok());
 
     // 2. Open the upstream stream.
     let upstream_url = match s.paavod.base_url.join(&format!("/jobs/{id}/stream")) {
@@ -158,7 +165,7 @@ pub async fn stream_job(
 
     // 3. Wrap the upstream byte stream into an SSE-event stream.
     let upstream_bytes = resp.bytes_stream();
-    let sse_stream = ndjson_to_sse(upstream_bytes);
+    let sse_stream = ndjson_to_sse(upstream_bytes, since_seq);
 
     // 4. KeepAlive comments every 15 s so corporate reverse proxies
     //    (and the browser's idle-tab timer) don't kill an idle
@@ -181,7 +188,10 @@ pub async fn stream_job(
 ///
 /// Generic over the byte-stream type so tests can wrap an in-memory
 /// `Vec<Bytes>` without spinning up reqwest.
-fn ndjson_to_sse<S, E>(s: S) -> impl futures::Stream<Item = Result<Event, Infallible>>
+fn ndjson_to_sse<S, E>(
+    s: S,
+    since_seq: Option<u64>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>>
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
@@ -214,6 +224,17 @@ where
                                 ));
                             }
                             Ok(WireMessage::Frame { frame }) => {
+                                // Bandwidth trim: the SSR pre-populate
+                                // already rendered frames through
+                                // `since_seq`; don't re-ship them.
+                                // Client-side lastSeq dedup is the
+                                // correctness backbone; this just saves
+                                // bytes on the initial connect.
+                                if let Some(cut) = since_seq {
+                                    if frame.seq <= cut {
+                                        continue;
+                                    }
+                                }
                                 // Enrichment: server-side format ts_us
                                 // → "mm:ss.fff" so the JS doesn't need
                                 // a duplicate formatter (the same

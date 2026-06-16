@@ -264,3 +264,55 @@ async fn proxy_synthesises_truncated_on_malformed_upstream_line() {
         "proxy continued past truncated; body:\n{sse}"
     );
 }
+
+#[tokio::test]
+async fn since_seq_filters_historicals_from_sse_stream() {
+    // Upstream replays frames seq 1..=10 then a terminal. A viewer that
+    // already rendered through seq 5 (SSR) reconnects with ?since_seq=5;
+    // the proxy must drop frames 1..=5 and emit only 6..=10 + terminal.
+    let mut body = String::new();
+    for seq in 1..=10u64 {
+        body.push_str(&ndjson_line(&WireMessage::Frame {
+            frame: LogFrame {
+                seq,
+                ts_us: seq * 1000,
+                level: LogLevel::Info,
+                // Token chosen so no message is a substring of another
+                // (e.g. "line 1" is a substring of "line 10"): the
+                // trailing "X" makes "L1X" not a substring of "L10X".
+                target: None,
+                message: format!("L{seq}X"),
+            },
+        }));
+    }
+    body.push_str(&ndjson_line(&WireMessage::Terminal {
+        outcome: JobOutcome::Passed,
+    }));
+    // spawn_fake_paavod takes &'static str; leak the body (test-only).
+    let body: &'static str = Box::leak(body.into_boxed_str());
+
+    let (addr, _g) = spawn_fake_paavod(body).await;
+    let (_dir, app) = paavo_web_router(addr);
+    let sse = fetch_sse_body(
+        app,
+        "/api/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stream?since_seq=5",
+    )
+    .await;
+
+    for seq in 1..=5u64 {
+        assert!(
+            !sse.contains(&format!("L{seq}X")),
+            "frame {seq} should have been filtered; body:\n{sse}"
+        );
+    }
+    for seq in 6..=10u64 {
+        assert!(
+            sse.contains(&format!("L{seq}X")),
+            "frame {seq} should have passed through; body:\n{sse}"
+        );
+    }
+    assert!(
+        sse.contains("event: terminal\n"),
+        "terminal must still pass through; body:\n{sse}"
+    );
+}
