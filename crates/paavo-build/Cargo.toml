@@ -12,6 +12,14 @@ tar = { workspace = true }
 blake3 = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
+# `build_release_streaming` emits each line of cargo's stdout/stderr
+# in real time over a `Sender<BuildLine>`. paavod's dispatch (commit
+# C) sets up a forwarder thread that drains the matching Receiver
+# and republishes onto the JobLogsBroker — same shape as paavo-
+# runner's existing `JobOutputs.log_tx` pattern. Workspace already
+# pins crossbeam-channel for the runner; pulling it in here is zero
+# version churn.
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

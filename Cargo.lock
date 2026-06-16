@@ -2229,6 +2229,7 @@ name = "paavo-build"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crossbeam-channel",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
