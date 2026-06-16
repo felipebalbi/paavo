@@ -5,18 +5,6 @@
 //!   - `PAAVO_HW=1` env var so even when run with `--ignored`, dev boxes
 //!     without the EVK plugged in self-skip without surfacing as failure.
 //!
-//! **Status (post-M7.7 RAM-resident fix)**: this test currently FAILS
-//! against the existing spike fixture (`dev/spike-fixture-mcxa266`).
-//! That fixture is flash-resident (its `memory.x` defines both FLASH
-//! and RAM, and its `.cargo/config.toml` links with `-Tlink.x`), and
-//! `RealSession::connect` now rejects flash-resident ELFs with an
-//! explicit error pointing at `templates/shared/link_ram_cortex_m.x`.
-//! See `dev/probe-rs-spike/FINDINGS.md` footnote 1 for the rationale.
-//! To restore this test, rebuild the spike fixture as RAM-resident
-//! (swap `memory.x` to RAM-only and `-Tlink.x` to `-Tlink_ram.x` plus a
-//! `cargo:rustc-link-arg=-Tlink_ram_cortex_m.x` in `build.rs` mirroring
-//! the templates).
-//!
 //! Depends on the spike fixture ELF; build it first by `cd`-ing INTO the
 //! fixture directory (NOT via `--manifest-path` from the workspace root —
 //! that bypasses the fixture's `.cargo/config.toml` which carries the
@@ -29,6 +17,12 @@
 //! Run with:
 //!   $env:PAAVO_HW = "1"
 //!   cargo test -p paavo-probe --test real_session_connect -- --ignored --nocapture
+//!
+//! Since 83ab964, the spike fixture is RAM-resident (matches the
+//! production templates). `RealSession::connect` exercises the
+//! `BootInfo::FromRam` → `prepare_running_on_ram` boot path on every
+//! invocation; see `real_session_ram_boot.rs` for the regression
+//! pin that asserts that path is actually taken.
 
 use paavo_probe::{RealSession, RealSessionOptions};
 use paavo_proto::ProbeSelector;

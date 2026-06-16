@@ -23,3 +23,7 @@ chrono         = { workspace = true }
 # `object`'s ELF *writer* lives behind the non-default `write` feature.
 # The runtime dep only needs the default `read` surface.
 object = { workspace = true, features = ["write"] }
+# Capture tracing events from `RealSession::connect` in the
+# `real_session_ram_boot` hardware test (asserts the post-M7.7
+# RAM-resident boot path is taken with the right vector_table_addr).
+tracing-subscriber = { workspace = true }
