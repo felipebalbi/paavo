@@ -38,6 +38,7 @@ fn job_state_roundtrip() {
         JobState::Submitted,
         JobState::Building,
         JobState::Running,
+        JobState::AwaitingBoard,
         JobState::Passed,
         JobState::Failed,
         JobState::TimedOut,
@@ -287,6 +288,10 @@ fn job_state_timedout_wire_string_is_one_word() {
         "\"running\""
     );
     assert_eq!(
+        serde_json::to_string(&JobState::AwaitingBoard).unwrap(),
+        "\"awaiting_board\""
+    );
+    assert_eq!(
         serde_json::to_string(&JobState::Passed).unwrap(),
         "\"passed\""
     );
@@ -417,4 +422,13 @@ fn job_view_terminal_includes_outcome_and_finished_at() {
     assert_eq!(json["state"], "aborted");
     assert_eq!(json["finished_at"], 2);
     assert!(json["outcome"].is_object());
+}
+
+#[test]
+fn awaiting_board_serializes_to_snake_case() {
+    let s = serde_json::to_string(&paavo_proto::JobState::AwaitingBoard).unwrap();
+    assert_eq!(s, "\"awaiting_board\"");
+    let back: paavo_proto::JobState = serde_json::from_str("\"awaiting_board\"").unwrap();
+    assert_eq!(back, paavo_proto::JobState::AwaitingBoard);
+    assert!(!back.is_terminal());
 }

@@ -37,7 +37,7 @@ pub enum JobSource {
     Scheduler,
 }
 
-/// One of the seven persistent states in the job state machine. See
+/// One of the eight persistent states in the job state machine. See
 /// `JobOutcome` for the finer-grained terminal-state information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
@@ -50,6 +50,11 @@ pub enum JobState {
     /// `paavo-runner` is attached to a probe.
     #[serde(rename = "running")]
     Running,
+    /// Built; ELF ready; waiting for a free matching board. The build
+    /// slot has been released, so this job no longer counts toward
+    /// `max_concurrent_builds`. Non-terminal.
+    #[serde(rename = "awaiting_board")]
+    AwaitingBoard,
     /// Terminal: test reported `Test OK` + bkpt.
     #[serde(rename = "passed")]
     Passed,
