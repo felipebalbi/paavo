@@ -7,6 +7,7 @@ pub const CRATE_NAME: &str = "paavod";
 
 pub mod app;
 pub mod app_state;
+pub mod builder;
 pub mod cancellation;
 pub mod config;
 pub mod cron;

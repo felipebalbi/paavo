@@ -18,8 +18,8 @@ mod error;
 pub mod tar;
 
 pub use build::{
-    build_release, build_release_streaming, BuildLine, BuildLineTx, BuildPlan, BuildResult,
-    BuildStream,
+    build_release, build_release_streaming, build_release_streaming_cancellable, BuildLine,
+    BuildLineTx, BuildPlan, BuildResult, BuildStream,
 };
 pub use elf::{discover_elf, ManifestArtifactHint};
 pub use error::{BuildError, Result};
