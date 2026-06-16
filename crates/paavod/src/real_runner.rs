@@ -87,7 +87,9 @@ impl RealRunner {
 
 impl Runner for RealRunner {
     fn run(&self, ctx: paavo_core::RunContext<'_>) -> RunOutcome {
-        let paavo_core::RunContext { job_id, board_id, .. } = ctx;
+        let paavo_core::RunContext {
+            job_id, board_id, ..
+        } = ctx;
         // 1. Read elf_path + board spec + per-job timeouts under one
         //    DB lock. Lock duration is bounded (two indexed SELECTs).
         let lookup = {

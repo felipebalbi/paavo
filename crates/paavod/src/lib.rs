@@ -12,6 +12,7 @@ pub mod config;
 pub mod cron;
 pub mod dispatch;
 pub mod job_logs;
+pub mod log_sink;
 pub mod real_runner;
 pub mod routes;
 pub mod shutdown;
