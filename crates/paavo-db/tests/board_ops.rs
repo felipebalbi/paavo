@@ -289,11 +289,11 @@ fn get_unknown_id_returns_not_found() {
 
 #[test]
 fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
-    // Hardware-safety invariant: a board currently dispatched on
-    // (state in 'building','running') must NOT appear in the scheduler's
-    // eligible-boards list. Without this guard `pick_next` could return
-    // the same board for two concurrent jobs and the daemon would
-    // launch two BoardWorker tasks on the same probe.
+    // Hardware-safety invariant: a board currently RUNNING a job must
+    // NOT appear in the scheduler's eligible-boards list. Only the run
+    // phase holds a board now (build is board-free), so only `running`
+    // excludes. Without this guard the run stage could claim the same
+    // board for two concurrent jobs and drive two probes at once.
     let db = fresh_db();
     let now = chrono::Utc::now().timestamp_millis();
     BoardRow::insert(db.raw_conn(), &sample_board(), now).unwrap();
@@ -307,8 +307,8 @@ fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
     let rows = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel).unwrap();
     assert_eq!(rows.len(), 1, "healthy board should appear when no jobs");
 
-    // Insert a job and walk it through Submitted → Building. Now the
-    // board should be hidden from the eligibility query.
+    // Insert a job and walk it through the two-stage lifecycle. Only a
+    // `running` job holds a board now, so only that state excludes it.
     let job_id = paavo_proto::JobId::new();
     paavo_db::JobRow::insert(
         db.raw_conn(),
@@ -328,17 +328,26 @@ fn find_healthy_for_selector_excludes_boards_with_in_flight_jobs() {
         now,
     )
     .unwrap();
-    paavo_db::JobRow::transition_to_building(db.raw_conn(), &job_id, "mcxa266-01", now + 1)
-        .unwrap();
+    // Building holds NO board → board stays eligible.
+    paavo_db::JobRow::transition_submitted_to_building(db.raw_conn(), &job_id, now + 1).unwrap();
     let rows = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel).unwrap();
-    assert!(
-        rows.is_empty(),
-        "board with a Building job must be excluded; got {} eligible",
-        rows.len()
+    assert_eq!(
+        rows.len(),
+        1,
+        "a building (board-free) job must not exclude the board"
     );
 
-    // Transition to Running — still excluded.
-    paavo_db::JobRow::transition_to_running(db.raw_conn(), &job_id, "/elf").unwrap();
+    // AwaitingBoard still holds no board → still eligible.
+    paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job_id, "/elf").unwrap();
+    let rows = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "an awaiting_board job must not exclude the board"
+    );
+
+    // Running claims the board → now excluded.
+    paavo_db::JobRow::transition_awaiting_to_running(db.raw_conn(), &job_id, "mcxa266-01").unwrap();
     let rows = BoardRow::find_healthy_for_selector(db.raw_conn(), &sel).unwrap();
     assert!(rows.is_empty(), "board with a Running job must be excluded");
 

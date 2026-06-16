@@ -81,8 +81,9 @@ impl BoardRow {
     }
 
     /// Find healthy boards matching the selector AND not currently
-    /// dispatched (no `job` row in `building` or `running` state on
-    /// this board). Result is unordered; the scheduler decides LRU.
+    /// dispatched (no `job` row in `running` state on this board — only
+    /// the run phase holds a board; the build phase is board-free).
+    /// Result is unordered; the scheduler decides LRU.
     ///
     /// The board-exclusivity clause (`NOT EXISTS (...)`) is what
     /// stops the dispatcher from launching two jobs on the same probe
@@ -94,7 +95,7 @@ impl BoardRow {
             "SELECT * FROM board WHERE kind = ?1 AND health = 'healthy'
              AND NOT EXISTS (
                 SELECT 1 FROM job WHERE job.board_id = board.id
-                  AND job.state IN ('building','running')
+                  AND job.state = 'running'
              )",
         );
         let mut next_param = 2;
