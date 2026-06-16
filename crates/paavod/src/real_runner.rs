@@ -19,7 +19,7 @@
 use crate::app_state::AppState;
 use crate::cancellation::CancellationRegistry;
 use crate::config::Config;
-use crate::job_logs::{JobLogsBroker, LiveEvent};
+use crate::job_logs::JobLogsBroker;
 use paavo_core::{RunOutcome, Runner};
 use paavo_db::{BoardRow, Db, JobRow};
 use paavo_proto::{JobOutcome, TerminalOutcome};
@@ -88,7 +88,10 @@ impl RealRunner {
 impl Runner for RealRunner {
     fn run(&self, ctx: paavo_core::RunContext<'_>) -> RunOutcome {
         let paavo_core::RunContext {
-            job_id, board_id, ..
+            job_id,
+            board_id,
+            log_seq,
+            job_start,
         } = ctx;
         // 1. Read elf_path + board spec + per-job timeouts under one
         //    DB lock. Lock duration is bounded (two indexed SELECTs).
@@ -195,12 +198,32 @@ impl Runner for RealRunner {
         // 4. Spawn forwarder thread: drain log_rx → JobLogsBroker.
         //    The thread exits when the worker drops log_tx (which
         //    happens when run_job's worker thread returns).
-        let broker = self.job_logs.clone();
+        //
+        //    Frames are fed through a FrameSink built from the shared
+        //    seq counter + job-start clock (from RunContext), so run
+        //    frames continue the seq space and timeline the build
+        //    forwarder started. The probe's own seq/ts_us are
+        //    discarded — FrameSink reassigns both. `recv_timeout` so
+        //    the 50 ms flush deadline fires even when the firmware is
+        //    quiet between defmt frames; Timeout ticks, Disconnected
+        //    does a final flush.
+        let mut sink = crate::log_sink::FrameSink::new(
+            job_id,
+            self.job_logs.clone(),
+            self.db.clone(),
+            log_seq,
+            job_start,
+        );
         let fwd = std::thread::Builder::new()
             .name("paavod-log-forwarder".into())
-            .spawn(move || {
-                while let Ok(frame) = log_rx.recv() {
-                    broker.publish(job_id, LiveEvent::Frame(frame));
+            .spawn(move || loop {
+                match log_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(frame) => sink.push(frame.level, frame.target, frame.message),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => sink.tick(),
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        sink.finish();
+                        break;
+                    }
                 }
             })
             .expect("spawn log forwarder thread");
