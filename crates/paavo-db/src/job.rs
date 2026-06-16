@@ -209,6 +209,19 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// Next `log_frame.seq` for a job — `COALESCE(MAX(seq), -1) + 1`.
+    /// Returns 0 when the job has no frames yet. Lets the run stage
+    /// continue the seq space after the build-phase frames so live
+    /// viewers see one contiguous timeline across the build→run split.
+    pub fn next_log_seq(conn: &Connection, id: &JobId) -> Result<u64> {
+        let n: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM log_frame WHERE job_id = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
     /// Returns the `limit` most recently submitted jobs in the given state,
     /// newest first. **For scheduler dispatch order on `Submitted`, use
     /// `list_submitted` instead** — it sorts by priority + age (oldest first

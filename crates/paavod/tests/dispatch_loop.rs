@@ -5,6 +5,7 @@ use paavo_proto::{
     ProbeSelector,
 };
 use paavod::app_state::{AppState, DrainState};
+use paavod::builder::{BuildOutcome, BuildRequest, Builder};
 use paavod::cancellation::CancellationRegistry;
 use paavod::config::{
     BuildCacheConfig, Config, QuarantineConfig, RetentionConfig, SchedulerConfig, ServerConfig,
@@ -25,6 +26,24 @@ impl Runner for FakeRunner {
             outcome: self.out.lock().clone(),
             probe_released_cleanly: true,
         }
+    }
+}
+
+/// Test builder: writes a stub ELF into the slot dir. Not invoked by the
+/// cache-hit fixtures (the cache short-circuits the build), but valid if
+/// it is called.
+struct FakeBuilder;
+impl Builder for FakeBuilder {
+    fn build(
+        &self,
+        req: BuildRequest<'_>,
+        _lines: paavo_build::BuildLineTx,
+        _cancel: crossbeam_channel::Receiver<()>,
+    ) -> BuildOutcome {
+        std::fs::create_dir_all(&req.target_dir).unwrap();
+        let elf = req.target_dir.join("fake.elf");
+        std::fs::write(&elf, b"\x7fELF").unwrap();
+        BuildOutcome::Ok { elf_path: elf }
     }
 }
 
@@ -151,7 +170,7 @@ async fn dispatch_runs_a_passed_job_to_completion() {
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
         out: Mutex::new(JobOutcome::Passed),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
 
     assert_eq!(wait_for_terminal(&state, &job_id).await, JobState::Passed);
     let row = {
@@ -177,7 +196,7 @@ async fn dispatch_propagates_failed_outcome_and_does_not_quarantine_on_test_err(
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
         out: Mutex::new(outcome.clone()),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
 
     assert_eq!(wait_for_terminal(&state, &job_id).await, JobState::Failed);
     let row = {
@@ -205,7 +224,7 @@ async fn dispatch_emits_terminal_on_job_logs_broker() {
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
         out: Mutex::new(JobOutcome::Passed),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
     // Drain non-terminal events (Phase, Frame, …) until the Terminal
     // event arrives. Pre-Phase, this loop saw exactly one event:
     // Terminal. Now that dispatch publishes Phase(Building) and
@@ -247,7 +266,7 @@ async fn dispatch_publishes_phase_events_synchronously_with_state_transitions() 
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
         out: Mutex::new(JobOutcome::Passed),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
 
     // Collect events until we see Terminal, then assert on the
     // sequence. Filtering on "non-Frame" makes the test resilient to
@@ -314,7 +333,7 @@ async fn dispatch_exits_loop_on_drain_when_no_jobs_in_flight() {
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
         out: Mutex::new(JobOutcome::Passed),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
     // Set drain before any work appears. The next poll cycle should
     // exit because nothing is in flight.
     state.drain.set_draining();
@@ -332,7 +351,7 @@ async fn dispatch_does_not_pick_new_jobs_after_drain() {
     });
     // Set drain before spawn — the loop should never claim the job.
     state.drain.set_draining();
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
     // Give the loop a few cycles to confirm it didn't claim.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let row = {
@@ -361,7 +380,7 @@ async fn dispatch_finalizes_on_runner_panic_without_leaking() {
 
     let (state, job_id, _tmp) = fixture_state(JobOutcome::Passed);
     let runner: Arc<dyn Runner> = Arc::new(PanickyRunner);
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
 
     assert_eq!(wait_for_terminal(&state, &job_id).await, JobState::Failed);
     let row = {
@@ -448,7 +467,7 @@ async fn dispatch_does_not_double_dispatch_same_board() {
     let runner: Arc<dyn Runner> = Arc::new(CountingRunner {
         counter: counter.clone(),
     });
-    let handle = paavod::dispatch::spawn(state.clone(), runner);
+    let handle = paavod::dispatch::spawn(state.clone(), Arc::new(FakeBuilder), runner);
 
     // Wait for both jobs to reach terminal.
     assert_eq!(wait_for_terminal(&state, &job_a).await, JobState::Passed);
@@ -458,6 +477,132 @@ async fn dispatch_does_not_double_dispatch_same_board() {
         1,
         "board must never have more than one concurrent dispatch"
     );
+
+    state.drain.set_draining();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn build_stage_respects_cap_and_builds_without_a_board() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Builder that records peak concurrency and blocks so overlap is observable.
+    struct CountingBuilder {
+        cur: Arc<AtomicU32>,
+        max: Arc<AtomicU32>,
+    }
+    impl Builder for CountingBuilder {
+        fn build(
+            &self,
+            req: BuildRequest<'_>,
+            _l: paavo_build::BuildLineTx,
+            _c: crossbeam_channel::Receiver<()>,
+        ) -> BuildOutcome {
+            let n = self.cur.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.cur.fetch_sub(1, Ordering::SeqCst);
+            std::fs::create_dir_all(&req.target_dir).unwrap();
+            let elf = req.target_dir.join("fake.elf");
+            std::fs::write(&elf, b"\x7fELF").unwrap();
+            BuildOutcome::Ok { elf_path: elf }
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sd = StateDir::from_root(tmp.path());
+    sd.ensure_dirs().unwrap();
+    sd.ensure_build_slots(2).unwrap();
+    let db = Db::open(&sd.sqlite_path).unwrap();
+    // 4 distinct-blake3 Submitted jobs; NO board, NO cache.
+    for i in 0..4u32 {
+        let tar = sd.uploads_dir.join(format!("{i}.tar"));
+        std::fs::write(&tar, b"x").unwrap();
+        paavo_db::JobRow::insert(
+            db.raw_conn(),
+            &paavo_db::NewJob {
+                id: JobId::new(),
+                priority: Priority::Interactive,
+                submitter: "x".into(),
+                source: JobSource::Cli,
+                board_selector: BoardSelector {
+                    kind: "mcxa266".into(),
+                    instance: None,
+                    wiring_profile: None,
+                },
+                inactivity_timeout_ms: 1,
+                hard_max_ms: 1,
+                tar_blake3: format!("blake{i}"),
+                tar_path: tar.display().to_string(),
+                cargo_update_packages: vec![],
+                skip_cache: false,
+            },
+            0,
+        )
+        .unwrap();
+    }
+    let cfg = Arc::new(Config {
+        server: ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            state_dir: tmp.path().to_path_buf(),
+            max_upload_bytes: 256 * 1024 * 1024,
+        },
+        web: WebConfig {
+            bind: "127.0.0.1:0".into(),
+        },
+        timeouts: TimeoutsConfig::default(),
+        scheduler: SchedulerConfig {
+            nightly_cron: "0 0 19 * * *".into(),
+            starvation_threshold_s: 21_600,
+            max_concurrent_builds: 2,
+        },
+        build_cache: BuildCacheConfig::default(),
+        retention: RetentionConfig::default(),
+        quarantine: QuarantineConfig::default(),
+        corpus: vec![],
+    });
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        config: cfg,
+        inventory: Arc::new(Mutex::new(vec![])),
+        drain: DrainState::default(),
+        cancellation: CancellationRegistry::default(),
+        build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
+        job_logs: JobLogsBroker::new(),
+    };
+    let cur = Arc::new(AtomicU32::new(0));
+    let max = Arc::new(AtomicU32::new(0));
+    let builder: Arc<dyn Builder> = Arc::new(CountingBuilder {
+        cur,
+        max: max.clone(),
+    });
+    let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
+        out: Mutex::new(JobOutcome::Passed),
+    });
+    let handle = paavod::dispatch::spawn(state.clone(), builder, runner);
+
+    // No board exists, so every job must end stuck in AwaitingBoard.
+    let mut all_awaiting = false;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let awaiting = {
+            let db = state.db.lock();
+            paavo_db::JobRow::list_by_state(db.raw_conn(), JobState::AwaitingBoard, 100)
+                .unwrap()
+                .len()
+        };
+        if awaiting == 4 {
+            all_awaiting = true;
+            break;
+        }
+    }
+    assert!(
+        all_awaiting,
+        "all 4 jobs must build (board-free) and reach AwaitingBoard"
+    );
+    let peak = max.load(Ordering::SeqCst);
+    assert!(peak <= 2, "cap exceeded: peak concurrent builds = {peak}");
+    assert_eq!(peak, 2, "cap should actually be reached with 4 jobs / 2 slots");
 
     state.drain.set_draining();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;

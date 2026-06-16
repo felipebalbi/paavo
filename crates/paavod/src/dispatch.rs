@@ -1,374 +1,240 @@
-//! Dispatch loop. Polls `pick_next` and runs jobs end-to-end.
+//! Two-stage dispatch loop.
 //!
-//! For each picked job:
-//! 1. (Synchronously in the dispatch thread) Transition row to
-//!    `Building`, touch the board's `last_used_at`, register a fresh
-//!    cancellation sender. Claiming-before-spawn means a re-pick on
-//!    the next iteration can't see the same Submitted row.
-//! 2. (On the blocking pool) Cache lookup or `paavo_build::build_release`.
-//! 3. Transition to `Running`.
-//! 4. Call `Runner::run`.
-//! 5. Persist outcome, apply quarantine policy, publish terminal event,
-//!    unregister cancellation, drop sandbox.
+//! Build stage: claims `Submitted → Building`, bounded by an in-memory
+//! slot pool of `max_concurrent_builds` (each slot a dedicated
+//! CARGO_TARGET_DIR). On success copies the ELF to a stable
+//! content-addressed cache path and moves the job to `AwaitingBoard`,
+//! releasing the slot. The board is NOT held during a build.
 //!
-//! Drain ordering (M4.3.d wires the actual SIGTERM hookup): when
-//! `state.drain.is_draining()` AND `state.cancellation.active() == 0`,
-//! the loop returns. Tasks already on the blocking pool finish on
-//! their own; new ones don't get picked.
+//! Run stage: claims `AwaitingBoard → Running` only when a matching
+//! healthy board is free, then invokes the Runner. Board exclusivity is
+//! enforced by `find_healthy_for_selector` (running rows only).
+//!
+//! Each tick runs the run stage first (keep scarce boards busy), then
+//! fills build slots. Drain stops new picks and exits once no build or
+//! run is in flight.
 
 use crate::app_state::AppState;
+use crate::builder::{BuildOutcome, BuildRequest, Builder};
 use crate::job_logs::LiveEvent;
 use chrono::Utc;
-use paavo_build::tar::unpack_into;
-use paavo_build::BuildPlan;
 use paavo_core::{
-    apply_outcome_to_board, cache_lookup, cache_store, pick_next, CacheLookup, QuarantinePolicy,
-    RunOutcome, Runner, SchedulerConfig,
+    apply_outcome_to_board, cache_lookup, cache_store, pick_buildable, pick_runnable, CacheLookup,
+    QuarantinePolicy, RunOutcome, Runner, SchedulerConfig,
 };
 use paavo_db::{JobRow, OutcomeRecord};
-use paavo_proto::{JobId, JobOutcome, JobPhase, JobState, TerminalOutcome};
+use paavo_proto::{AbortReason, JobId, JobOutcome, JobPhase, JobState, TerminalOutcome};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
 
 /// Spawn the dispatch loop. Returns immediately. The loop exits when
-/// `state.drain` flips to true *and* `state.cancellation` reports zero
-/// in-flight workers.
-///
-/// Drain semantics: as soon as drain is set, the loop STOPS picking
-/// new Submitted rows. Already-running workers finish on their own,
-/// and once the registry empties the loop returns. This is the
-/// guarantee §6.3 wants — SIGTERM may not silently start new builds.
-pub fn spawn(state: AppState, runner: Arc<dyn Runner>) -> tokio::task::JoinHandle<()> {
+/// `state.drain` is set AND no build or run is in flight.
+pub fn spawn(
+    state: AppState,
+    builder: Arc<dyn Builder>,
+    runner: Arc<dyn Runner>,
+) -> tokio::task::JoinHandle<()> {
+    let n = state.config.scheduler.max_concurrent_builds.max(1);
+    // Slot pool: a bounded channel pre-filled with slot indices. Acquire
+    // = try_recv; release = send back (from the finished build task).
+    let (slot_tx, slot_rx) = crossbeam_channel::bounded::<usize>(n);
+    for i in 0..n {
+        let _ = slot_tx.send(i);
+    }
     tokio::spawn(async move {
         loop {
-            // Drain short-circuit: stop picking new jobs the moment
-            // drain is set. Exit only when in-flight count is 0.
             if state.drain.is_draining() {
-                if state.cancellation.active() == 0 {
+                if state.build_cancel.active() == 0 && state.cancellation.active() == 0 {
                     return;
                 }
                 sleep(Duration::from_millis(100)).await;
                 continue;
             }
-
-            let now_ms = Utc::now().timestamp_millis();
-            let pick = {
-                let db = state.db.lock();
-                pick_next(
-                    db.raw_conn(),
-                    SchedulerConfig {
-                        starvation_threshold_ms: state.config.scheduler.starvation_threshold_s
-                            * 1_000,
-                    },
-                    now_ms,
-                )
+            let cfg = SchedulerConfig {
+                starvation_threshold_ms: state.config.scheduler.starvation_threshold_s * 1_000,
             };
-            let scheduled = match pick {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-                Err(e) => {
-                    warn!(error = %e, "dispatch: pick_next failed");
-                    sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let job_id = scheduled.job.id;
-            let board_id = scheduled.board.spec.id.clone();
-            // Claim the job + register cancellation BEFORE spawning the
-            // blocking task. Otherwise the next loop iteration would
-            // pick_next the same Submitted row.
-            let claim_ok = {
-                let db = state.db.lock();
-                let r = JobRow::transition_to_building(db.raw_conn(), &job_id, &board_id, now_ms);
-                if r.is_ok() {
-                    let _ = paavo_db::BoardRow::touch_last_used(db.raw_conn(), &board_id, now_ms);
-                }
-                r.is_ok()
-            };
-            if !claim_ok {
-                // Someone else (a parallel dispatcher in the future, or
-                // a manual UPDATE) won the claim race. Brief sleep so we
-                // don't spin on the SQLite lock when the race becomes
-                // possible.
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            // Synchronously announce the Submitted→Building transition
-            // to live-log subscribers. Order matters: publish AFTER the
-            // DB transition has succeeded (above), so a subscriber that
-            // races a `GET /jobs/:id` against this Phase event sees a
-            // state-coherent pair (state=Building, last phase=Building).
-            // The broker may have no subscribers yet — `publish`
-            // returns 0 and the event is dropped, which is fine
-            // because viewers that join later read state from
-            // `JobView.state` and infer phase from there.
-            state
-                .job_logs
-                .publish(job_id, LiveEvent::Phase(JobPhase::Building));
-            // Allocate a fresh cancel channel inside the registry. The
-            // sender stays on the registry entry so `signal()` keeps
-            // working through the job's lifetime; the receiver is
-            // consumed later by `RealRunner::run` via `take_receiver`,
-            // which hands it to the BoardWorker's watchdog. Dispatch
-            // itself never touches the rx — wiring is centralised in
-            // the runner.
-            state.cancellation.register(job_id);
-
-            let state_clone = state.clone();
-            let runner_clone = runner.clone();
-            tokio::task::spawn_blocking(move || {
-                run_one(state_clone, runner_clone, scheduled.job, scheduled.board);
-            });
+            run_stage(&state, &runner, cfg);
+            build_stage(&state, &builder, &slot_rx, &slot_tx, cfg);
+            sleep(Duration::from_millis(250)).await;
         }
     })
 }
 
-/// Per-job blocking work: build (or cache hit), transition to Running,
-/// invoke the Runner, persist outcome, apply quarantine, publish
-/// terminal frame, unregister cancellation.
-///
-/// **Cleanup invariant**: every exit path from this function MUST
-/// finalize via `finalize_with_outcome` so the cancellation registry
-/// and the live-log broker entry are reclaimed. We use
-/// `std::panic::catch_unwind` to ensure even a panicking
-/// `runner.run` / `build_or_cache` doesn't leak — a panic surfaces as
-/// `JobOutcome::Failed(InfraErr { stage: "dispatch", message })` so
-/// the operator sees a clear terminal instead of a stuck Building/
-/// Running row.
-///
-/// The cancel-channel rx is owned by the `CancellationRegistry`
-/// entry that `spawn` allocated via `register(job_id)`; the runner
-/// consumes it via `take_receiver` inside `runner.run`. Dispatch
-/// does not touch the rx directly — wiring is centralised in
-/// `RealRunner::run`.
-fn run_one(
+/// Drain `AwaitingBoard` jobs onto free boards until none can dispatch.
+fn run_stage(state: &AppState, runner: &Arc<dyn Runner>, cfg: SchedulerConfig) {
+    loop {
+        let now = Utc::now().timestamp_millis();
+        let pick = {
+            let db = state.db.lock();
+            pick_runnable(db.raw_conn(), cfg, now)
+        };
+        let scheduled = match pick {
+            Ok(Some(s)) => s,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(error = %e, "dispatch: pick_runnable failed");
+                break;
+            }
+        };
+        let job_id = scheduled.job.id;
+        let board_id = scheduled.board.spec.id.clone();
+        let claim_ok = {
+            let db = state.db.lock();
+            let r = JobRow::transition_awaiting_to_running(db.raw_conn(), &job_id, &board_id);
+            if r.is_ok() {
+                let _ = paavo_db::BoardRow::touch_last_used(db.raw_conn(), &board_id, now);
+            }
+            r.is_ok()
+        };
+        if !claim_ok {
+            break; // raced (e.g. a cancel landed); next tick recovers
+        }
+        state
+            .job_logs
+            .publish(job_id, LiveEvent::Phase(JobPhase::Running));
+        state.cancellation.register(job_id);
+        let st = state.clone();
+        let rn = runner.clone();
+        tokio::task::spawn_blocking(move || run_one_run(st, rn, scheduled.job, board_id));
+    }
+}
+
+/// Fill free build slots with `Submitted` jobs (single-flight respected
+/// by `pick_buildable`).
+fn build_stage(
+    state: &AppState,
+    builder: &Arc<dyn Builder>,
+    slot_rx: &crossbeam_channel::Receiver<usize>,
+    slot_tx: &crossbeam_channel::Sender<usize>,
+    cfg: SchedulerConfig,
+) {
+    loop {
+        let now = Utc::now().timestamp_millis();
+        let pick = {
+            let db = state.db.lock();
+            pick_buildable(db.raw_conn(), cfg, now)
+        };
+        let job = match pick {
+            Ok(Some(j)) => j,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(error = %e, "dispatch: pick_buildable failed");
+                break;
+            }
+        };
+        let slot = match slot_rx.try_recv() {
+            Ok(s) => s,
+            Err(_) => break, // at cap
+        };
+        let job_id = job.id;
+        let claim_ok = {
+            let db = state.db.lock();
+            JobRow::transition_submitted_to_building(db.raw_conn(), &job_id, now).is_ok()
+        };
+        if !claim_ok {
+            let _ = slot_tx.send(slot);
+            break;
+        }
+        state
+            .job_logs
+            .publish(job_id, LiveEvent::Phase(JobPhase::Building));
+        let cancel_rx = state.build_cancel.register(job_id);
+        let st = state.clone();
+        let b = builder.clone();
+        let stx = slot_tx.clone();
+        tokio::task::spawn_blocking(move || run_one_build(st, b, job, slot, stx, cancel_rx));
+    }
+}
+
+enum BuildStageOutcome {
+    /// Job advanced to `AwaitingBoard`; broker stays open for the run.
+    Advanced,
+    /// Build stage produced a terminal outcome (BuildErr/Aborted/Infra).
+    Terminal(JobOutcome),
+}
+
+/// Per-job build work on the blocking pool. Always reclaims the slot +
+/// build-cancel entry, even on panic.
+fn run_one_build(
     state: AppState,
-    runner: Arc<dyn Runner>,
-    job: paavo_db::JobRow,
-    board: paavo_db::BoardRow,
+    builder: Arc<dyn Builder>,
+    job: JobRow,
+    slot: usize,
+    slot_tx: crossbeam_channel::Sender<usize>,
+    cancel_rx: crossbeam_channel::Receiver<()>,
 ) {
     let job_id = job.id;
-    let board_id = board.spec.id.clone();
-
-    // Use catch_unwind so a panic in build_or_cache or runner.run can't
-    // leave the job stuck in Building/Running with a leaked broker +
-    // cancellation entry. The catch boundary is the function body
-    // minus its own cleanup. UnwindSafe is satisfied because the only
-    // captured-by-mutable-ref values (the inner Option<...> outcome
-    // accumulator) are not unwind-observable.
-    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_one_inner(&state, runner.as_ref(), &job, &board_id)
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_inner(&state, builder.as_ref(), &job, slot, cancel_rx)
     }));
-    let (outcome, probe_released_cleanly) = match panic_result {
-        Ok(pair) => pair,
+    let _ = slot_tx.send(slot);
+    state.build_cancel.unregister(&job_id);
+    match res {
+        Ok(BuildStageOutcome::Advanced) => {}
+        Ok(BuildStageOutcome::Terminal(outcome)) => finalize_terminal(&state, &job_id, outcome),
         Err(payload) => {
-            let message = panic_message(&payload);
-            error!(%job_id, %message, "dispatch: run_one panicked");
-            (
+            let message = panic_message(payload);
+            error!(%job_id, %message, "dispatch: run_one_build panicked");
+            finalize_terminal(
+                &state,
+                &job_id,
                 JobOutcome::Failed(TerminalOutcome::InfraErr {
-                    stage: "dispatch".into(),
+                    stage: "build_dispatch".into(),
                     message,
                 }),
-                false,
-            )
-        }
-    };
-    finalize_with_outcome(&state, &job_id, &board_id, outcome, probe_released_cleanly);
-}
-
-/// Inner body of `run_one` — returns the outcome + probe_released_cleanly
-/// pair. Any early return funnels through here and the wrapper in
-/// `run_one` guarantees finalize gets called.
-fn run_one_inner(
-    state: &AppState,
-    runner: &dyn Runner,
-    job: &paavo_db::JobRow,
-    board_id: &str,
-) -> (JobOutcome, bool) {
-    let job_id = job.id;
-
-    // Shared per-job log-frame seq counter + monotonic job-start clock.
-    // Both reach the build forwarder (via build_or_cache, a later task) and
-    // the run forwarder (via RunContext, below) so build- and run-phase
-    // frames share one contiguous seq space and one timeline.
-    let job_start = std::time::Instant::now();
-    let log_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    // 2. Cache lookup or build. The cache is keyed by tar_blake3, so
-    //    an identical resubmit hits it (fast turnaround). Operators
-    //    chasing a flaky chip can force a fresh build + flash by
-    //    submitting with `--skip-cache` (paavo-cli) / `skip_cache:
-    //    true` (JobSpec); see `JobRow::skip_cache`.
-    let elf_path = match build_or_cache(state, job, &log_seq, job_start) {
-        Ok(p) => p,
-        Err(stderr) => {
-            return (
-                JobOutcome::Failed(TerminalOutcome::BuildErr { stderr }),
-                true,
-            );
-        }
-    };
-
-    // 3. Transition Building → Running. If the row has been moved out
-    // from under us (e.g. a future cancel-during-Building lands on it),
-    // surface as InfraErr so the operator sees a terminal instead of
-    // a stuck Building row.
-    {
-        let db = state.db.lock();
-        if let Err(e) =
-            JobRow::transition_to_running(db.raw_conn(), &job_id, &elf_path.display().to_string())
-        {
-            warn!(error = %e, %job_id, "dispatch: transition_to_running failed");
-            return (
-                JobOutcome::Failed(TerminalOutcome::InfraErr {
-                    stage: "transition_to_running".into(),
-                    message: e.to_string(),
-                }),
-                true,
             );
         }
     }
-    // Synchronously announce the Building→Running transition. Order
-    // matters: publish AFTER the DB transition has succeeded (above)
-    // and BEFORE runner.run starts producing run-phase frames, so a
-    // subscriber that just connected sees Phase(Running) before the
-    // first defmt frame from the test ELF.
-    state
-        .job_logs
-        .publish(job_id, LiveEvent::Phase(JobPhase::Running));
-
-    // 4. Run.
-    let RunOutcome {
-        outcome,
-        probe_released_cleanly,
-    } = runner.run(paavo_core::RunContext {
-        job_id,
-        board_id,
-        log_seq: log_seq.clone(),
-        job_start,
-    });
-    (outcome, probe_released_cleanly)
 }
 
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
-}
-
-/// Look up the cached ELF or build from the tar. On cache miss, run
-/// `paavo_build::build_release` and store the result in the cache.
-/// Returns the ELF path. On build failure returns the captured
-/// stderr tail so the caller can produce a `BuildErr` outcome.
-fn build_or_cache(
+fn build_inner(
     state: &AppState,
-    job: &paavo_db::JobRow,
-    log_seq: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-    job_start: std::time::Instant,
-) -> Result<std::path::PathBuf, String> {
-    let now_ms = Utc::now().timestamp_millis();
-    // `skip_cache` is the operator's explicit "rebuild, don't reuse a
-    // cached ELF for this tar_blake3" knob (set via paavo-cli
-    // `--skip-cache` / JobSpec::skip_cache). When true we deliberately
-    // do NOT consult the build_cache table; the cargo target dir is
-    // still shared across jobs (CARGO_TARGET_DIR) so a no-op rebuild
-    // is fast, but the path goes through `paavo_build::build_release`
-    // every time so any drift between submits is healed.
-    //
-    // We also do NOT delete the existing cache row — a subsequent
-    // submit without --skip-cache should still hit the cache. The
-    // upstream cache_store at the end of this function refreshes the
-    // row's last_used_at + elf_path either way, so the cache stays
-    // warm for the next operator who wants the fast path.
+    builder: &dyn Builder,
+    job: &JobRow,
+    slot: usize,
+    cancel_rx: crossbeam_channel::Receiver<()>,
+) -> BuildStageOutcome {
+    let sd = crate::state_dir::StateDir::from_root(&state.config.server.state_dir);
+    let now = Utc::now().timestamp_millis();
+
+    // Cache hit → straight to AwaitingBoard (no slot work).
     if !job.skip_cache {
         let lookup = {
             let db = state.db.lock();
-            cache_lookup(db.raw_conn(), &job.tar_blake3, now_ms)
+            cache_lookup(db.raw_conn(), &job.tar_blake3, now)
         };
         if let Ok(CacheLookup::Hit { elf_path }) = lookup {
-            return Ok(elf_path);
+            let db = state.db.lock();
+            return match JobRow::transition_building_to_awaiting_board(
+                db.raw_conn(),
+                &job.id,
+                &elf_path.display().to_string(),
+            ) {
+                Ok(()) => BuildStageOutcome::Advanced,
+                Err(e) => BuildStageOutcome::Terminal(JobOutcome::Failed(
+                    TerminalOutcome::InfraErr {
+                        stage: "transition_awaiting_board".into(),
+                        message: e.to_string(),
+                    },
+                )),
+            };
         }
-    } else {
-        tracing::info!(
-            job_id = %job.id,
-            tar_blake3 = %job.tar_blake3,
-            "build: skip_cache=true; bypassing build_cache lookup, will rebuild"
-        );
     }
 
-    // Cache miss (or lookup error — fall through to a fresh build).
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(&job.tar_path)
-        .and_then(|mut f| f.read_to_end(&mut bytes))
-        .map_err(|e| format!("read tar {}: {e}", job.tar_path))?;
-    let sd = crate::state_dir::StateDir::from_root(&state.config.server.state_dir);
-    let crate_dir = sd.sandboxes_dir.join(job.id.to_string());
-    unpack_into(&bytes, &crate_dir).map_err(|e| e.to_string())?;
-
-    // Find the unique sub-dir under crate_dir that contains Cargo.toml.
-    let crate_root = walkdir::WalkDir::new(&crate_dir)
-        .min_depth(1)
-        .max_depth(2)
-        .into_iter()
-        .flatten()
-        .find(|e| e.file_name() == "Cargo.toml")
-        .map(|e| e.path().parent().unwrap().to_path_buf())
-        .ok_or_else(|| "no Cargo.toml in uploaded tar".to_string())?;
-
-    let plan = BuildPlan {
-        crate_dir: crate_root,
-        target_dir: sd.cargo_target_dir.clone(),
-        // Thread the job's `cargo_update_packages` through to the build
-        // sandbox. paavo_build runs `cargo update -p <pkg>` for each
-        // before `cargo build`. HTTP-submitted jobs always carry
-        // `vec![]` (dep graph locked at submit time); the nightly cron
-        // populates it from `[[corpus]].cargo_update` so soak runs
-        // pull fresh embassy revisions (spec §8.1 step 4).
-        cargo_update_packages: job.cargo_update_packages.clone(),
-    };
-
-    // Build-forwarder: drains BuildLine messages from
-    // build_release_streaming and feeds each into a FrameSink, which
-    // assigns the shared per-job seq, stamps ts_us against the shared
-    // job-start clock, publishes on the JobLogsBroker for live
-    // `/jobs/:id/stream` subscribers, and batch-persists to
-    // `log_frame`. The run forwarder feeds an identically-constructed
-    // FrameSink from the same `log_seq` + `job_start`, so build- and
-    // run-phase frames share one contiguous seq space and one
-    // monotonic timeline.
-    //
-    // Frame translation:
-    //   - target = "cargo:stdout" / "cargo:stderr" — the colon-
-    //     namespaced convention the UI infers the build phase from.
-    //     Operators filter on the `cargo:` prefix to isolate build
-    //     lines.
-    //   - level = Info uniformly. Cargo's stderr is mostly progress
-    //     output ("Compiling foo v0.1.0", "Finished release [...]"),
-    //     not warn/error severity. Real failures surface as
-    //     `JobOutcome::Failed(BuildErr {...})` on the terminal event.
-    //
-    // `recv_timeout` (not `recv`) so the FrameSink's 50 ms flush
-    // deadline fires even when cargo goes quiet mid-compile.
+    // Build forwarder: cargo lines → broker + log_frame (build phase seq 0..).
+    let log_seq = Arc::new(AtomicU64::new(0));
+    let job_start = std::time::Instant::now();
     let (build_tx, build_rx) = crossbeam_channel::unbounded::<paavo_build::BuildLine>();
     let mut sink = crate::log_sink::FrameSink::new(
         job.id,
         state.job_logs.clone(),
         state.db.clone(),
-        log_seq.clone(),
+        log_seq,
         job_start,
     );
-    let job_id_for_fwd = job.id;
-    let build_fwd = std::thread::Builder::new()
+    let fwd = std::thread::Builder::new()
         .name("paavod-build-forwarder".into())
         .spawn(move || loop {
             match build_rx.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -377,11 +243,7 @@ fn build_or_cache(
                         paavo_build::BuildStream::Stdout => "cargo:stdout",
                         paavo_build::BuildStream::Stderr => "cargo:stderr",
                     };
-                    sink.push(
-                        paavo_proto::LogLevel::Info,
-                        Some(target.to_string()),
-                        bl.text,
-                    );
+                    sink.push(paavo_proto::LogLevel::Info, Some(target.to_string()), bl.text);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => sink.tick(),
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -392,46 +254,101 @@ fn build_or_cache(
         })
         .expect("spawn paavod-build-forwarder thread");
 
-    let res = paavo_build::build_release_streaming(&plan, build_tx).map_err(|e| e.to_string());
-    // Always join the forwarder before returning so a failure path
-    // doesn't leave the thread dangling. The forwarder exits when
-    // build_release_streaming drops its build_tx clones (which the
-    // streaming function does on every return path).
-    if let Err(payload) = build_fwd.join() {
-        let msg = panic_message(&payload);
-        warn!(%job_id_for_fwd, msg, "build forwarder thread panicked; build output may be incomplete");
-    }
-    let res = res?;
-    let now_ms = Utc::now().timestamp_millis();
-    {
-        let db = state.db.lock();
-        if let Err(e) = cache_store(db.raw_conn(), &job.tar_blake3, &res.elf_path, now_ms) {
-            warn!(error = %e, job_id = %job.id, "dispatch: cache_store failed; continuing anyway");
+    let req = BuildRequest {
+        job,
+        sandbox_dir: sd.sandboxes_dir.join(job.id.to_string()),
+        target_dir: sd.build_slot_dir(slot),
+    };
+    let outcome = builder.build(req, build_tx, cancel_rx);
+    let _ = fwd.join();
+
+    match outcome {
+        BuildOutcome::Ok { elf_path } => {
+            // Copy to a stable, content-addressed artifact so slot reuse
+            // can't clobber it and the cache path stays valid.
+            let stable = sd.cache_elfs_dir.join(format!("{}.elf", job.tar_blake3));
+            if let Err(e) = std::fs::copy(&elf_path, &stable) {
+                return BuildStageOutcome::Terminal(JobOutcome::Failed(
+                    TerminalOutcome::InfraErr {
+                        stage: "artifact_copy".into(),
+                        message: e.to_string(),
+                    },
+                ));
+            }
+            let stable_str = stable.display().to_string();
+            let db = state.db.lock();
+            let now2 = Utc::now().timestamp_millis();
+            if let Err(e) = cache_store(db.raw_conn(), &job.tar_blake3, &stable, now2) {
+                warn!(error = %e, job_id = %job.id, "dispatch: cache_store failed; continuing");
+            }
+            match JobRow::transition_building_to_awaiting_board(db.raw_conn(), &job.id, &stable_str) {
+                Ok(()) => BuildStageOutcome::Advanced,
+                Err(e) => BuildStageOutcome::Terminal(JobOutcome::Failed(
+                    TerminalOutcome::InfraErr {
+                        stage: "transition_awaiting_board".into(),
+                        message: e.to_string(),
+                    },
+                )),
+            }
+        }
+        BuildOutcome::Failed(stderr) => {
+            BuildStageOutcome::Terminal(JobOutcome::Failed(TerminalOutcome::BuildErr { stderr }))
+        }
+        BuildOutcome::Cancelled => {
+            BuildStageOutcome::Terminal(JobOutcome::Aborted { by: AbortReason::User })
         }
     }
-    Ok(res.elf_path)
 }
 
-/// Persist the terminal outcome, apply the quarantine policy, publish
-/// the Terminal event on the live broker, finalize the broker channel,
-/// and unregister the cancellation entry. Idempotent at the broker
-/// layer — `finalize` removes any stale Sender. At the DB layer, a
-/// second call would fail the WHERE-state-clause guard in
-/// `JobRow::finalize`, which is logged + tolerated.
-fn finalize_with_outcome(
+/// Per-job run work on the blocking pool. Continues the log seq space
+/// after the build-phase frames so live viewers see one timeline.
+fn run_one_run(state: AppState, runner: Arc<dyn Runner>, job: JobRow, board_id: String) {
+    let job_id = job.id;
+    let start_seq = {
+        let db = state.db.lock();
+        JobRow::next_log_seq(db.raw_conn(), &job_id).unwrap_or(0)
+    };
+    let log_seq = Arc::new(AtomicU64::new(start_seq));
+    let job_start = std::time::Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runner.run(paavo_core::RunContext {
+            job_id,
+            board_id: &board_id,
+            log_seq: log_seq.clone(),
+            job_start,
+        })
+    }));
+    let (outcome, probe_released_cleanly) = match result {
+        Ok(RunOutcome {
+            outcome,
+            probe_released_cleanly,
+        }) => (outcome, probe_released_cleanly),
+        Err(payload) => {
+            let message = panic_message(payload);
+            error!(%job_id, %message, "dispatch: run_one_run panicked");
+            (
+                JobOutcome::Failed(TerminalOutcome::InfraErr {
+                    stage: "dispatch".into(),
+                    message,
+                }),
+                false,
+            )
+        }
+    };
+    finalize_run(&state, &job_id, &board_id, outcome, probe_released_cleanly);
+}
+
+/// Run-stage terminal: persist outcome, apply board quarantine policy,
+/// publish Terminal, finalize broker, unregister run cancellation.
+fn finalize_run(
     state: &AppState,
     job_id: &JobId,
     board_id: &str,
     outcome: JobOutcome,
     probe_released_cleanly: bool,
 ) {
-    let terminal_state = match &outcome {
-        JobOutcome::Passed => JobState::Passed,
-        JobOutcome::Failed(_) => JobState::Failed,
-        JobOutcome::TimedOut { .. } => JobState::TimedOut,
-        JobOutcome::Aborted { .. } => JobState::Aborted,
-    };
-    let now_ms = Utc::now().timestamp_millis();
+    let terminal_state = terminal_state_of(&outcome);
+    let now = Utc::now().timestamp_millis();
     {
         let db = state.db.lock();
         if let Err(e) = JobRow::finalize(
@@ -440,10 +357,10 @@ fn finalize_with_outcome(
             &OutcomeRecord {
                 state: terminal_state,
                 outcome: outcome.clone(),
-                finished_at_ms: now_ms,
+                finished_at_ms: now,
             },
         ) {
-            warn!(error = %e, %job_id, "dispatch: JobRow::finalize failed");
+            warn!(error = %e, %job_id, "dispatch: finalize_run failed");
         }
         if let Err(e) = apply_outcome_to_board(
             db.raw_conn(),
@@ -457,9 +374,49 @@ fn finalize_with_outcome(
             warn!(error = %e, board_id, "dispatch: apply_outcome_to_board failed");
         }
     }
-    state
-        .job_logs
-        .publish(*job_id, LiveEvent::Terminal(outcome));
+    state.job_logs.publish(*job_id, LiveEvent::Terminal(outcome));
     state.job_logs.finalize(*job_id);
     state.cancellation.unregister(job_id);
+}
+
+/// Build-stage terminal: persist outcome, publish Terminal, finalize
+/// broker. No board involved → no quarantine accounting.
+fn finalize_terminal(state: &AppState, job_id: &JobId, outcome: JobOutcome) {
+    let terminal_state = terminal_state_of(&outcome);
+    let now = Utc::now().timestamp_millis();
+    {
+        let db = state.db.lock();
+        if let Err(e) = JobRow::finalize(
+            db.raw_conn(),
+            job_id,
+            &OutcomeRecord {
+                state: terminal_state,
+                outcome: outcome.clone(),
+                finished_at_ms: now,
+            },
+        ) {
+            warn!(error = %e, %job_id, "dispatch: finalize_terminal failed");
+        }
+    }
+    state.job_logs.publish(*job_id, LiveEvent::Terminal(outcome));
+    state.job_logs.finalize(*job_id);
+}
+
+fn terminal_state_of(outcome: &JobOutcome) -> JobState {
+    match outcome {
+        JobOutcome::Passed => JobState::Passed,
+        JobOutcome::Failed(_) => JobState::Failed,
+        JobOutcome::TimedOut { .. } => JobState::TimedOut,
+        JobOutcome::Aborted { .. } => JobState::Aborted,
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }

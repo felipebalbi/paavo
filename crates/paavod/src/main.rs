@@ -37,6 +37,8 @@ async fn main() -> Result<()> {
     let sd = StateDir::from_root(&config.server.state_dir);
     sd.ensure_dirs()
         .with_context(|| format!("creating state dirs under {}", sd.root.display()))?;
+    sd.ensure_build_slots(config.scheduler.max_concurrent_builds.max(1))
+        .with_context(|| format!("creating build slots under {}", sd.root.display()))?;
 
     let db = paavo_db::Db::open(&sd.sqlite_path)
         .with_context(|| format!("opening sqlite at {}", sd.sqlite_path.display()))?;
@@ -85,8 +87,9 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(paavod::real_runner::RealRunner::from_state(&state))
     };
+    let builder: Arc<dyn paavod::builder::Builder> = Arc::new(paavod::builder::RealBuilder);
 
-    let dispatch_handle = paavod::dispatch::spawn(state.clone(), runner);
+    let dispatch_handle = paavod::dispatch::spawn(state.clone(), builder, runner);
     let cron = paavod::cron::start(state.clone()).await?;
 
     let bind = config.server.bind.clone();
