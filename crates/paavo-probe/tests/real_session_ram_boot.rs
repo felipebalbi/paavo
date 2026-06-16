@@ -238,13 +238,15 @@ fn connect_takes_ram_boot_path_with_vector_table_at_ram_origin() {
             )
         });
 
-    let addr = ram_boot_event.field("vector_table_addr").unwrap_or_else(|| {
-        panic!(
-            "RAM-resident event present but missing `vector_table_addr` field. \
+    let addr = ram_boot_event
+        .field("vector_table_addr")
+        .unwrap_or_else(|| {
+            panic!(
+                "RAM-resident event present but missing `vector_table_addr` field. \
              Fields on the event: {:?}",
-            ram_boot_event.fields.keys().collect::<Vec<_>>()
-        )
-    });
+                ram_boot_event.fields.keys().collect::<Vec<_>>()
+            )
+        });
     assert_eq!(
         addr, "0x20000000",
         "vector_table_addr must equal ORIGIN(RAM) for the spike fixture (see \

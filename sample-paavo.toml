@@ -15,7 +15,7 @@
 bind = "127.0.0.1:8090"
 # Daemon state dir. Will be auto-created (uploads/, sandboxes/,
 # cargo-target/, cache/elf/). Sqlite + migrations land here too.
-state_dir = "C:/Users/febalbi/AppData/Local/paavo"
+state_dir = "/tmp/paavo"
 # 256 MiB per-request body cap for POST /jobs uploads.
 max_upload_bytes = 268435456
 
