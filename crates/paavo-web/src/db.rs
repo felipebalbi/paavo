@@ -57,6 +57,18 @@ impl WebDb {
         paavo_proto::LogFrame::list(self.inner.lock().raw_conn(), id, 0, limit)
     }
 
+    /// A page of log frames for a job (oldest first), starting at
+    /// `offset`. Backs `GET /api/jobs/:id/log`, which the SPA uses to
+    /// backfill scrollback before attaching the live SSE tail.
+    pub fn job_logs_page(
+        &self,
+        id: &paavo_proto::JobId,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_proto::LogFrame>> {
+        paavo_proto::LogFrame::list(self.inner.lock().raw_conn(), id, offset, limit)
+    }
+
     /// All schedule rows.
     pub fn all_schedules(&self) -> paavo_db::Result<Vec<ScheduleRow>> {
         ScheduleRow::list_all(self.inner.lock().raw_conn())

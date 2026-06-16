@@ -2,11 +2,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod api;
 pub mod app;
 pub mod config;
 pub mod db;
-pub mod feed;
+pub mod embed;
 pub mod index;
-pub mod pages;
 pub mod proxy;
 pub mod time;

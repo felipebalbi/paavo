@@ -200,7 +200,7 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
 | **paavo-core** | Scheduler + policy glue (enqueue, quarantine, cancel, build-cache bridge). **No HTTP, no async runtime.** | proto, db, build, runner | `src/scheduler.rs`, `src/enqueue.rs`, `src/quarantine.rs`, `src/build_cache.rs` |
 | **paavod** | The daemon. The **only** crate with axum. Two-stage dispatch, routes, config, cron, drain, frame sink. Largest crate. | proto, db, core, build, runner, probe | `src/main.rs`, `src/dispatch.rs`, `src/app.rs`, `src/routes/`, `src/config.rs` |
 | **paavo-cli** | Developer HTTP client (clap). The only user-facing TUI. | proto *(dev-only: paavod, paavo-db for integration tests)* | `src/cli.rs`, `src/cmd_run.rs`, `src/cmd_new.rs`, `src/client.rs` |
-| **paavo-web** | Read-only web viewer. Reads SQLite RO; proxies the daemon's NDJSON stream to browser SSE. | proto, db | `src/app.rs`, `src/proxy.rs`, `src/feed.rs`, `src/pages/` |
+| **paavo-web** | Read-only web backend for the WASM SPA. Reads SQLite RO; serves a JSON/SSE API and embeds the `paavo-web-ui` (Leptos CSR) bundle; proxies the daemon's NDJSON stream to browser SSE. | proto, db | `src/app.rs`, `src/api/`, `src/proxy.rs`, `src/index.rs`, `src/embed.rs` |
 
 ---
 
@@ -251,9 +251,14 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
   string) followed by `cortex_m::asm::bkpt()`. A bkpt without a preceding
   `Test OK` is classified as a test error.
 - **Known doc/code drift — trust the code:**
-  - `paavo-web` is **plain axum + server-rendered HTML with baked CSS/JS**
-    (`format!` + `include_str!`), **not Leptos**, despite what the 2026-06-09
-    master spec says.
+  - `paavo-web` is a **JSON/SSE API backend that embeds the Leptos CSR
+    WASM SPA** (`paavo-web-ui`) via `rust-embed` over
+    `../paavo-web-ui/dist`, **not** server-rendered HTML. The `dist/`
+    bundle is git-ignored and built out of band (`trunk build` /
+    `just build-ui`); rust-embed does **not** generate its accessors when
+    `dist/` is absent, so `paavo-web` won't compile until the UI bundle
+    exists. CI/fresh checkouts must build the UI before
+    `cargo build/test --workspace`.
   - `paavo-meta` is **self-contained `macro_rules!` macros**, not a
     re-export of any upstream `*-meta` crate.
   - `insta`, `proptest`, and `mockall` are pinned in

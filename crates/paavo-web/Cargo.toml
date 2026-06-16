@@ -52,6 +52,12 @@ futures      = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 bytes        = { workspace = true }
+# Bakes the `trunk`-built WASM UI bundle (`../paavo-web-ui/dist`) into
+# the paavo-web binary at compile time so the daemon stays a single-file
+# deploy. Not workspace-pinned: paavo-web is the only crate that embeds
+# the UI. `dist/` is produced out of band (git-ignored); see
+# `crate::embed`.
+rust-embed   = "8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
