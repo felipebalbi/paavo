@@ -38,7 +38,23 @@
   // hammering the server after the stream has closed cleanly.
   let closed = false;
 
-  const es = new EventSource('/api/jobs/' + encodeURIComponent(jobId) + '/stream');
+  // Highest seq already rendered. Initialized from the SSR-emitted
+  // data-since-seq (the last frame baked into the page). Every frame
+  // with seq <= lastSeq is dropped, making the consumer idempotent
+  // under historical replay, the broadcast-buffer race, and reconnects.
+  let lastSeq = parseInt(pane.dataset.sinceSeq || '-1', 10);
+  if (Number.isNaN(lastSeq)) lastSeq = -1;
+
+  // Pass since_seq upstream so the proxy doesn't re-ship the SSR
+  // prefix on the initial connect. Only meaningful when the page
+  // baked in historical frames.
+  const sinceQuery =
+    pane.dataset.sinceSeq != null
+      ? '?since_seq=' + encodeURIComponent(pane.dataset.sinceSeq)
+      : '';
+  const es = new EventSource(
+    '/api/jobs/' + encodeURIComponent(jobId) + '/stream' + sinceQuery
+  );
 
   // Append a `<span class="log-line ...">` to the pane and
   // auto-scroll if the operator is already pinned to the bottom.
@@ -83,13 +99,22 @@
       console.warn('paavo-web live-log: bad frame JSON', e.data);
       return;
     }
-    // Phase tag on the line: from the proxy's enrichment if
-    // present, otherwise none. The phase determines colour via the
-    // matching `.phase-build` / `.phase-run` CSS class declared in
-    // style.css.
-    const phaseClass = f.phase ? 'phase-' + f.phase : '';
+    // Idempotency: drop any frame we've already rendered. Closes the
+    // historical-replay, broadcast-buffer-race, and reconnect dup
+    // sources with one mechanism (see the C2 spec §5).
+    if (typeof f.seq === 'number') {
+      if (f.seq <= lastSeq) return;
+      lastSeq = f.seq;
+    }
+    // Phase tag: prefer the proxy's enrichment; fall back to an EXACT
+    // inference from target (cargo:* => build, else => run) so
+    // stream-replayed historical frames — which carry no Phase events —
+    // tag identically to SSR-rendered ones.
+    const phase =
+      f.phase || (f.target && f.target.indexOf('cargo:') === 0 ? 'build' : 'run');
+    const phaseClass = 'phase-' + phase;
     const lvlClass = 'lvl-' + (f.level || 'info');
-    const tag = f.phase ? '[' + f.phase + ']\u00a0' : '';
+    const tag = '[' + phase + ']\u00a0';
     const ts = f.display_ts || '';
     const lvl = (f.level || 'info').toUpperCase();
     const html =
