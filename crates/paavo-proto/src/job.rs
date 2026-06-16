@@ -272,3 +272,42 @@ pub struct JobView {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_cache: bool,
 }
+
+/// Lightweight jobs-list row. A subset of [`JobView`]: exactly the
+/// columns the jobs index holds in memory and the list renders. The
+/// fuzzy haystack is built from `id + submitter + state + board_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobListItem {
+    /// Job id.
+    pub id: JobId,
+    /// Current state.
+    pub state: JobState,
+    /// Scheduler priority.
+    pub priority: Priority,
+    /// Submitter free text.
+    pub submitter: String,
+    /// Board the job is/was dispatched to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_id: Option<String>,
+    /// Submission time, epoch ms.
+    pub submitted_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_list_item_roundtrips() {
+        let it = JobListItem {
+            id: JobId::new(),
+            state: JobState::Running,
+            priority: Priority::Interactive,
+            submitter: "alice".into(),
+            board_id: Some("mcxa266-01".into()),
+            submitted_at: 1_700_000_000_000,
+        };
+        let j = serde_json::to_string(&it).unwrap();
+        assert_eq!(it, serde_json::from_str::<JobListItem>(&j).unwrap());
+    }
+}
