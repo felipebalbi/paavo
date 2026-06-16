@@ -123,7 +123,7 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
         config: cfg,
         inventory: Arc::new(Mutex::new(inventory)),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
     (state, job_id, tmp)
@@ -308,7 +308,7 @@ async fn dispatch_exits_loop_on_drain_when_no_jobs_in_flight() {
         config: cfg,
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
     let runner: Arc<dyn Runner> = Arc::new(FakeRunner {

@@ -56,7 +56,7 @@ fn make_state(tmp: &std::path::Path) -> AppState {
         }),
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     }
 }

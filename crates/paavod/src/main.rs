@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         inventory: Arc::new(Mutex::new(inventory)),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
 

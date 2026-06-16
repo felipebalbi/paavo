@@ -78,7 +78,7 @@ fn make_state(corpus: Vec<CorpusEntry>, state_root: &std::path::Path) -> AppStat
         config: cfg,
         inventory: Arc::new(Mutex::new(inventory)),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     }
 }

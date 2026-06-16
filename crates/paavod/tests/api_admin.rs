@@ -53,7 +53,7 @@ fn state_with_dir() -> (PathBuf, AppState) {
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
         job_logs: paavod::job_logs::JobLogsBroker::new(),
-        cancellation: paavod::cancellation::CancellationRegistry::default(),
+        cancellation: paavod::cancellation::CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
     };
     (state_dir, s)
 }

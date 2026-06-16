@@ -64,6 +64,10 @@ pub struct AppState {
     /// `Building` / `Running` jobs, and `paavod::main` calls
     /// `signal_all(DaemonShutdown)` during SIGTERM drain.
     pub cancellation: crate::cancellation::CancellationRegistry,
+    /// Per-job BUILD-phase kill registry (Building cancel → kill the
+    /// cargo child). Distinct from `cancellation`, which carries
+    /// `RunCommand` to the run-phase watchdog.
+    pub build_cancel: crate::cancellation::BuildCancelRegistry,
 }
 
 impl AppState {

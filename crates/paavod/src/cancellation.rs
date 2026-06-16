@@ -96,3 +96,60 @@ impl CancellationRegistry {
         self.inner.lock().len()
     }
 }
+
+/// Per-job kill switch for the BUILD phase. Separate from
+/// `CancellationRegistry` (which carries `RunCommand` to the run
+/// watchdog): a build cancel just kills the cargo child via a `()`
+/// signal the build task hands to `Builder::build`.
+#[derive(Clone, Default)]
+pub struct BuildCancelRegistry {
+    inner: Arc<Mutex<HashMap<JobId, Sender<()>>>>,
+}
+
+impl BuildCancelRegistry {
+    /// Allocate a kill channel for a build about to start; returns the rx
+    /// the build task passes to `Builder::build`.
+    pub fn register(&self, id: JobId) -> Receiver<()> {
+        let (tx, rx) = unbounded::<()>();
+        self.inner.lock().insert(id, tx);
+        rx
+    }
+
+    /// Request a kill of the in-flight build. Returns `true` if a live
+    /// build channel existed (the receiver was still alive).
+    pub fn signal(&self, id: &JobId) -> bool {
+        match self.inner.lock().get(id) {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drop the entry when the build finishes. Idempotent.
+    pub fn unregister(&self, id: &JobId) {
+        self.inner.lock().remove(id);
+    }
+
+    /// In-flight build count (drain bookkeeping + tests).
+    pub fn active(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod build_cancel_tests {
+    use super::BuildCancelRegistry;
+    use paavo_proto::JobId;
+
+    #[test]
+    fn register_signal_unregister() {
+        let reg = BuildCancelRegistry::default();
+        let id = JobId::new();
+        let rx = reg.register(id);
+        assert_eq!(reg.active(), 1);
+        assert!(reg.signal(&id), "signal delivers while rx alive");
+        rx.recv().unwrap();
+        reg.unregister(&id);
+        assert_eq!(reg.active(), 0);
+        assert!(!reg.signal(&id), "signal after unregister is false");
+    }
+}

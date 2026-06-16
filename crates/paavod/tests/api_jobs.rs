@@ -62,7 +62,7 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
         inventory: Arc::new(Mutex::new(inv)),
         drain: DrainState::default(),
         job_logs: paavod::job_logs::JobLogsBroker::new(),
-        cancellation: paavod::cancellation::CancellationRegistry::default(),
+        cancellation: paavod::cancellation::CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
     }
 }
 
