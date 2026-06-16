@@ -5,6 +5,10 @@
 
 use crate::db::WebDb;
 use crate::pages::dashboard::{recent_jobs_tbody, RECENT_JOBS_LIMIT};
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -74,6 +78,31 @@ pub fn spawn_poller(db: WebDb, feed: JobFeed, interval: Duration) {
             }
         }
     });
+}
+
+/// `GET /api/dashboard/feed` — emit the current "Recent jobs" snapshot
+/// immediately, then one `recent-jobs` SSE event per change. The
+/// immediate snapshot closes the SSR→connect gap and re-syncs every
+/// `EventSource` auto-reconnect, so no `Last-Event-ID` handling is
+/// needed. 15 s keep-alive comments match the per-job proxy.
+pub async fn dashboard_feed(State(feed): State<JobFeed>) -> impl IntoResponse {
+    let mut rx = feed.subscribe();
+    let stream = async_stream::stream! {
+        // borrow_and_update marks the current value seen so the next
+        // changed() waits for the *next* change. The Ref is dropped at
+        // the end of each statement — never held across an .await.
+        let initial = rx.borrow_and_update().clone();
+        yield Ok::<Event, Infallible>(Event::default().event("recent-jobs").data(initial));
+        while rx.changed().await.is_ok() {
+            let payload = rx.borrow_and_update().clone();
+            yield Ok(Event::default().event("recent-jobs").data(payload));
+        }
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 #[cfg(test)]

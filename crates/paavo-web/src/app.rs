@@ -103,5 +103,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/static/style.css", get(serve_css))
         .route("/static/live-log.js", get(serve_live_log_js))
         .route("/api/jobs/:id/stream", get(crate::proxy::stream_job))
+        .route("/api/dashboard/feed", get(crate::feed::dashboard_feed))
         .with_state(state)
 }
