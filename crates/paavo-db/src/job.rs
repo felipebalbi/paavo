@@ -261,6 +261,28 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// Lightweight projection feeding paavo-web's in-memory jobs index.
+    /// Only the columns the list/search need; newest-first.
+    ///
+    /// Returns [`paavo_proto::JobListItem`] rows rather than full
+    /// [`JobRow`]s so the web viewer can hold the entire jobs index in
+    /// memory cheaply (no JSON-encoded selector/outcome/path columns).
+    /// Same ordering as `list_recent` — `submitted_at DESC, id DESC` —
+    /// so ties on the same millisecond stay deterministic via the
+    /// monotonic ULID id.
+    pub fn list_index(conn: &Connection) -> Result<Vec<paavo_proto::JobListItem>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, state, priority, submitter, board_id, submitted_at
+             FROM job ORDER BY submitted_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], index_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// `Submitted → Building`, recording the chosen board and start time.
     /// Errors if the job is not in `Submitted` state (0 rows updated).
     pub fn transition_to_building(
@@ -536,6 +558,33 @@ fn state_from_str(s: &str) -> Result<JobState> {
             })
         }
     })
+}
+
+/// Map a row from the `list_index` projection to a
+/// [`paavo_proto::JobListItem`]. Follows the same double-`Result` shape
+/// as `from_row` (outer = rusqlite row error, inner = decode error) so
+/// the caller can collect both layers in one chain.
+fn index_row(r: &Row<'_>) -> rusqlite::Result<Result<paavo_proto::JobListItem>> {
+    let id_str: String = r.get("id")?;
+    let state_str: String = r.get("state")?;
+    let priority_i64: i64 = r.get("priority")?;
+    let submitter: String = r.get("submitter")?;
+    let board_id: Option<String> = r.get("board_id")?;
+    let submitted_at: i64 = r.get("submitted_at")?;
+    Ok((|| -> Result<paavo_proto::JobListItem> {
+        let id = JobId::from_str(&id_str).map_err(|_| DbError::UnknownEnum {
+            column: "job.id",
+            value: id_str.clone(),
+        })?;
+        Ok(paavo_proto::JobListItem {
+            id,
+            state: state_from_str(&state_str)?,
+            priority: priority_from_i64(priority_i64)?,
+            submitter,
+            board_id,
+            submitted_at,
+        })
+    })())
 }
 
 /// Map a row to a Result, with JSON/enum decoding errors surfacing as
