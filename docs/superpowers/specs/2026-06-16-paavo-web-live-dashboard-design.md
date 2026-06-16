@@ -36,10 +36,10 @@ mode (`db::WebDb::open`) and every page handler reads at request time:
 
 Jobs enter the system by two paths, both of which write the DB:
 
-| Path | Writer |
-| --- | --- |
+| Path                             | Writer                                            |
+|----------------------------------|---------------------------------------------------|
 | `POST /jobs` (paavo-cli, ad-hoc) | `paavod::routes::jobs::post_jobs` → `enqueue_job` |
-| cron scheduler (nightly soaks) | `paavod::cron` → `enqueue_job` directly (no HTTP) |
+| cron scheduler (nightly soaks)   | `paavod::cron` → `enqueue_job` directly (no HTTP) |
 
 Because both terminate in a SQLite write, **polling the DB is the one
 observation point that sees every job from every source** — including
@@ -149,9 +149,9 @@ All changes live in `crates/paavo-web`.
  │        JobFeed (on AppState)                   │
  │              │ subscribe()                     │
  │      ┌───────┴────────┐                        │
- │      ▼                ▼                         │
- │  /api/dashboard/feed  /api/dashboard/feed       │
- │   (SSE conn A)        (SSE conn B)              │
+ │      ▼                ▼                        │
+ │  /api/dashboard/feed  /api/dashboard/feed      │
+ │   (SSE conn A)        (SSE conn B)             │
  └──────┼────────────────┼────────────────────────┘
         ▼                ▼
    EventSource      EventSource     ← dashboard-live.js
