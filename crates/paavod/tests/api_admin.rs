@@ -262,7 +262,10 @@ async fn purge_refuses_with_409_when_job_is_running() {
     let resp = post_empty(app, "/admin/purge").await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let body = read_text(resp).await;
-    assert!(body.contains("building or running"), "got: {body}");
+    assert!(
+        body.contains("building, awaiting board, or running"),
+        "got: {body}"
+    );
     // Confirm nothing was wiped: the in-flight job is still there.
     let db = s.db.lock();
     let n: i64 = db

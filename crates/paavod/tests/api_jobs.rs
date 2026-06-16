@@ -426,6 +426,50 @@ async fn cancel_submitted_job_returns_204() {
 }
 
 #[tokio::test]
+async fn cancel_awaiting_board_job_returns_204() {
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let id = paavo_proto::JobId::new();
+    paavo_db::JobRow::insert(
+        s.db.lock().raw_conn(),
+        &paavo_db::NewJob {
+            id,
+            priority: paavo_proto::Priority::Interactive,
+            submitter: "x".into(),
+            source: paavo_proto::JobSource::Cli,
+            board_selector: paavo_proto::BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "x".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+            skip_cache: false,
+        },
+        0,
+    )
+    .unwrap();
+    // Drive to AwaitingBoard via the two-stage transitions (no board).
+    paavo_db::JobRow::transition_submitted_to_building(s.db.lock().raw_conn(), &id, 1).unwrap();
+    paavo_db::JobRow::transition_building_to_awaiting_board(s.db.lock().raw_conn(), &id, "/e.elf")
+        .unwrap();
+
+    let app = build_router(s.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/jobs/{id}/cancel"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let row = paavo_db::JobRow::get(s.db.lock().raw_conn(), &id).unwrap();
+    assert_eq!(row.state, paavo_proto::JobState::Aborted);
+}
+
+#[tokio::test]
 async fn list_jobs_filters_by_state() {
     let tmp = tempdir().unwrap();
     let s = state(tmp.path());

@@ -355,6 +355,7 @@ fn parse_state(s: &str) -> Result<paavo_proto::JobState, (StatusCode, String)> {
         "submitted" => Submitted,
         "building" => Building,
         "running" => Running,
+        "awaiting_board" => AwaitingBoard,
         "passed" => Passed,
         "failed" => Failed,
         "timedout" => TimedOut,
@@ -382,13 +383,13 @@ pub async fn get_job(
     }
 }
 
-/// POST /jobs/:id/cancel — cancel a `Submitted` job inline.
+/// POST /jobs/:id/cancel.
 ///
-/// `Building`/`Running` cancellation will land in M4.3 (signal the
-/// worker); for now those return 409 so the API is honest. Unknown id
-/// returns 404 (paavo-db surfaces `DbError::NotFound { entity: "job" }`
-/// from `JobRow::get`, mapped here without pattern-matching on the
-/// underlying rusqlite variant).
+/// `Submitted`/`AwaitingBoard` are cancelled inline (no worker, no
+/// board) → `Aborted{User}`. `Building` kills the cargo child via the
+/// build-cancel registry; `Running` signals the run watchdog. If no
+/// live registry entry exists (already terminal, worker exited) → 409.
+/// Unknown id → 404 (paavo-db surfaces `DbError::NotFound`).
 pub async fn cancel_job(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -400,18 +401,20 @@ pub async fn cancel_job(
     let now_ms = Utc::now().timestamp_millis();
     let res = {
         let db = s.db.lock();
-        paavo_core::cancel_if_submitted(db.raw_conn(), &id, now_ms)
+        paavo_core::cancel_if_pending(db.raw_conn(), &id, now_ms)
     };
     match res {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(paavo_core::CoreError::NotCancellable { state }) => {
-            // Building / Running: try to deliver a Cancel signal to the
-            // worker via the registry. If a live sender exists the
-            // worker takes care of the transition (per §5.4); 204.
-            // Otherwise (terminal row, worker already exited, dispatch
-            // loop not running) the registry has nothing to signal and
-            // we return 409 — "not cancellable in state X".
-            if s.cancellation.signal(&id, paavo_runner::RunCommand::Cancel) {
+            // Submitted/AwaitingBoard were handled inline above by
+            // cancel_if_pending. Here: Building → kill the cargo child;
+            // Running → signal the run watchdog. If no live registry
+            // entry exists (terminal row, worker exited) → 409.
+            let signalled = match state {
+                paavo_proto::JobState::Building => s.build_cancel.signal(&id),
+                _ => s.cancellation.signal(&id, paavo_runner::RunCommand::Cancel),
+            };
+            if signalled {
                 StatusCode::NO_CONTENT.into_response()
             } else {
                 (

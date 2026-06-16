@@ -41,7 +41,7 @@ pub async fn purge(State(s): State<AppState>) -> HandlerResult<StatusCode> {
         let conn = db.raw_conn();
         let in_flight: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM job WHERE state IN ('building','running')",
+                "SELECT COUNT(*) FROM job WHERE state IN ('building','awaiting_board','running')",
                 [],
                 |r| r.get(0),
             )
@@ -56,7 +56,7 @@ pub async fn purge(State(s): State<AppState>) -> HandlerResult<StatusCode> {
             return Err((
                 StatusCode::CONFLICT,
                 format!(
-                    "purge refused: {in_flight} job(s) currently building or running; \
+                    "purge refused: {in_flight} job(s) currently building, awaiting board, or running; \
                      cancel or wait for them to terminate first"
                 ),
             ));
