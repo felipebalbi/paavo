@@ -31,6 +31,12 @@ anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
+# Human-readable timestamps. paavod and every other crate already
+# pin chrono via the workspace; paavo-web pulls the same `0.4 +
+# serde` pin in. Used by `crate::time` for the `epoch_ms_to_local`,
+# `relative_us`, and `relative_to_now` helpers that the pages render
+# in place of raw `i64.to_string()`.
+chrono      = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

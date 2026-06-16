@@ -1,6 +1,7 @@
 //! `/jobs/:id`.
 
 use crate::db::WebDb;
+use crate::time::{relative_us, ts_us_to_wall_clock};
 use axum::extract::{Path, State};
 use axum::response::Html;
 use std::str::FromStr;
@@ -46,11 +47,21 @@ pub async fn render(State(db): State<WebDb>, Path(id): Path<String>) -> Html<Str
         r#"<pre class="bg-zinc-900 text-zinc-100 text-xs leading-snug p-4 rounded overflow-x-auto">"#,
     );
     for f in &logs {
+        // Render `ts_us` as `mm:ss.fff` (relative to job start) for
+        // the visible body. Hover-tooltip resolves to the absolute
+        // wall-clock by adding `ts_us` to `submitted_at`. If
+        // `ts_us_to_wall_clock` returns `None` (impossible in
+        // practice — we always have submitted_at on a real JobRow —
+        // we just omit the title attribute, NOT render a broken
+        // tooltip).
+        let rel = relative_us(f.ts_us, true);
+        let tooltip = ts_us_to_wall_clock(f.ts_us, Some(job.submitted_at))
+            .map(|abs| format!(r#" title="{}""#, super::html_escape(&abs)))
+            .unwrap_or_default();
         body.push_str(&format!(
-            "{:>10} [{:?}] {}\n",
-            f.ts_us,
-            f.level,
-            super::html_escape(&f.message)
+            "<span{tooltip}>{rel} [{lvl:?}] {msg}\n</span>",
+            lvl = f.level,
+            msg = super::html_escape(&f.message),
         ));
     }
     body.push_str("</pre>");

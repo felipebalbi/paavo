@@ -1,12 +1,16 @@
 //! `/schedule`.
 
 use crate::db::WebDb;
+use crate::time::{epoch_ms_to_utc, relative_to_now};
 use axum::extract::State;
 use axum::response::Html;
+use chrono::Utc;
 
 /// Render the schedule page.
 pub async fn render(State(db): State<WebDb>) -> Html<String> {
     let rows = db.all_schedules().unwrap_or_default();
+    // Per-render baseline; matches dashboard.rs / boards.rs.
+    let now_ms = Utc::now().timestamp_millis();
     let mut body = String::from(
         r#"<h1 class="text-2xl font-semibold mb-4">schedule</h1>
 <table class="w-full text-sm"><thead><tr>
@@ -23,13 +27,24 @@ pub async fn render(State(db): State<WebDb>) -> Html<String> {
         );
     } else {
         for s in &rows {
+            // Two-faced timestamps for last_triggered_at and
+            // last_completed_at: visible body is relative ("2 hours
+            // ago"), tooltip is absolute UTC. Same pattern as boards.rs.
+            let (lt_abs, lt_rel) = match s.last_triggered_at {
+                Some(t) => (epoch_ms_to_utc(Some(t)), relative_to_now(t, now_ms)),
+                None => ("never".into(), "never".into()),
+            };
+            let (lc_abs, lc_rel) = match s.last_completed_at {
+                Some(t) => (epoch_ms_to_utc(Some(t)), relative_to_now(t, now_ms)),
+                None => ("never".into(), "never".into()),
+            };
             body.push_str(&format!(
                 r#"<tr>
 <td class="py-1.5 border-b border-zinc-200">{id}</td>
 <td class="py-1.5 border-b border-zinc-200"><code class="bg-zinc-100 px-1 rounded">{cron}</code></td>
 <td class="py-1.5 border-b border-zinc-200 {ec}">{en}</td>
-<td class="py-1.5 border-b border-zinc-200 text-zinc-500">{lt}</td>
-<td class="py-1.5 border-b border-zinc-200 text-zinc-500">{lc}</td>
+<td class="py-1.5 border-b border-zinc-200 text-zinc-500" title="{lt_abs}">{lt_rel}</td>
+<td class="py-1.5 border-b border-zinc-200 text-zinc-500" title="{lc_abs}">{lc_rel}</td>
 </tr>"#,
                 id = super::html_escape(&s.id),
                 cron = super::html_escape(&s.cron),
@@ -39,14 +54,6 @@ pub async fn render(State(db): State<WebDb>) -> Html<String> {
                     "text-zinc-500"
                 },
                 en = if s.enabled { "enabled" } else { "disabled" },
-                lt = s
-                    .last_triggered_at
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                lc = s
-                    .last_completed_at
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "—".into()),
             ));
         }
     }
