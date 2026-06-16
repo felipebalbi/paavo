@@ -118,6 +118,9 @@ pub enum AbortReason {
     User,
     /// SIGTERM drain ran out of grace.
     DaemonShutdown,
+    /// paavod restarted while this job was still building/running; the
+    /// startup reconciliation pass terminalized the orphaned row.
+    Interrupted,
 }
 
 /// Fully-tagged terminal outcome stored in the `job.outcome_detail` JSON

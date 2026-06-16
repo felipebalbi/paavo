@@ -212,6 +212,19 @@ fn terminal_aborted_daemon_shutdown_matches_historical() {
     );
 }
 
+#[test]
+fn terminal_aborted_interrupted_matches_historical() {
+    let expected = r#"{"type":"terminal","outcome":{"aborted":{"by":"interrupted"}}}"#;
+    assert_roundtrip(
+        WireMessage::Terminal {
+            outcome: JobOutcome::Aborted {
+                by: AbortReason::Interrupted,
+            },
+        },
+        expected,
+    );
+}
+
 // =============================================================
 // Variants: Lagged + Truncated
 // =============================================================
