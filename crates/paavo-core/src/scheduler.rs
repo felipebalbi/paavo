@@ -74,6 +74,65 @@ pub fn pick_next(
     Ok(None)
 }
 
+/// Build-stage pick: highest-priority `Submitted` job whose `tar_blake3`
+/// is NOT already `Building` (single-flight), with starvation promotion.
+/// No board required. Pure read; caller transitions to Building.
+pub fn pick_buildable(
+    conn: &Connection,
+    config: SchedulerConfig,
+    now_ms: i64,
+) -> paavo_db::Result<Option<paavo_db::JobRow>> {
+    let building: std::collections::HashSet<String> = paavo_db::JobRow::building_tar_blake3s(conn)?
+        .into_iter()
+        .collect();
+    let mut promoted: Vec<paavo_db::JobRow> =
+        paavo_db::JobRow::list_submitted(conn, MAX_SUBMITTED_SCAN)?
+            .into_iter()
+            .map(|mut j| {
+                if j.priority == Priority::Scheduled
+                    && now_ms - j.submitted_at >= config.starvation_threshold_ms
+                {
+                    j.priority = Priority::Interactive;
+                }
+                j
+            })
+            .collect();
+    promoted.sort_by_key(|j| (j.priority.weight(), j.submitted_at));
+    Ok(promoted
+        .into_iter()
+        .find(|j| !building.contains(&j.tar_blake3)))
+}
+
+/// Run-stage pick: highest-priority `AwaitingBoard` job that has a free
+/// healthy matching board (LRU), with starvation promotion. Pure read;
+/// caller transitions to Running.
+pub fn pick_runnable(
+    conn: &Connection,
+    config: SchedulerConfig,
+    now_ms: i64,
+) -> paavo_db::Result<Option<ScheduledJob>> {
+    let mut promoted: Vec<paavo_db::JobRow> =
+        paavo_db::JobRow::list_awaiting_board(conn, MAX_SUBMITTED_SCAN)?
+            .into_iter()
+            .map(|mut j| {
+                if j.priority == Priority::Scheduled
+                    && now_ms - j.submitted_at >= config.starvation_threshold_ms
+                {
+                    j.priority = Priority::Interactive;
+                }
+                j
+            })
+            .collect();
+    promoted.sort_by_key(|j| (j.priority.weight(), j.submitted_at));
+    for job in promoted {
+        let boards = paavo_db::BoardRow::find_healthy_for_selector(conn, &job.board_selector)?;
+        if let Some(pick) = lru_pick(boards) {
+            return Ok(Some(ScheduledJob { job, board: pick }));
+        }
+    }
+    Ok(None)
+}
+
 /// Sort by LRU (`None` first, then ascending `last_used_at`, ties broken by
 /// `spec.id`) and return the head, or `None` if `boards` is empty.
 fn lru_pick(mut boards: Vec<paavo_db::BoardRow>) -> Option<paavo_db::BoardRow> {

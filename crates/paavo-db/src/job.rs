@@ -181,6 +181,34 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// Returns up to `limit` jobs in `AwaitingBoard` state, in the same
+    /// scheduler dispatch order as `list_submitted` (priority then
+    /// oldest-first). Used by the run-stage scheduler.
+    pub fn list_awaiting_board(conn: &Connection, limit: u32) -> Result<Vec<Self>> {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM job WHERE state = 'awaiting_board'
+             ORDER BY priority ASC, submitted_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct `tar_blake3` values of jobs currently `Building` — the
+    /// single-flight set the build scheduler skips so N identical
+    /// concurrent submits compile only once.
+    pub fn building_tar_blake3s(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT tar_blake3 FROM job WHERE state = 'building'")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns the `limit` most recently submitted jobs in the given state,
     /// newest first. **For scheduler dispatch order on `Submitted`, use
     /// `list_submitted` instead** — it sorts by priority + age (oldest first

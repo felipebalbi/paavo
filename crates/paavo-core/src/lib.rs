@@ -25,5 +25,5 @@ pub use enqueue::{enqueue_job, validate_enqueue, EnqueueRequest};
 pub use error::{CoreError, Result};
 pub use quarantine::{apply_outcome_to_board, auto_quarantine_reason, QuarantinePolicy};
 pub use runner::{RunContext, RunOutcome, Runner};
-pub use scheduler::{pick_next, ScheduledJob, SchedulerConfig};
+pub use scheduler::{pick_buildable, pick_next, pick_runnable, ScheduledJob, SchedulerConfig};
 pub use selector::selector_matches_any;
