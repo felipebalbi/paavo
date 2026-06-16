@@ -1,0 +1,56 @@
+[package]
+name = "paavo-web-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Leptos client-side-rendered (CSR) single-page app. Cross-compiles to
+# wasm32-unknown-unknown and is built by `trunk`, NOT cargo — hence excluded
+# from the workspace (see root Cargo.toml `exclude`). Versions below are pinned
+# to the exact set proven to build on Rust 1.95.0 by the Task 0.2 spike; later
+# UI tasks target these. Bump deliberately, re-run `trunk build`, re-pin.
+
+# Standalone workspace. paavo-web-ui is excluded from the repo workspace, but
+# the empty `[workspace]` table is still required: cargo otherwise walks up the
+# directory tree and, because this branch's git worktree is nested inside the
+# main checkout, latches onto the main checkout's Cargo.toml (which neither
+# includes nor excludes this crate) and refuses to build. Mirrors the same
+# trick in tests/fixtures/smoke-crate. It also gives the wasm app its own
+# Cargo.lock, decoupled from the host workspace.
+[workspace]
+
+[dependencies]
+leptos = { version = "=0.7.8", features = ["csr"] }
+leptos_router = "=0.7.8"
+paavo-proto = { path = "../paavo-proto" }
+gloo-net = "=0.6.0"
+gloo-timers = { version = "=0.3.0", features = ["futures"] }
+# Pinned to 0.2.100 to match the wasm-bindgen-cli version trunk has cached
+# locally; trunk requires an exact crate<->CLI version match for the bindgen
+# step, and 0.2.100 avoids a network fetch.
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "=0.4.50"
+web-sys = { version = "=0.3.77", features = [
+    "EventSource",
+    "MessageEvent",
+    "Storage",
+    "Window",
+    "HtmlInputElement",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+# WHY getrandom is a *direct* dep even though the UI never generates ulids:
+# paavo-proto -> ulid 1.2 -> rand 0.9 -> rand_core 0.9 -> getrandom 0.3. The
+# ulid randomness path (Ulid::new) is compiled in even though the UI only
+# PARSES ulids, so getrandom must resolve a backend for wasm32-unknown-unknown.
+# getrandom 0.3 has NO default wasm backend, so we (a) enable the `wasm_js`
+# feature here — it unifies with rand_core's getrandom 0.3 and pulls in the
+# wasm-bindgen/js-sys backend — and (b) set `getrandom_backend="wasm_js"` via
+# .cargo/config.toml. NOTE: the plan anticipated getrandom 0.2 + the `js`
+# feature; the real tree uses getrandom 0.3 (via rand 0.9), so 0.2's `js`
+# feature would NOT unify and is insufficient. See .cargo/config.toml.
+getrandom = { version = "=0.3.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

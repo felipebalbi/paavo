@@ -1,0 +1,14 @@
+# Load-bearing for the wasm build (see Cargo.toml's getrandom dependency).
+#
+# getrandom 0.3 (pulled in transitively via paavo-proto -> ulid -> rand ->
+# rand_core) has no default RNG backend for wasm32-unknown-unknown and will
+# `compile_error!` without one. Selecting the wasm-bindgen/js-sys backend
+# requires BOTH the `wasm_js` *feature* (set in Cargo.toml) and this backend
+# *cfg*. The UI only parses ulids and never draws randomness, but the path is
+# still compiled in, so the backend must resolve for the crate to build.
+#
+# Scoped to the wasm target so it never leaks into host builds. `trunk build`
+# (which shells out to `cargo build --target wasm32-unknown-unknown`) picks
+# this up from the crate directory.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
