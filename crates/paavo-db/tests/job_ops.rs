@@ -274,3 +274,116 @@ fn get_unknown_id_returns_not_found() {
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
+
+#[test]
+fn abort_interrupted_jobs_terminalizes_in_flight_only() {
+    use paavo_db::LogFrameDb;
+    use paavo_proto::{AbortReason, JobOutcome, JobState, LogFrame, LogLevel};
+
+    let db = fresh_db();
+    insert_default_board(&db);
+    let conn = db.raw_conn();
+
+    // submitted: untouched (not orphaned).
+    let submitted = JobId::new();
+    JobRow::insert(conn, &sample_new_job(submitted), 0).unwrap();
+
+    // building: orphaned -> aborted.
+    let building = JobId::new();
+    JobRow::insert(conn, &sample_new_job(building), 0).unwrap();
+    JobRow::transition_to_building(conn, &building, "mcxa266-01", 1000).unwrap();
+
+    // running: orphaned -> aborted, with two pre-existing log frames.
+    let running = JobId::new();
+    JobRow::insert(conn, &sample_new_job(running), 0).unwrap();
+    JobRow::transition_to_building(conn, &running, "mcxa266-01", 1000).unwrap();
+    JobRow::transition_to_running(conn, &running, "/tmp/x.elf").unwrap();
+    let pre = vec![
+        LogFrame {
+            seq: 0,
+            ts_us: 10,
+            level: LogLevel::Info,
+            target: Some("cargo:stdout".into()),
+            message: "l0".into(),
+        },
+        LogFrame {
+            seq: 1,
+            ts_us: 20,
+            level: LogLevel::Info,
+            target: Some("cargo:stdout".into()),
+            message: "l1".into(),
+        },
+    ];
+    LogFrame::append_batch(conn, &running, &pre).unwrap();
+
+    // passed: terminal, untouched.
+    let passed = JobId::new();
+    JobRow::insert(conn, &sample_new_job(passed), 0).unwrap();
+    JobRow::transition_to_building(conn, &passed, "mcxa266-01", 1000).unwrap();
+    JobRow::transition_to_running(conn, &passed, "/tmp/y.elf").unwrap();
+    JobRow::finalize(
+        conn,
+        &passed,
+        &paavo_db::OutcomeRecord {
+            state: JobState::Passed,
+            outcome: JobOutcome::Passed,
+            finished_at_ms: 2000,
+        },
+    )
+    .unwrap();
+
+    // Reconcile at now_ms = 5000.
+    let n = JobRow::abort_interrupted_jobs(conn, 5000).unwrap();
+    assert_eq!(n, 2, "exactly the building + running jobs are reconciled");
+
+    // building + running are now aborted/interrupted.
+    for id in [&building, &running] {
+        let row = JobRow::get(conn, id).unwrap();
+        assert_eq!(row.state, JobState::Aborted, "in-flight job aborted");
+        assert_eq!(
+            row.outcome,
+            Some(JobOutcome::Aborted {
+                by: AbortReason::Interrupted
+            }),
+        );
+    }
+
+    // Forensic frame: running job's lands at seq 2 (after 0,1), warn level.
+    let frames = LogFrame::list(conn, &running, 0, 100).unwrap();
+    assert_eq!(frames.len(), 3, "two original + one forensic");
+    let forensic = &frames[2];
+    assert_eq!(forensic.seq, 2);
+    assert_eq!(forensic.level, LogLevel::Warn);
+    assert_eq!(
+        forensic.ts_us,
+        (5000 - 1000) * 1000,
+        "ts_us continues timeline from started_at"
+    );
+    assert!(
+        forensic.message.contains("interrupted"),
+        "forensic msg: {}",
+        forensic.message
+    );
+
+    // building job (no prior frames) gets its forensic frame at seq 0.
+    let bframes = LogFrame::list(conn, &building, 0, 100).unwrap();
+    assert_eq!(bframes.len(), 1);
+    assert_eq!(bframes[0].seq, 0);
+    assert_eq!(bframes[0].level, LogLevel::Warn);
+
+    // submitted + passed untouched.
+    assert_eq!(
+        JobRow::get(conn, &submitted).unwrap().state,
+        JobState::Submitted
+    );
+    assert_eq!(JobRow::get(conn, &passed).unwrap().state, JobState::Passed);
+    assert_eq!(LogFrame::list(conn, &submitted, 0, 100).unwrap().len(), 0);
+
+    // Idempotent: a second call finds nothing.
+    assert_eq!(JobRow::abort_interrupted_jobs(conn, 6000).unwrap(), 0);
+    assert_eq!(
+        LogFrame::list(conn, &running, 0, 100).unwrap().len(),
+        3,
+        "no new frames on re-run"
+    );
+}

@@ -78,6 +78,9 @@ fn job_outcome_roundtrip_all_variants() {
         JobOutcome::Aborted {
             by: paavo_proto::AbortReason::DaemonShutdown,
         },
+        JobOutcome::Aborted {
+            by: paavo_proto::AbortReason::Interrupted,
+        },
     ];
     for o in outcomes {
         let s = serde_json::to_string(&o).unwrap();

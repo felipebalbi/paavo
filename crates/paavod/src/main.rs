@@ -41,6 +41,24 @@ async fn main() -> Result<()> {
     let db = paavo_db::Db::open(&sd.sqlite_path)
         .with_context(|| format!("opening sqlite at {}", sd.sqlite_path.display()))?;
 
+    // Self-heal: terminalize any job left `building`/`running` by a
+    // previous paavod that died mid-job. A fresh process has no worker
+    // for those rows, so they are provably orphaned. Must run before
+    // `dispatch::spawn` so the loop never sees stale in-flight rows,
+    // and it un-deadlocks `admin purge` (which refuses while any job
+    // is in-flight). See the startup-reconciliation design spec.
+    let reconciled = paavo_db::JobRow::abort_interrupted_jobs(
+        db.raw_conn(),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .context("reconciling orphaned in-flight jobs at startup")?;
+    if reconciled > 0 {
+        tracing::warn!(
+            reconciled,
+            "startup: aborted orphaned in-flight jobs (interrupted)"
+        );
+    }
+
     // Sync boards.toml into the `board` table if present, then load the
     // inventory snapshot AppState caches. `inventory` MUST be populated
     // BEFORE we start serving HTTP — otherwise selector validation in
