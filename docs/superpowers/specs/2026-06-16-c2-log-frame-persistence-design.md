@@ -193,7 +193,15 @@ Consequences:
 
 ### 4.3 Per-frame persistence contract
 
-Each forwarder thread, per frame:
+The seq-assign + ts_us-stamp + broker-publish + batch-persist logic is
+identical for both phases, so it is extracted into a single
+unit-testable **`FrameSink`** (new module `crates/paavod/src/log_sink.rs`).
+Each forwarder constructs a `FrameSink` from the shared `Arc<AtomicU64>`
+seq counter + the shared `Instant` + the broker + the db handle, and
+feeds it frames. The sink owns a thread-local batch buffer; the shared
+seq/clock carry continuity across the build→run boundary.
+
+`FrameSink::push(level, target, message)`, per frame:
 
 1. `seq = log_seq.fetch_add(1, Relaxed)` — authoritative, overrides any
    probe-side seq.
@@ -201,15 +209,23 @@ Each forwarder thread, per frame:
    — shared monotonic timeline.
 3. `broker.publish(job_id, LiveEvent::Frame(frame.clone()))` — live path,
    unchanged.
-4. Push into a batch; flush via `LogFrame::append_batch` every **64
-   frames or 50 ms**, whichever comes first, plus a final flush when the
-   source channel closes (`RecvTimeoutError::Disconnected`).
+4. Push into the batch; flush via `LogFrame::append_batch` every **64
+   frames or 50 ms**, whichever comes first.
 
-The build forwarder switches from `crossbeam_channel::recv()` to
-`recv_timeout(50ms)` so the 50 ms flush deadline fires even when cargo
-goes quiet mid-compile. The run forwarder makes the same change.
+`FrameSink::tick()` flushes if ≥50 ms have elapsed since the last flush
+(called on a forwarder's `recv_timeout` timeout). `FrameSink::finish()`
+does a final flush (called when the source channel closes,
+`RecvTimeoutError::Disconnected`).
 
-`flush_batch` helper:
+Both forwarders switch from `crossbeam_channel::recv()` to
+`recv_timeout(50ms)` so the 50 ms flush deadline fires even when the
+source goes quiet (cargo mid-compile, firmware between defmt frames).
+The build forwarder maps `BuildLine { stream, text }` →
+`sink.push(Info, Some("cargo:stdout"|"cargo:stderr"), text)`; the run
+forwarder maps each incoming `LogFrame` →
+`sink.push(frame.level, frame.target, frame.message)`.
+
+The flush helper (a private method on `FrameSink`):
 
 ```
 fn flush_batch(db: &Arc<Mutex<Db>>, job_id: &JobId, batch: &[LogFrame]) {
@@ -236,7 +252,7 @@ Three dup sources, and what closes each:
 
 | # | Source | Closed by |
 | --- | --- | --- |
-| 1 | SSR pre-populates frames `0..N` into the HTML `<pre>`; the stream's `historical_lines` replays them | `since_seq=N` server trim **and** client `seq <= lastSeq` drop |
+| 1 | SSR pre-populates frames `0..N` into the HTML `<pre>`; the stream's `historical_lines` replays them | `since_seq=N` proxy trim **and** client `seq <= lastSeq` drop |
 | 2 | `stream_job` subscribes to the broker before `historical_lines` reads the DB; a frame both persisted and broadcast-buffered in that window is emitted twice in one stream | client `seq <= lastSeq` drop |
 | 3 | `EventSource` auto-reconnects → `historical_lines` replays the whole log; `since_seq` is frozen at the page-load value | client `seq <= lastSeq` drop |
 
@@ -254,15 +270,29 @@ current stateless consumer lacks.
 
 ### 5.2 `since_seq` (bandwidth trim)
 
+The filter lives in the **proxy**, not in paavod. paavod's stream
+endpoint is unchanged — it always replays the full historical range;
+the proxy drops the SSR-covered prefix before it reaches the browser.
+
 - `job_detail.rs` SSR computes `max_seq = logs.iter().map(|f| f.seq).max()`
   and emits `data-since-seq="{max_seq}"` on `#logpane`. Omitted when no
   historical rows exist.
 - `live-log.js` reads `dataset.sinceSeq` and appends it:
   `/api/jobs/{id}/stream?since_seq={n}`.
-- `proxy.rs::stream_job` accepts `Query<HashMap<String,String>>`, reads
-  `since_seq`, and forwards it onto the upstream paavod URL.
-- paavod `stream_job` accepts `since_seq`; `historical_lines` skips rows
-  with `seq <= since_seq`.
+- `proxy.rs::stream_job` reads `since_seq` from
+  `Query<HashMap<String,String>>` (default 0 / absent = no filter) and
+  passes it into `ndjson_to_sse`, which skips `WireMessage::Frame`
+  events whose `frame.seq <= since_seq`. Non-Frame events (Phase,
+  Lagged, Terminal, Truncated) always pass through.
+
+*Why the proxy and not paavod:* client-side dedup (§5.1) is the
+correctness backbone, so `since_seq` is purely a bandwidth trim on the
+proxy→browser hop. Filtering in `ndjson_to_sse` keeps the change to a
+single crate (paavo-web), matches the existing proxy test harness
+(synthetic `Vec<Bytes>` in → asserted SSE out), and leaves paavod's
+stream endpoint a pure historical+live replayer. The only thing a
+paavod-side filter would additionally save is the localhost
+paavod→proxy bytes — negligible.
 
 `since_seq` trims only the initial connect. Reconnect replays from the
 frozen value; client dedup absorbs it. Chasing `lastSeq` on reconnect
@@ -276,9 +306,9 @@ SSR uses `LogFrame::list(offset=0, limit=2000)` — the *first* 2000
 frames (head, ascending by seq). For jobs ≤2000 frames, SSR shows
 everything and `since_seq` = max; the stream adds only newer live
 frames. For jobs >2000, SSR shows `0..1999`, `data-since-seq=1999`, and
-the stream delivers `2000..end` via `historical_lines`. Head SSR +
-tail-of-historical stream composes to the full log with no gap and no
-dup.
+paavod's `historical_lines` replays `0..end` while the proxy filters to
+`2000..end` before the browser. Head SSR + tail-of-historical (after the
+proxy trim) composes to the full log with no gap and no dup.
 
 ## 6. Phase tags
 
@@ -313,23 +343,37 @@ frames tag identically. The proxy's `current_phase` cursor and the
 
 ## 8. Testing strategy
 
-1. `paavod/tests/dispatch_loop.rs` —
-   `build_and_run_lines_share_monotonic_seq`: a `FakeRunner` emits N run
-   frames after a build that emits M build lines; assert `log_frame`
-   rows have contiguous seqs `0..M+N-1` with no duplicates, the first M
-   carry `target = cargo:*`, and `ts_us` is non-decreasing across the
+The build forwarder (cache-bypassed in the existing dispatch fixtures)
+and run forwarder (replaced by `FakeRunner`, which emits no frames)
+cannot be driven through the integration fixtures. The persistence
+logic is therefore unit-tested at the `FrameSink` seam; the read path
+is already covered by existing `api_jobs.rs` stream tests.
+
+1. `paavod/src/log_sink.rs` (`#[cfg(test)]`) —
+   `push_assigns_monotonic_seq_and_persists`: a `FrameSink` over a temp
+   db; push 3 frames; assert 3 `log_frame` rows with seqs `0,1,2` and
+   the expected levels/targets/messages.
+2. `paavod/src/log_sink.rs` (`#[cfg(test)]`) —
+   `build_then_run_share_seq_and_clock` (the monotonic-seq test): two
+   `FrameSink`s sharing one `Arc<AtomicU64>` + one `Instant`; the first
+   pushes M build frames (`target = cargo:*`), the second pushes N run
+   frames; assert `log_frame` has contiguous seqs `0..M+N-1`, the first
+   M carry `cargo:*` targets, and `ts_us` is non-decreasing across the
    boundary.
-2. `paavod/tests/api_jobs.rs` —
-   `historical_replay_after_terminal_returns_persisted_frames`: run a
-   fake job to terminal, then `GET /jobs/:id/stream` and assert the
-   persisted historical frames come back (read path over real rows).
-3. `paavo-web/tests/proxy.rs` —
-   `since_seq_filters_historicals_from_sse_stream`: seed upstream NDJSON
-   frames seq `1..10`, request `?since_seq=5`, assert only `6..10` are
-   emitted as SSE `frame` events.
-4. `paavo-web/tests/smoke.rs` — extend the job-detail smoke to seed a
-   few frames and assert `data-since-seq` appears on `#logpane`.
-5. The `live-log.js` `lastSeq` dedup and `target`-phase fallback are
+3. `paavod/src/log_sink.rs` (`#[cfg(test)]`) —
+   `push_publishes_to_broker`: subscribe to the broker, push one frame,
+   assert the subscriber receives `LiveEvent::Frame` with the assigned
+   seq; and `final_flush_persists_partial_batch`: push 3 (< batch
+   threshold), `finish()`, assert all 3 rows present.
+4. `paavo-web/tests/proxy.rs` —
+   `since_seq_filters_historicals_from_sse_stream`: feed `ndjson_to_sse`
+   synthetic NDJSON `Frame`s seq `1..10` with `since_seq = 5`; assert
+   only seqs `6..10` are emitted as SSE `frame` events and that a
+   `Terminal` line still passes through.
+5. `paavo-web/tests/smoke.rs` — extend the job-detail smoke to seed a
+   few `log_frame` rows and assert `data-since-seq` appears on
+   `#logpane`.
+6. The `live-log.js` `lastSeq` dedup and `target`-phase fallback are
    covered by the proxy/SSR tests plus the §9 manual smoke. We do not
    stand up a JS test harness for this change.
 
@@ -359,18 +403,22 @@ frames tag identically. The proxy's `current_phase` cursor and the
 | File | Change |
 | --- | --- |
 | `crates/paavo-core/src/runner.rs` | Define `RunContext<'a>`; change `Runner::run` to take it |
-| `crates/paavod/src/dispatch.rs` | Create `job_start` + `log_seq`; pass to `build_or_cache`; build `RunContext`; build forwarder persists + batches + restamps seq/ts_us |
-| `crates/paavod/src/real_runner.rs` | `RealRunner::run(ctx)`; run forwarder reassigns seq, restamps ts_us, persists + batches (via `self.db`) |
+| `crates/paavod/src/log_sink.rs` | **New.** `FrameSink`: seq-assign + ts_us-stamp + broker-publish + batch-persist; `push`/`tick`/`finish` + unit tests |
+| `crates/paavod/src/lib.rs` | Declare `pub mod log_sink;` |
+| `crates/paavod/src/dispatch.rs` | Create `job_start` + `log_seq`; pass to `build_or_cache`; build `RunContext`; build forwarder feeds a `FrameSink` |
+| `crates/paavod/src/real_runner.rs` | `RealRunner::run(ctx)`; run forwarder feeds a `FrameSink` from `ctx` (via `self.db`) |
 | `crates/paavod/src/main.rs` | Update the dev `FakeRunner` impl to `run(ctx)` |
-| `crates/paavod/src/routes/jobs.rs` | `stream_job` reads `since_seq`; `historical_lines` skips `seq <= since_seq` |
-| `crates/paavod/tests/dispatch_loop.rs` | Update three test doubles to `run(ctx)`; new monotonic-seq test |
-| `crates/paavod/tests/api_jobs.rs` | Historical-replay-after-terminal test |
-| `crates/paavo-web/src/proxy.rs` | `since_seq` query param → upstream URL |
+| `crates/paavod/tests/dispatch_loop.rs` | Update three test doubles to `run(ctx)` |
+| `crates/paavo-web/src/proxy.rs` | `since_seq` query param → `ndjson_to_sse` filters `Frame` events with `seq <= since_seq` |
 | `crates/paavo-web/src/pages/job_detail.rs` | Compute max seq → `data-since-seq` |
 | `crates/paavo-web/src/assets/live-log.js` | `lastSeq` dedup; `target`-inferred phase fallback; `since_seq` on URL |
 | `crates/paavo-web/tests/proxy.rs` | `since_seq` filter test |
 | `crates/paavo-web/tests/smoke.rs` | Seed frames; assert `data-since-seq` |
 | `docs/deployment.md` | Retention note on build lines |
+
+**paavod stream endpoint (`routes/jobs.rs`):** unchanged — the
+`since_seq` filter lives in the proxy (§5.2), so `historical_lines`
+keeps replaying the full range.
 
 **Migration:** none. **Proto change:** none — `RunContext` is
 paavo-core-internal; `WireMessage` and `LogFrame` wire shapes are
