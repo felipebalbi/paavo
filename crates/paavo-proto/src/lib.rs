@@ -17,6 +17,7 @@ mod board;
 mod ids;
 mod job;
 mod log;
+mod page;
 mod schedule;
 mod stream;
 
@@ -27,5 +28,6 @@ pub use job::{
     TerminalOutcome, TimeoutReason,
 };
 pub use log::{LogFrame, LogLevel};
+pub use page::Page;
 pub use schedule::ScheduleView;
 pub use stream::{JobPhase, WireMessage};
