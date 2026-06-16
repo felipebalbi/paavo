@@ -2,18 +2,26 @@ use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use paavo_db::Db;
 use paavo_web::db::WebDb;
+use paavo_web::proxy::{AppState, PaavodClient};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
 /// Helper: open a fresh empty DB and build a router around it. Keeps the
 /// `TempDir` alive on the stack so the sqlite file isn't unlinked while
 /// the test is still reading it.
+///
+/// The `PaavodClient` points at a localhost URL on a port nothing is
+/// listening on. Smoke tests don't exercise the SSE proxy route, so
+/// the address never gets dialled — but if a future test does, it
+/// gets a clean connect-refused 502 rather than a panic.
 fn fresh_app() -> (tempfile::TempDir, axum::Router) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("paavo.sqlite");
     let _ = Db::open(&path).unwrap(); // run migrations
     let db = WebDb::open(&path).unwrap();
-    let app = paavo_web::app::build_router(db);
+    let paavod = PaavodClient::new("http://127.0.0.1:1").expect("valid URL");
+    let state = AppState { db, paavod };
+    let app = paavo_web::app::build_router(state);
     (dir, app)
 }
 
@@ -195,5 +203,40 @@ async fn html_shell_links_static_stylesheet() {
     assert!(
         !body.contains("cdn.jsdelivr.net"),
         "external CDN reference resurfaced; body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn sse_proxy_rejects_invalid_job_id_with_400() {
+    // The SSE proxy's first-line defence: any URL segment that
+    // doesn't parse as a `paavo_proto::JobId` (ULID) returns 400
+    // verbatim, without dialling paavod. Two upsides: (1) saves an
+    // upstream round trip on operator typos, (2) keeps the error
+    // wording aligned with paavo-cli's local id-validation messages.
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/api/jobs/not-a-ulid/stream").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(body.contains("invalid job id"), "got: {body}");
+}
+
+#[tokio::test]
+async fn sse_proxy_returns_502_when_paavod_unreachable() {
+    // The smoke fixture's PaavodClient points at 127.0.0.1:1, where
+    // no service listens (port 1 is reserved by IANA and not used
+    // by any common daemon). A reqwest connect error must surface
+    // as 502 BadGateway with a paavod-unreachable message — NOT a
+    // 500 (which would imply paavo-web's own bug) and NOT a panic.
+    //
+    // We use 127.0.0.1:1 instead of the more common '0' (0 means
+    // "any free port" on bind, but 'connect to port 0' is OS-
+    // dependent — Linux returns EADDRNOTAVAIL, BSD returns ECONNREFUSED).
+    // Port 1 is unambiguously refused on every platform we care about.
+    let (_d, app) = fresh_app();
+    let (status, body) =
+        fetch(app, "/api/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stream").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        body.contains("paavod unreachable"),
+        "expected 'paavod unreachable' in body; got: {body}"
     );
 }

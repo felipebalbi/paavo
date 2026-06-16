@@ -1,10 +1,30 @@
 //! axum router.
 
 use crate::db::WebDb;
+use crate::proxy::{AppState, PaavodClient};
+use axum::extract::FromRef;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+
+// FromRef glue: page handlers keep their `State<WebDb>` extractor
+// untouched (no per-page edit needed). The proxy handler extracts
+// `State<AppState>` directly. axum `from_ref`-derives the substate
+// for each request from the parent state at extract time; cloning
+// `WebDb` is just `Arc::clone` and `PaavodClient` is the same.
+
+impl FromRef<AppState> for WebDb {
+    fn from_ref(s: &AppState) -> Self {
+        s.db.clone()
+    }
+}
+
+impl FromRef<AppState> for PaavodClient {
+    fn from_ref(s: &AppState) -> Self {
+        s.paavod.clone()
+    }
+}
 
 /// `/static/style.css` — serves the baked-in ef-cyprus + ef-symbiosis
 /// stylesheet. The bytes are pulled in at compile time via
@@ -34,8 +54,14 @@ async fn serve_css() -> impl IntoResponse {
     )
 }
 
-/// Build the router.
-pub fn build_router(db: WebDb) -> Router {
+/// Build the router from a fully-constructed [`AppState`].
+///
+/// Used by both `paavo-web`'s `main` (real config + real reqwest
+/// client) and integration tests (fake paavod URL plus an empty
+/// in-memory sqlite). The single entry point keeps the route
+/// definitions in one place — anything that wants to spin up the
+/// router stays in sync.
+pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(crate::pages::dashboard::render))
         .route("/jobs", get(crate::pages::jobs_list::render))
@@ -43,5 +69,9 @@ pub fn build_router(db: WebDb) -> Router {
         .route("/boards", get(crate::pages::boards::render))
         .route("/schedule", get(crate::pages::schedule::render))
         .route("/static/style.css", get(serve_css))
-        .with_state(db)
+        .route(
+            "/api/jobs/:id/stream",
+            get(crate::proxy::stream_job),
+        )
+        .with_state(state)
 }

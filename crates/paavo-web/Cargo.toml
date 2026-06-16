@@ -37,6 +37,17 @@ parking_lot = { workspace = true }
 # `relative_us`, and `relative_to_now` helpers that the pages render
 # in place of raw `i64.to_string()`.
 chrono      = { workspace = true }
+# SSE proxy at `/api/jobs/:id/stream` opens a streaming HTTP request
+# to paavod's NDJSON endpoint and bridges the lines to browser SSE.
+# `reqwest` for the HTTP client, `futures` + `tokio-stream` +
+# `async-stream` + `bytes` for the byte-stream → line-stream →
+# SSE-event pipeline. All five are already workspace-pinned (paavod
+# uses the same set on its producer side); zero version churn.
+reqwest      = { workspace = true }
+futures      = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+bytes        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

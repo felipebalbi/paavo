@@ -6,4 +6,5 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod pages;
+pub mod proxy;
 pub mod time;

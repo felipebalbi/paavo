@@ -25,6 +25,19 @@ pub struct ServerSection {
 pub struct WebSection {
     /// `host:port`.
     pub bind: String,
+    /// Base URL of the paavod HTTP API. paavo-web's
+    /// `/api/jobs/:id/stream` SSE proxy connects to
+    /// `<paavod_url>/jobs/:id/stream` and bridges paavod's NDJSON
+    /// body to browser-friendly Server-Sent Events. Defaults to
+    /// `http://127.0.0.1:8090` (the bind documented in
+    /// `sample-paavo.toml`); override in production deployments
+    /// where paavod and paavo-web run on different hosts.
+    #[serde(default = "default_paavod_url")]
+    pub paavod_url: String,
+}
+
+fn default_paavod_url() -> String {
+    "http://127.0.0.1:8090".to_string()
 }
 
 impl RootConfig {
