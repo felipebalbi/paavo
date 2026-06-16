@@ -47,7 +47,7 @@ fn make_state(tmp: &std::path::Path) -> AppState {
             timeouts: TimeoutsConfig::default(),
             scheduler: SchedulerConfig {
                 nightly_cron: "0 0 19 * * *".into(),
-                starvation_threshold_s: 21_600,
+                starvation_threshold_s: 21_600, max_concurrent_builds: 5,
             },
             build_cache: BuildCacheConfig::default(),
             retention: RetentionConfig::default(),

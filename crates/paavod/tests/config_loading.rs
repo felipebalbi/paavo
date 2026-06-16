@@ -119,6 +119,8 @@ nightly_cron = "0 0 19 * * *"
     assert_eq!(cfg.retention.passed_full_log_days, 30);
     assert_eq!(cfg.quarantine.consecutive_infra_failures, 3);
     assert!(cfg.corpus.is_empty());
+    // max_concurrent_builds is omitted above → defaults to 5.
+    assert_eq!(cfg.scheduler.max_concurrent_builds, 5);
 }
 
 #[test]

@@ -115,6 +115,10 @@ pub struct SchedulerConfig {
     /// Promote Scheduled→Interactive after this many seconds queued.
     #[serde(default = "default_starvation_threshold_s")]
     pub starvation_threshold_s: i64,
+    /// Max concurrent `cargo build` processes (each gets its own
+    /// CARGO_TARGET_DIR). Jobs beyond this wait in `Submitted`.
+    #[serde(default = "default_max_concurrent_builds")]
+    pub max_concurrent_builds: usize,
 }
 
 impl SchedulerConfig {
@@ -129,6 +133,10 @@ impl SchedulerConfig {
 
 fn default_starvation_threshold_s() -> i64 {
     21_600
+}
+
+fn default_max_concurrent_builds() -> usize {
+    5
 }
 
 /// `[build_cache]`.

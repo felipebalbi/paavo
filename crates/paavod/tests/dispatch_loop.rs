@@ -105,7 +105,7 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600,
+            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
@@ -296,7 +296,7 @@ async fn dispatch_exits_loop_on_drain_when_no_jobs_in_flight() {
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600,
+            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
