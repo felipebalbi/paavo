@@ -377,3 +377,36 @@ async fn job_detail_emits_data_since_seq_when_frames_exist() {
         "expected data-since-seq=\"2\" (max of seqs 0,1,2); body:\n{body}"
     );
 }
+
+#[tokio::test]
+async fn static_dashboard_live_js_serves_with_correct_headers() {
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/static/dashboard-live.js").await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("EventSource") || body.contains("recent-jobs"),
+        "dashboard-live.js content marker missing; got first 200 chars: {}",
+        &body.chars().take(200).collect::<String>()
+    );
+}
+
+#[tokio::test]
+async fn dashboard_wires_live_feed_consumer() {
+    // The dashboard must carry the live-region ids the JS targets and
+    // load the consumer script, or the table is silently inert.
+    let (_d, app) = fresh_app();
+    let (status, body) = fetch(app, "/").await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(r#"id="recent-jobs-body""#),
+        "dashboard missing #recent-jobs-body; body: {body}"
+    );
+    assert!(
+        body.contains(r#"id="recent-jobs-count""#),
+        "dashboard missing #recent-jobs-count; body: {body}"
+    );
+    assert!(
+        body.contains(r#"<script src="/static/dashboard-live.js?v="#),
+        "dashboard missing dashboard-live.js script tag; body: {body}"
+    );
+}
