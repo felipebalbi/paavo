@@ -14,7 +14,7 @@
 //! surfaces that as a `{"type":"lagged","missed":n}` NDJSON line so the
 //! client can decide whether to refetch from sqlite.
 
-use paavo_proto::{JobId, JobOutcome, LogFrame};
+use paavo_proto::{JobId, JobOutcome, JobPhase, LogFrame};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +27,16 @@ pub enum LiveEvent {
     Frame(LogFrame),
     /// Terminal outcome — the stream closes after emitting this.
     Terminal(JobOutcome),
+    /// Job phase transition. Emitted by `dispatch` synchronously with
+    /// the corresponding non-terminal DB state transition (Submitted →
+    /// Building → Running). Live viewers (paavo-web's job page,
+    /// paavo-cli's `--follow`) update a phase indicator from these
+    /// without polling `GET /jobs/:id`. Phase events are NOT
+    /// persisted to `log_frame` — the schema records phase
+    /// transitions implicitly via `job.state` + the started_at /
+    /// finished_at timestamps; phase is a stream-only signal for
+    /// in-flight viewers.
+    Phase(JobPhase),
 }
 
 /// Per-job broadcaster.

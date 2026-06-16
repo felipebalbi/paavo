@@ -612,6 +612,9 @@ pub async fn stream_job(
                     saw_terminal = true;
                     break;
                 }
+                Ok(crate::job_logs::LiveEvent::Phase(p)) => {
+                    yield Ok(wire_line(&paavo_proto::WireMessage::Phase { phase: p }));
+                }
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     yield Ok(wire_line(&paavo_proto::WireMessage::Lagged { missed: n }));
                 }

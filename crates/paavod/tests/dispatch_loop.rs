@@ -206,14 +206,74 @@ async fn dispatch_emits_terminal_on_job_logs_broker() {
         out: Mutex::new(JobOutcome::Passed),
     });
     let handle = paavod::dispatch::spawn(state.clone(), runner);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timeout waiting for terminal event")
-        .expect("broker closed before terminal");
+    // Drain non-terminal events (Phase, Frame, …) until the Terminal
+    // event arrives. Pre-Phase, this loop saw exactly one event:
+    // Terminal. Now that dispatch publishes Phase(Building) and
+    // Phase(Running) synchronously with the matching DB transitions,
+    // the test's contract is "terminal eventually arrives via the
+    // broker", not "Terminal is the first event". The drain is also
+    // future-proofing against any variant added later — only the
+    // Terminal-shaped event matters for this test.
+    let event = loop {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout waiting for terminal event")
+            .expect("broker closed before terminal");
+        if matches!(next, paavod::job_logs::LiveEvent::Terminal(_)) {
+            break next;
+        }
+    };
     assert!(matches!(
         event,
         paavod::job_logs::LiveEvent::Terminal(JobOutcome::Passed)
     ));
+    state.drain.set_draining();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_publishes_phase_events_synchronously_with_state_transitions() {
+    // Pin the contract that dispatch emits Phase(Building) and
+    // Phase(Running) on the broker, in that order, before the
+    // Terminal event. paavo-web's job-detail page (commit 5) drives
+    // a phase indicator off these events; without them the
+    // indicator would stay stuck on "submitted" through the entire
+    // build+run.
+    use paavo_proto::JobPhase;
+    use paavod::job_logs::LiveEvent;
+
+    let (state, job_id, _tmp) = fixture_state(JobOutcome::Passed);
+    let mut rx = state.job_logs.subscribe(job_id);
+    let runner: Arc<dyn Runner> = Arc::new(FakeRunner {
+        out: Mutex::new(JobOutcome::Passed),
+    });
+    let handle = paavod::dispatch::spawn(state.clone(), runner);
+
+    // Collect events until we see Terminal, then assert on the
+    // sequence. Filtering on "non-Frame" makes the test resilient to
+    // future commits that emit per-line build frames into the same
+    // broker — Frames may interleave with Phases, but Phase ordering
+    // (Building → Running → Terminal) is stable.
+    let mut seen_phases: Vec<JobPhase> = Vec::new();
+    let mut saw_terminal = false;
+    while !saw_terminal {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout draining broker")
+            .expect("broker closed unexpectedly");
+        match next {
+            LiveEvent::Phase(p) => seen_phases.push(p),
+            LiveEvent::Terminal(_) => saw_terminal = true,
+            LiveEvent::Frame(_) => {} // ignore — irrelevant to phase ordering
+        }
+    }
+
+    assert_eq!(
+        seen_phases,
+        vec![JobPhase::Building, JobPhase::Running],
+        "expected Building then Running phases in order; saw: {seen_phases:?}"
+    );
+
     state.drain.set_draining();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
 }

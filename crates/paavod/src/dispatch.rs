@@ -26,7 +26,7 @@ use paavo_core::{
     RunOutcome, Runner, SchedulerConfig,
 };
 use paavo_db::{JobRow, OutcomeRecord};
-use paavo_proto::{JobId, JobOutcome, JobState, TerminalOutcome};
+use paavo_proto::{JobId, JobOutcome, JobPhase, JobState, TerminalOutcome};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
@@ -98,6 +98,18 @@ pub fn spawn(state: AppState, runner: Arc<dyn Runner>) -> tokio::task::JoinHandl
                 sleep(Duration::from_millis(50)).await;
                 continue;
             }
+            // Synchronously announce the Submitted→Building transition
+            // to live-log subscribers. Order matters: publish AFTER the
+            // DB transition has succeeded (above), so a subscriber that
+            // races a `GET /jobs/:id` against this Phase event sees a
+            // state-coherent pair (state=Building, last phase=Building).
+            // The broker may have no subscribers yet — `publish`
+            // returns 0 and the event is dropped, which is fine
+            // because viewers that join later read state from
+            // `JobView.state` and infer phase from there.
+            state
+                .job_logs
+                .publish(job_id, LiveEvent::Phase(JobPhase::Building));
             // Allocate a fresh cancel channel inside the registry. The
             // sender stays on the registry entry so `signal()` keeps
             // working through the job's lifetime; the receiver is
@@ -214,6 +226,14 @@ fn run_one_inner(
             );
         }
     }
+    // Synchronously announce the Building→Running transition. Order
+    // matters: publish AFTER the DB transition has succeeded (above)
+    // and BEFORE runner.run starts producing run-phase frames, so a
+    // subscriber that just connected sees Phase(Running) before the
+    // first defmt frame from the test ELF.
+    state
+        .job_logs
+        .publish(job_id, LiveEvent::Phase(JobPhase::Running));
 
     // 4. Run.
     let RunOutcome {
@@ -299,7 +319,73 @@ fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path:
         // pull fresh embassy revisions (spec §8.1 step 4).
         cargo_update_packages: job.cargo_update_packages.clone(),
     };
-    let res = paavo_build::build_release(&plan).map_err(|e| e.to_string())?;
+
+    // Build-forwarder: drains BuildLine messages from
+    // build_release_streaming, converts each line to a LogFrame, and
+    // publishes it on the JobLogsBroker so live `/jobs/:id/stream`
+    // subscribers see cargo's progress in real time. Mirrors the
+    // shape of real_runner's run-forwarder thread.
+    //
+    // Frame translation:
+    //   - target = "cargo:stdout" / "cargo:stderr" — the colon-
+    //     namespaced convention from the architect's design (see
+    //     paavo-build/src/build.rs::BuildStream rustdoc). Operators
+    //     filter on the `cargo:` prefix to isolate build lines.
+    //   - level = Info uniformly. Cargo's stderr is mostly progress
+    //     output ("Compiling foo v0.1.0", "Finished release [...]"),
+    //     not warn/error severity. Real failures surface as
+    //     `JobOutcome::Failed(BuildErr {...})` on the terminal event.
+    //   - seq is build-forwarder-local (starts at 0 per build, bumped
+    //     per emitted line). Build frames are NOT persisted to
+    //     `log_frame` in this commit (commit C2 will add persistence
+    //     with a shared per-job seq counter); for now the seq is just
+    //     a wire-debug aid for live subscribers.
+    //   - ts_us is microseconds since the build forwarder started.
+    //     Same monotonic clock the runtime forwarder will use after
+    //     C2; from a viewer's perspective time flows monotonically
+    //     across the build → run boundary.
+    let (build_tx, build_rx) =
+        crossbeam_channel::unbounded::<paavo_build::BuildLine>();
+    let job_id_for_fwd = job.id;
+    let broker_for_fwd = state.job_logs.clone();
+    let build_started = std::time::Instant::now();
+    let build_fwd = std::thread::Builder::new()
+        .name("paavod-build-forwarder".into())
+        .spawn(move || {
+            let mut seq: u64 = 0;
+            while let Ok(bl) = build_rx.recv() {
+                let target = match bl.stream {
+                    paavo_build::BuildStream::Stdout => "cargo:stdout",
+                    paavo_build::BuildStream::Stderr => "cargo:stderr",
+                };
+                let frame = paavo_proto::LogFrame {
+                    seq,
+                    ts_us: u64::try_from(build_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    level: paavo_proto::LogLevel::Info,
+                    target: Some(target.into()),
+                    message: bl.text,
+                };
+                broker_for_fwd.publish(
+                    job_id_for_fwd,
+                    crate::job_logs::LiveEvent::Frame(frame),
+                );
+                seq = seq.saturating_add(1);
+            }
+        })
+        .expect("spawn paavod-build-forwarder thread");
+
+    let res = paavo_build::build_release_streaming(&plan, build_tx)
+        .map_err(|e| e.to_string());
+    // Always join the forwarder before returning so a failure path
+    // doesn't leave the thread dangling. The forwarder exits when
+    // build_release_streaming drops its build_tx clones (which the
+    // streaming function does on every return path).
+    if let Err(payload) = build_fwd.join() {
+        let msg = panic_message(&payload);
+        warn!(%job_id_for_fwd, msg, "build forwarder thread panicked; build output may be incomplete");
+    }
+    let res = res?;
     let now_ms = Utc::now().timestamp_millis();
     {
         let db = state.db.lock();
