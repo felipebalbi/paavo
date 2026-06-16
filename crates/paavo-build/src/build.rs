@@ -169,6 +169,23 @@ pub struct BuildResult {
 /// has joined to EOF — see "ordering invariant" in the docstring of
 /// [`run_cargo_streaming`]).
 pub fn build_release_streaming(plan: &BuildPlan, lines: BuildLineTx) -> Result<BuildResult> {
+    // Non-cancellable: drop the sender so `wait_or_kill` sees a
+    // disconnected channel and blocks to completion exactly like
+    // `child.wait()` did before.
+    let (never_tx, never_rx) = crossbeam_channel::unbounded::<()>();
+    drop(never_tx);
+    build_release_streaming_cancellable(plan, lines, never_rx)
+}
+
+/// Cancellable variant of [`build_release_streaming`]. `cancel_rx`
+/// firing kills the in-flight cargo child and returns
+/// [`BuildError::Cancelled`]. paavod uses this so a `POST
+/// /jobs/:id/cancel` during the build phase stops cargo promptly.
+pub fn build_release_streaming_cancellable(
+    plan: &BuildPlan,
+    lines: BuildLineTx,
+    cancel_rx: crossbeam_channel::Receiver<()>,
+) -> Result<BuildResult> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
     // Pre-build cargo updates: lines flow through the sink but the
@@ -177,10 +194,12 @@ pub fn build_release_streaming(plan: &BuildPlan, lines: BuildLineTx) -> Result<B
     // operators scripting against it expect it not to drift on update
     // failures. Tail returned from these calls is therefore discarded.
     for pkg in &plan.cargo_update_packages {
-        let _tail = run_cargo_streaming(&cargo, &["update", "-p", pkg], plan, lines.clone())?;
+        let _tail =
+            run_cargo_streaming(&cargo, &["update", "-p", pkg], plan, lines.clone(), &cancel_rx)?;
     }
 
-    let stderr_tail = run_cargo_streaming(&cargo, &["build", "--release"], plan, lines)?;
+    let stderr_tail =
+        run_cargo_streaming(&cargo, &["build", "--release"], plan, lines, &cancel_rx)?;
 
     let hint = ManifestArtifactHint::default();
     let elf_path = discover_elf(&plan.crate_dir, &plan.target_dir, &hint)?;
@@ -232,6 +251,7 @@ fn run_cargo_streaming(
     args: &[&str],
     plan: &BuildPlan,
     tx: BuildLineTx,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
 ) -> Result<String> {
     let mut child = Command::new(cargo)
         .args(args)
@@ -317,7 +337,7 @@ fn run_cargo_streaming(
         })
         .expect("spawn paavo-build-stderr reader");
 
-    let status = child.wait()?;
+    let (status, cancelled) = wait_or_kill(&mut child, cancel_rx)?;
 
     // Read order matters here: stdout_join FIRST so a faulty stderr
     // path can't deadlock a `_ = stdout_join.join()` that the lint
@@ -330,6 +350,9 @@ fn run_cargo_streaming(
         .unwrap_or_else(|_| StderrTail::with_capacity(0));
     let stderr_tail = tail.snapshot();
 
+    if cancelled {
+        return Err(BuildError::Cancelled);
+    }
     if !status.success() {
         return Err(BuildError::Cargo {
             exit: status.code(),
@@ -337,6 +360,34 @@ fn run_cargo_streaming(
         });
     }
     Ok(stderr_tail)
+}
+
+/// Wait for `child`, but if `cancel_rx` fires first, kill it. Returns
+/// `(status, was_cancelled)`. Polls `try_wait` so we react to cancel
+/// without a second thread. A dropped sender (the non-cancellable
+/// `build_release` path) blocks to completion exactly like `wait()`.
+fn wait_or_kill(
+    child: &mut std::process::Child,
+    cancel_rx: &crossbeam_channel::Receiver<()>,
+) -> std::io::Result<(std::process::ExitStatus, bool)> {
+    use crossbeam_channel::RecvTimeoutError;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        match cancel_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) => {
+                let _ = child.kill();
+                let status = child.wait()?;
+                return Ok((status, true));
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = child.wait()?;
+                return Ok((status, false));
+            }
+        }
+    }
 }
 
 /// Rolling last-8-KiB-of-stderr buffer. Fed by the stderr reader
@@ -408,6 +459,50 @@ fn tail(s: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sleeper() -> std::process::Child {
+        let mut c = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping 127.0.0.1 -n 30 > NUL"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        };
+        c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+    }
+
+    #[test]
+    fn wait_or_kill_kills_promptly_on_signal() {
+        let (tx, rx) = crossbeam_channel::unbounded::<()>();
+        let mut child = sleeper();
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = tx.send(());
+        });
+        let (_status, cancelled) = wait_or_kill(&mut child, &rx).unwrap();
+        assert!(cancelled, "should report cancellation");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "child should be killed promptly, not run the full sleep"
+        );
+    }
+
+    #[test]
+    fn wait_or_kill_runs_to_completion_when_sender_dropped() {
+        let (tx, rx) = crossbeam_channel::unbounded::<()>();
+        drop(tx); // never-cancellable path → Disconnected → block to completion
+        let mut child = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap()
+        };
+        let (status, cancelled) = wait_or_kill(&mut child, &rx).unwrap();
+        assert!(!cancelled);
+        assert!(status.success());
+    }
 
     #[test]
     fn stderr_tail_keeps_only_last_n_bytes() {

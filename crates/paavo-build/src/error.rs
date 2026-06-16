@@ -46,6 +46,10 @@ pub enum BuildError {
         /// Directory that was scanned.
         dir: String,
     },
+    /// The build was cancelled (the cargo child was killed) before it
+    /// finished. paavod maps this to `Aborted { User }`.
+    #[error("build cancelled")]
+    Cancelled,
 }
 
 /// Result alias.
