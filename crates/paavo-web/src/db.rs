@@ -61,4 +61,52 @@ impl WebDb {
     pub fn all_schedules(&self) -> paavo_db::Result<Vec<ScheduleRow>> {
         ScheduleRow::list_all(self.inner.lock().raw_conn())
     }
+
+    /// Lightweight jobs index projection (id/state/priority/submitter/board/ts).
+    pub fn jobs_index(&self) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
+        paavo_db::JobRow::list_index(self.inner.lock().raw_conn())
+    }
+
+    /// Page of full job rows, optionally pinned to `submitted_at <= as_of`.
+    pub fn jobs_page(
+        &self,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::JobRow>> {
+        paavo_db::JobRow::list_page(self.inner.lock().raw_conn(), as_of, offset, limit)
+    }
+
+    /// Count of jobs (optionally `submitted_at <= as_of`).
+    pub fn jobs_count(&self, as_of: Option<i64>) -> paavo_db::Result<u64> {
+        paavo_db::JobRow::count(self.inner.lock().raw_conn(), as_of)
+    }
+
+    /// Page of boards (id ASC).
+    pub fn boards_page(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::BoardRow>> {
+        paavo_db::BoardRow::list_page(self.inner.lock().raw_conn(), offset, limit)
+    }
+
+    /// Total board count.
+    pub fn boards_count(&self) -> paavo_db::Result<u64> {
+        paavo_db::BoardRow::count(self.inner.lock().raw_conn())
+    }
+
+    /// Page of schedules (id ASC).
+    pub fn schedules_page(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::ScheduleRow>> {
+        paavo_db::ScheduleRow::list_page(self.inner.lock().raw_conn(), offset, limit)
+    }
+
+    /// Total schedule count.
+    pub fn schedules_count(&self) -> paavo_db::Result<u64> {
+        paavo_db::ScheduleRow::count(self.inner.lock().raw_conn())
+    }
 }
