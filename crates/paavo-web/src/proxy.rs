@@ -144,11 +144,7 @@ pub async fn stream_job(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, %upstream_url, "paavod unreachable");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("paavod unreachable: {e}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("paavod unreachable: {e}")).into_response();
         }
     };
     if !resp.status().is_success() {

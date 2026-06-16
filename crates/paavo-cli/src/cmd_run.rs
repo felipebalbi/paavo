@@ -252,7 +252,11 @@ fn handle_ndjson_line(line: &str) {
             println!("--- terminal: {outcome_json}");
             // Exit 0 only on Passed; everything else is a non-zero
             // exit so CI scripts can chain on success.
-            std::process::exit(if matches!(outcome, JobOutcome::Passed) { 0 } else { 1 });
+            std::process::exit(if matches!(outcome, JobOutcome::Passed) {
+                0
+            } else {
+                1
+            });
         }
         WireMessage::Lagged { missed } => {
             eprintln!(

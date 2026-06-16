@@ -44,7 +44,10 @@ async fn serve_css() -> impl IntoResponse {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/css; charset=utf-8"),
+            ),
             (
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=86400, must-revalidate"),
@@ -93,9 +96,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/schedule", get(crate::pages::schedule::render))
         .route("/static/style.css", get(serve_css))
         .route("/static/live-log.js", get(serve_live_log_js))
-        .route(
-            "/api/jobs/:id/stream",
-            get(crate::proxy::stream_job),
-        )
+        .route("/api/jobs/:id/stream", get(crate::proxy::stream_job))
         .with_state(state)
 }

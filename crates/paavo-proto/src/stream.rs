@@ -148,6 +148,9 @@ impl WireMessage {
     /// receive loop without having to remember which variants are
     /// terminal-equivalent.
     pub fn closes_stream(&self) -> bool {
-        matches!(self, WireMessage::Terminal { .. } | WireMessage::Truncated { .. })
+        matches!(
+            self,
+            WireMessage::Terminal { .. } | WireMessage::Truncated { .. }
+        )
     }
 }

@@ -217,7 +217,10 @@ mod tests {
         // > 365 days delta → absolute UTC string.
         let now = 1_735_689_600_000;
         let two_years_ago = now - (2 * 365 * 86_400_000);
-        assert_eq!(relative_to_now(two_years_ago, now), "2023-01-02 00:00:00 UTC");
+        assert_eq!(
+            relative_to_now(two_years_ago, now),
+            "2023-01-02 00:00:00 UTC"
+        );
     }
 
     #[test]
@@ -238,7 +241,7 @@ mod tests {
     #[test]
     fn ts_us_to_wall_clock_adds_offset() {
         let submitted = Some(1_735_689_600_000); // 2025-01-01 00:00:00 UTC
-        // 45.123 seconds into the job
+                                                 // 45.123 seconds into the job
         assert_eq!(
             ts_us_to_wall_clock(45_123_000, submitted),
             Some("2025-01-01 00:00:45.123 UTC".into())

@@ -344,8 +344,7 @@ fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path:
     //     Same monotonic clock the runtime forwarder will use after
     //     C2; from a viewer's perspective time flows monotonically
     //     across the build → run boundary.
-    let (build_tx, build_rx) =
-        crossbeam_channel::unbounded::<paavo_build::BuildLine>();
+    let (build_tx, build_rx) = crossbeam_channel::unbounded::<paavo_build::BuildLine>();
     let job_id_for_fwd = job.id;
     let broker_for_fwd = state.job_logs.clone();
     let build_started = std::time::Instant::now();
@@ -360,23 +359,18 @@ fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path:
                 };
                 let frame = paavo_proto::LogFrame {
                     seq,
-                    ts_us: u64::try_from(build_started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX),
+                    ts_us: u64::try_from(build_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     level: paavo_proto::LogLevel::Info,
                     target: Some(target.into()),
                     message: bl.text,
                 };
-                broker_for_fwd.publish(
-                    job_id_for_fwd,
-                    crate::job_logs::LiveEvent::Frame(frame),
-                );
+                broker_for_fwd.publish(job_id_for_fwd, crate::job_logs::LiveEvent::Frame(frame));
                 seq = seq.saturating_add(1);
             }
         })
         .expect("spawn paavod-build-forwarder thread");
 
-    let res = paavo_build::build_release_streaming(&plan, build_tx)
-        .map_err(|e| e.to_string());
+    let res = paavo_build::build_release_streaming(&plan, build_tx).map_err(|e| e.to_string());
     // Always join the forwarder before returning so a failure path
     // doesn't leave the thread dangling. The forwarder exits when
     // build_release_streaming drops its build_tx clones (which the

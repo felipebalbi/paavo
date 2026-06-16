@@ -57,9 +57,7 @@ pub async fn logs(client: &Client, job_id: &str, _follow: bool) -> Result<()> {
                     return Ok(());
                 }
                 WireMessage::Lagged { missed } => {
-                    eprintln!(
-                        "paavo-cli: log stream lagged ({missed} frames missed)"
-                    );
+                    eprintln!("paavo-cli: log stream lagged ({missed} frames missed)");
                 }
                 WireMessage::Truncated { reason } => {
                     eprintln!("paavo-cli: log stream truncated: {reason}");

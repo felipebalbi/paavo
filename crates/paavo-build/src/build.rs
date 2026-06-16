@@ -420,8 +420,15 @@ mod tests {
         // bytes: "23\n4567\n89\n" but that's 11. Step through: the
         // ring oscillates as we exceed cap. Just sanity-check the
         // tail ends with "89\n" and is at most 10 bytes long.
-        assert!(snap.ends_with("89\n"), "tail did not end with '89\\n': {snap:?}");
-        assert!(snap.len() <= 10, "tail exceeded cap: len={} body={snap:?}", snap.len());
+        assert!(
+            snap.ends_with("89\n"),
+            "tail did not end with '89\\n': {snap:?}"
+        );
+        assert!(
+            snap.len() <= 10,
+            "tail exceeded cap: len={} body={snap:?}",
+            snap.len()
+        );
     }
 
     #[test]

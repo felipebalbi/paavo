@@ -131,16 +131,28 @@ async fn proxy_emits_named_sse_events_for_each_wire_variant() {
     // against substrings rather than parsing the full SSE record set
     // (the contract here is "the named events are present", not
     // "the proxy uses N spaces between : and value").
-    assert!(sse.contains("event: phase\n"), "missing phase events; body:\n{sse}");
-    assert!(sse.contains("event: frame\n"), "missing frame events; body:\n{sse}");
-    assert!(sse.contains("event: terminal\n"), "missing terminal event; body:\n{sse}");
+    assert!(
+        sse.contains("event: phase\n"),
+        "missing phase events; body:\n{sse}"
+    );
+    assert!(
+        sse.contains("event: frame\n"),
+        "missing frame events; body:\n{sse}"
+    );
+    assert!(
+        sse.contains("event: terminal\n"),
+        "missing terminal event; body:\n{sse}"
+    );
 
     // Order: the first phase appears BEFORE any frame, the second
     // phase BETWEEN the two frames. Walk indices.
     let first_phase = sse.find("event: phase").expect("phase event");
     let first_frame = sse.find("event: frame").expect("frame event");
     let terminal = sse.find("event: terminal").expect("terminal event");
-    assert!(first_phase < first_frame, "phase did not precede first frame");
+    assert!(
+        first_phase < first_frame,
+        "phase did not precede first frame"
+    );
     assert!(first_frame < terminal, "frame did not precede terminal");
 
     // Frame phase enrichment: the first frame carries
@@ -218,7 +230,9 @@ async fn proxy_synthesises_truncated_on_malformed_upstream_line() {
     // truncated, the client is expected to refetch state via
     // `GET /jobs/:id` and decide what to do.
     let mut body = String::new();
-    body.push_str(r#"{"type":"frame","frame":{"seq":0,"ts_us":0,"level":"info","message":"good"}}"#);
+    body.push_str(
+        r#"{"type":"frame","frame":{"seq":0,"ts_us":0,"level":"info","message":"good"}}"#,
+    );
     body.push('\n');
     body.push_str("not-json-at-all\n");
     body.push_str(&ndjson_line(&WireMessage::Terminal {

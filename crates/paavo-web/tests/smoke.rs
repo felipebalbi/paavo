@@ -142,7 +142,10 @@ async fn aria_current_marks_correct_nav_entry() {
         ("/boards", r#"href="/boards" aria-current="page""#),
         ("/schedule", r#"href="/schedule" aria-current="page""#),
         // /jobs/:id is rendered with the Jobs tab marked.
-        ("/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV", r#"href="/jobs" aria-current="page""#),
+        (
+            "/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            r#"href="/jobs" aria-current="page""#,
+        ),
     ];
     for (uri, expected) in cases {
         let (status, body) = fetch(app.clone(), uri).await;
@@ -154,7 +157,10 @@ async fn aria_current_marks_correct_nav_entry() {
         // Exactly one `aria-current` per page — catches a future
         // refactor accidentally tagging two entries.
         let count = body.matches(r#"aria-current="page""#).count();
-        assert_eq!(count, 1, "uri={uri} has {count} aria-current markers; expected 1");
+        assert_eq!(
+            count, 1,
+            "uri={uri} has {count} aria-current markers; expected 1"
+        );
     }
 }
 
@@ -175,7 +181,10 @@ async fn static_style_css_serves_with_correct_headers() {
         &body.chars().take(200).collect::<String>()
     );
     // Light + dark palette both present.
-    assert!(body.contains("prefers-color-scheme: dark"), "missing dark theme media query");
+    assert!(
+        body.contains("prefers-color-scheme: dark"),
+        "missing dark theme media query"
+    );
     assert!(body.contains("#fcf7ef"), "missing ef-cyprus bg-main hex");
     assert!(body.contains("#130911"), "missing ef-symbiosis bg-main hex");
 }
@@ -232,8 +241,7 @@ async fn sse_proxy_returns_502_when_paavod_unreachable() {
     // dependent — Linux returns EADDRNOTAVAIL, BSD returns ECONNREFUSED).
     // Port 1 is unambiguously refused on every platform we care about.
     let (_d, app) = fresh_app();
-    let (status, body) =
-        fetch(app, "/api/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stream").await;
+    let (status, body) = fetch(app, "/api/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stream").await;
     assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
     assert!(
         body.contains("paavod unreachable"),

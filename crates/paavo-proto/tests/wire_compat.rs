@@ -27,8 +27,7 @@ fn assert_roundtrip(msg: WireMessage, expected: &str) {
         actual, expected,
         "wire bytes drifted; expected {expected:?}, got {actual:?}"
     );
-    let parsed: WireMessage =
-        serde_json::from_str(expected).expect("deserialise the pinned bytes");
+    let parsed: WireMessage = serde_json::from_str(expected).expect("deserialise the pinned bytes");
     assert_eq!(
         parsed, msg,
         "round-trip lost data; serialised {expected:?} but parsed differently"
@@ -160,8 +159,7 @@ fn terminal_failed_infra_err_matches_historical() {
 
 #[test]
 fn terminal_timedout_inactivity_matches_historical() {
-    let expected =
-        r#"{"type":"terminal","outcome":{"timed_out":{"reason":"inactivity","elapsed_ms":120000}}}"#;
+    let expected = r#"{"type":"terminal","outcome":{"timed_out":{"reason":"inactivity","elapsed_ms":120000}}}"#;
     assert_roundtrip(
         WireMessage::Terminal {
             outcome: JobOutcome::TimedOut {
@@ -307,10 +305,7 @@ fn closes_stream_for_terminal_and_truncated_only() {
         phase: JobPhase::Running
     }
     .closes_stream());
-    assert!(WireMessage::Truncated {
-        reason: "x".into()
-    }
-    .closes_stream());
+    assert!(WireMessage::Truncated { reason: "x".into() }.closes_stream());
     assert!(WireMessage::Terminal {
         outcome: JobOutcome::Passed
     }
