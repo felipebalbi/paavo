@@ -6,6 +6,12 @@
 //!   - `PAAVO_HW=1` env var so even when run with `--ignored`, dev boxes
 //!     without the EVK plugged in self-skip without surfacing as failure.
 //!
+//! **Status (post-M7.7 RAM-resident fix)**: like
+//! `real_session_connect.rs`, this test currently fails against the
+//! flash-resident spike fixture because `RealSession::connect` now
+//! rejects `BootInfo::Other`. See that file's status note and
+//! `dev/probe-rs-spike/FINDINGS.md` footnote 1.
+//!
 //! Depends on the spike fixture ELF; build it first by `cd`-ing INTO the
 //! fixture directory (NOT via `--manifest-path` from the workspace root —
 //! see `real_session_connect.rs` for the rationale):

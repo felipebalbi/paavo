@@ -12,7 +12,7 @@ use defmt_decoder::{DecodeError, StreamDecoder, Table};
 use defmt_parser::Level as DefmtLevel;
 use paavo_proto::{LogFrame, LogLevel};
 use probe_rs::{
-    flashing::{download_file_with_options, DownloadOptions, FormatKind},
+    flashing::{build_loader, BootInfo, DownloadOptions, Format, FormatKind},
     probe::{list::Lister, DebugProbeSelector},
     rtt::{ChannelMode, Rtt},
     Permissions, Session,
@@ -109,13 +109,28 @@ impl RealSession {
     /// Steps:
     ///   1. `Lister::new().open(DebugProbeSelector)` — by VID/PID/serial.
     ///   2. `Probe::attach(chip, Permissions::default())` — chip name as a `&str`.
-    ///   3. `flashing::download_file(&mut session, &elf, FormatKind::Elf)`.
-    ///   4. `core(0)?.reset_and_halt(2s) + .run()` (unless `skip_post_load_reset`).
+    ///   3. `flashing::build_loader(...)`, capture `loader.boot_info()`,
+    ///      then `loader.commit(&mut session, DownloadOptions)`. Going
+    ///      via `build_loader` (instead of the convenience wrapper
+    ///      `download_file_with_options`) keeps the loader alive long
+    ///      enough to inspect `boot_info()`, which we need in step 4
+    ///      to decide how to start the firmware.
+    ///   4. Boot the loaded image (unless `skip_post_load_reset`):
+    ///         - `BootInfo::FromRam { vector_table_addr, .. }` →
+    ///           `session.prepare_running_on_ram(vector_table_addr) +
+    ///           core.run()`. `prepare_running_on_ram` sets SP_main, PC,
+    ///           and VTOR from the vector table — there is NO hardware
+    ///           reset, because the chip's flash reset vector points at
+    ///           ROM/leftover firmware, not at our RAM-loaded code.
+    ///         - `BootInfo::Other` → error. paavo's templates produce
+    ///           RAM-resident ELFs only (`link_ram_cortex_m.x`); a
+    ///           flash-resident ELF surfacing here is a misconfiguration
+    ///           we surface clearly rather than silently boot wrong.
     ///   5. `defmt_decoder::Table::parse(elf_bytes)` — for the decode table.
     ///      The `Table` is `Box::leak`-ed so its `'static` ref can hand
     ///      out a `Box<dyn StreamDecoder + 'static>` we store on Self
     ///      (see struct doc for the trade-off).
-    ///   6. 200 ms sleep, then `Rtt::attach(&mut core)`.
+    ///   6. 200 ms sleep, then `Rtt::attach_at(&mut core, _SEGGER_RTT)`.
     ///
     /// **Hardware-only**: requires a physical probe + board. Workspace
     /// tests use a mock `ProbeSession` impl.
@@ -160,19 +175,35 @@ impl RealSession {
             .attach(opts.chip_name.as_str(), Permissions::default())
             .map_err(|e| ProbeError::ProbeRs(format!("attach chip={}: {e}", opts.chip_name)))?;
 
-        // 3. Flash. `FormatKind::Elf` is a unit variant — `Format::Elf`
-        //    takes `ElfOptions`, and `From<FormatKind> for Format` wraps
-        //    with `ElfOptions::default()` (spike finding).
+        // 3. Flash. paavo only supports RAM-resident ELFs (linked with
+        //    `link_ram_cortex_m.x`); see `templates/*/memory.x` and
+        //    `templates/shared/link_ram_cortex_m.x`. The vector table,
+        //    .text, .rodata, and .data all live at ORIGIN(RAM) and there
+        //    is no FLASH region. To boot one of these, we let probe-rs
+        //    write the ELF into RAM and then we set SP/PC/VTOR from the
+        //    vector table — we do NOT issue a hardware reset, because
+        //    the chip's reset vector points to flash (boot ROM or
+        //    leftover firmware), NOT to our RAM-loaded code.
         //
-        //    Use `download_file_with_options` with explicitly-named
-        //    DownloadOptions instead of the shorter `download_file`.
-        //    The contract is: paavod ALWAYS fully flashes the ELF on
-        //    every job, even if the operator resubmits the identical
-        //    binary back-to-back. No content-based skip, no read-back-
-        //    based verify shortcut, no leftover-region preservation.
-        //    Two identical submits → two identical flashes; if the
-        //    chip drifted into a bad state between runs, the second
-        //    flash heals it.
+        //    `download_file_with_options` is a thin wrapper around
+        //    `build_loader().commit()` that drops the loader and so
+        //    discards `loader.boot_info()`. We need that info — it
+        //    carries `vector_table_addr` for `prepare_running_on_ram`
+        //    — so we call `build_loader` and `commit` directly.
+        //
+        //    `Format::from(FormatKind::Elf)` wraps the unit-style
+        //    `FormatKind::Elf` with the default `ElfOptions` (spike
+        //    finding; same as the old `download_file_with_options`
+        //    auto-conversion).
+        //
+        //    Use explicitly-named DownloadOptions instead of relying on
+        //    `DownloadOptions::default()`. The contract is: paavod
+        //    ALWAYS fully flashes the ELF on every job, even if the
+        //    operator resubmits the identical binary back-to-back. No
+        //    content-based skip, no read-back-based verify shortcut, no
+        //    leftover-region preservation. Two identical submits → two
+        //    identical flashes; if the chip drifted into a bad state
+        //    between runs, the second flash heals it.
         //
         //    Concretely (all defaults today, named here so a future
         //    DownloadOptions field default-flip can't silently change
@@ -202,6 +233,17 @@ impl RealSession {
         //
         //    User-facing rule, locked in here: "even if the user sends
         //    the same thing, paavod always compiles and flashes."
+        let loader = build_loader(
+            &mut session,
+            &opts.elf_path,
+            Format::from(FormatKind::Elf),
+            None,
+        )
+        .map_err(|e| {
+            ProbeError::ProbeRs(format!("build_loader {}: {e}", opts.elf_path.display()))
+        })?;
+        let boot_info = loader.boot_info();
+
         let mut download_opts = DownloadOptions::default();
         download_opts.keep_unwritten_bytes = false;
         download_opts.dry_run = false;
@@ -210,18 +252,73 @@ impl RealSession {
         download_opts.preverify = false;
         download_opts.verify = false;
         download_opts.disable_double_buffering = false;
-        download_file_with_options(&mut session, &opts.elf_path, FormatKind::Elf, download_opts)
+        loader
+            .commit(&mut session, download_opts)
             .map_err(|e| ProbeError::ProbeRs(format!("flash {}: {e}", opts.elf_path.display())))?;
 
-        // 4. Reset + run (unless caller asked to skip — RT685S quirk).
+        // 4. Boot the loaded RAM image (unless caller asked to skip —
+        //    RT685S quirk; see spec §17 "Deferred from M7").
+        //
+        //    `loader.commit()` already left the core reset_and_halted
+        //    when `boot_info` is `FromRam` (FlashLoader::commit does an
+        //    internal `reset_and_halt(500ms)` before writing RAM regions
+        //    — visible as the FIRST `reset_and_halt{timeout=500ms}`
+        //    line in probe-rs INFO output). PC currently points to the
+        //    chip's flash reset vector, which is NOT our code: our
+        //    `Reset` symbol lives in RAM at `vector_table_addr + 4`.
+        //
+        //    `Session::prepare_running_on_ram(vector_table_addr)`:
+        //      - reads `*vector_table_addr` → writes to SP_main
+        //      - reads `*(vector_table_addr + 4)` → writes to PC
+        //      - writes `vector_table_addr` to VTOR
+        //    so a subsequent `core.run()` executes our `Reset` handler
+        //    with the correct stack pointer and vector table base. It
+        //    does NOT issue a hardware reset, so flash content is
+        //    irrelevant. This mirrors what `probe-rs run` and
+        //    `cargo-embed` do for RAM-resident binaries.
+        //
+        //    If `boot_info` is `Other`, the ELF is flash-resident — the
+        //    paavo templates do not produce flash-resident ELFs (they
+        //    use `link_ram_cortex_m.x`), so this is a misconfiguration
+        //    we surface clearly. Adding a flash-resident path back is
+        //    intentionally deferred until a kind needs it; reintroducing
+        //    `reset_and_halt + run` here without auto-detect would
+        //    silently mask the RAM-resident bug fixed in this commit.
         if !opts.skip_post_load_reset {
-            let mut core = session
-                .core(0)
-                .map_err(|e| ProbeError::ProbeRs(format!("session.core(0): {e}")))?;
-            core.reset_and_halt(Duration::from_secs(2))
-                .map_err(|e| ProbeError::ProbeRs(format!("reset_and_halt: {e}")))?;
-            core.run()
-                .map_err(|e| ProbeError::ProbeRs(format!("core.run: {e}")))?;
+            match boot_info {
+                BootInfo::FromRam {
+                    vector_table_addr, ..
+                } => {
+                    tracing::info!(
+                        vector_table_addr = format!("{vector_table_addr:#010x}"),
+                        "RAM-resident ELF; calling prepare_running_on_ram (sets SP/PC/VTOR \
+                         from vector table; no hardware reset)"
+                    );
+                    session
+                        .prepare_running_on_ram(vector_table_addr)
+                        .map_err(|e| {
+                            ProbeError::ProbeRs(format!(
+                                "prepare_running_on_ram {vector_table_addr:#010x}: {e}"
+                            ))
+                        })?;
+                    let mut core = session.core(0).map_err(|e| {
+                        ProbeError::ProbeRs(format!("session.core(0) for run: {e}"))
+                    })?;
+                    core.run()
+                        .map_err(|e| ProbeError::ProbeRs(format!("core.run: {e}")))?;
+                }
+                BootInfo::Other => {
+                    return Err(ProbeError::ProbeRs(format!(
+                        "ELF {} is flash-resident (probe-rs reports BootInfo::Other), \
+                         but paavo expects RAM-resident ELFs linked with \
+                         `link_ram_cortex_m.x` (vector table at ORIGIN(RAM)). Either \
+                         relink the test crate against the RAM linker script, or use \
+                         the `cargo generate` template under `templates/` which already \
+                         does this. See `templates/shared/link_ram_cortex_m.x`.",
+                        opts.elf_path.display()
+                    )));
+                }
+            }
         }
 
         // 5. Parse `.defmt` for the decode table BEFORE the RTT attach

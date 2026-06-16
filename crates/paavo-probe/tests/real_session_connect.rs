@@ -5,6 +5,18 @@
 //!   - `PAAVO_HW=1` env var so even when run with `--ignored`, dev boxes
 //!     without the EVK plugged in self-skip without surfacing as failure.
 //!
+//! **Status (post-M7.7 RAM-resident fix)**: this test currently FAILS
+//! against the existing spike fixture (`dev/spike-fixture-mcxa266`).
+//! That fixture is flash-resident (its `memory.x` defines both FLASH
+//! and RAM, and its `.cargo/config.toml` links with `-Tlink.x`), and
+//! `RealSession::connect` now rejects flash-resident ELFs with an
+//! explicit error pointing at `templates/shared/link_ram_cortex_m.x`.
+//! See `dev/probe-rs-spike/FINDINGS.md` footnote 1 for the rationale.
+//! To restore this test, rebuild the spike fixture as RAM-resident
+//! (swap `memory.x` to RAM-only and `-Tlink.x` to `-Tlink_ram.x` plus a
+//! `cargo:rustc-link-arg=-Tlink_ram_cortex_m.x` in `build.rs` mirroring
+//! the templates).
+//!
 //! Depends on the spike fixture ELF; build it first by `cd`-ing INTO the
 //! fixture directory (NOT via `--manifest-path` from the workspace root —
 //! that bypasses the fixture's `.cargo/config.toml` which carries the

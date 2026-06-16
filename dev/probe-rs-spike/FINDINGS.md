@@ -200,7 +200,7 @@ in the deployment guide.
 | Probe selector by VID/PID/serial      | yes — match the MCU-Link by serial |
 | Chip name for MCX-A266                | `"MCXA276"` (document the trap) |
 | Flash format                          | `FormatKind::Elf` |
-| Reset sequence                        | `reset_and_halt(2s)` then `core.run()` |
+| Reset sequence                        | branch on `loader.boot_info()` — see footnote ¹ |
 | RTT attach mode                       | `Rtt::attach(&mut core)` (auto-scan RAM) |
 | Up-channel selection                  | `rtt.up_channels.first_mut()` (one channel) |
 | Up-channel buffer size                | 1024 B; spike uses `[u8; 1024]` |
@@ -209,6 +209,42 @@ in the deployment guide.
 | defmt decoding                        | mandatory; `defmt_decoder::Table` + `StreamDecoder` |
 | Vendor-WARN suppression               | filter or document; do not surface as error |
 | Send/Sync bounds on `ProbeSession`    | no change — `Send` only matches Session |
+
+¹ **Reset sequence — corrected after M7.7 RAM-resident bug**:
+the spike originally locked in `reset_and_halt(2s) + core.run()` after
+`download_file`. That was correct *for the spike fixture*
+(`dev/spike-fixture-mcxa266/memory.x` defines both `FLASH 0x00000000 1M`
+and `RAM 0x20000000 128K`, and `dev/spike-fixture-mcxa266/.cargo/config.toml`
+links with `-Tlink.x` → vector table sits in flash). Cortex-M reset
+correctly jumps to that flash vector and runs the user code.
+
+paavo's actual templates (`templates/*/memory.x` +
+`templates/shared/link_ram_cortex_m.x`) are **RAM-resident**: they define
+only RAM and link the vector table at `ORIGIN(RAM) = 0x20000000`. After
+`reset_and_halt`, the chip's PC goes to the *flash* reset vector
+(boot ROM / leftover firmware) — NOT to the RAM-loaded `Reset`
+function — so `core.run()` runs the wrong code. Symptom: RTT attaches
+to the (stale) `_SEGGER_RTT` block in RAM, no defmt frames ever come
+out because firmware never executes, inactivity timeout fires after 2
+minutes. (See `crates/paavo-probe/src/session.rs::RealSession::connect`
+step 4.)
+
+`paavo-probe` therefore branches on `FlashLoader::boot_info()`:
+
+  - `BootInfo::FromRam { vector_table_addr, .. }` →
+    `session.prepare_running_on_ram(vector_table_addr)` (sets SP_main,
+    PC, and VTOR from the vector table; **no** hardware reset) +
+    `core.run()`. Mirrors what `probe-rs run` and `cargo-embed` do.
+  - `BootInfo::Other` → return a `ProbeError` pointing the operator at
+    `templates/shared/link_ram_cortex_m.x`. paavo no longer supports
+    flash-resident ELFs.
+
+Side effect: the existing `cargo test -p paavo-probe --test
+real_session_connect -- --ignored --nocapture` hardware test (which
+points at the spike fixture, flash-resident) now fails with that
+explicit error until the spike fixture is relinked against
+`link_ram_cortex_m.x`. That test is `#[ignore]`-d and `PAAVO_HW=1`-gated,
+so it does not affect default `cargo test`.
 
 ## Reproducing the spike
 
