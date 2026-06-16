@@ -20,7 +20,7 @@ struct FakeRunner {
 }
 
 impl Runner for FakeRunner {
-    fn run(&self, _id: JobId, _board_id: &str) -> RunOutcome {
+    fn run(&self, _ctx: paavo_core::RunContext<'_>) -> RunOutcome {
         RunOutcome {
             outcome: self.out.lock().clone(),
             probe_released_cleanly: true,
@@ -354,7 +354,7 @@ async fn dispatch_finalizes_on_runner_panic_without_leaking() {
     // be reclaimed.
     struct PanickyRunner;
     impl Runner for PanickyRunner {
-        fn run(&self, _id: JobId, _board_id: &str) -> RunOutcome {
+        fn run(&self, _ctx: paavo_core::RunContext<'_>) -> RunOutcome {
             panic!("simulated runner panic");
         }
     }
@@ -401,7 +401,7 @@ async fn dispatch_does_not_double_dispatch_same_board() {
         counter: Arc<Counter>,
     }
     impl Runner for CountingRunner {
-        fn run(&self, _id: JobId, _board_id: &str) -> RunOutcome {
+        fn run(&self, _ctx: paavo_core::RunContext<'_>) -> RunOutcome {
             let now = self.counter.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
             self.counter.max_seen.fetch_max(now, Ordering::SeqCst);
             // Hold for 200ms so any double-dispatch is observable.

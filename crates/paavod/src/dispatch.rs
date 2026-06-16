@@ -192,6 +192,13 @@ fn run_one_inner(
 ) -> (JobOutcome, bool) {
     let job_id = job.id;
 
+    // Shared per-job log-frame seq counter + monotonic job-start clock.
+    // Both reach the build forwarder (via build_or_cache, a later task) and
+    // the run forwarder (via RunContext, below) so build- and run-phase
+    // frames share one contiguous seq space and one timeline.
+    let job_start = std::time::Instant::now();
+    let log_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // 2. Cache lookup or build. The cache is keyed by tar_blake3, so
     //    an identical resubmit hits it (fast turnaround). Operators
     //    chasing a flaky chip can force a fresh build + flash by
@@ -239,7 +246,12 @@ fn run_one_inner(
     let RunOutcome {
         outcome,
         probe_released_cleanly,
-    } = runner.run(job_id, board_id);
+    } = runner.run(paavo_core::RunContext {
+        job_id,
+        board_id,
+        log_seq: log_seq.clone(),
+        job_start,
+    });
     (outcome, probe_released_cleanly)
 }
 

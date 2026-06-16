@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::job_logs::{JobLogsBroker, LiveEvent};
 use paavo_core::{RunOutcome, Runner};
 use paavo_db::{BoardRow, Db, JobRow};
-use paavo_proto::{JobId, JobOutcome, TerminalOutcome};
+use paavo_proto::{JobOutcome, TerminalOutcome};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,7 +86,8 @@ impl RealRunner {
 }
 
 impl Runner for RealRunner {
-    fn run(&self, job_id: JobId, board_id: &str) -> RunOutcome {
+    fn run(&self, ctx: paavo_core::RunContext<'_>) -> RunOutcome {
+        let paavo_core::RunContext { job_id, board_id, .. } = ctx;
         // 1. Read elf_path + board spec + per-job timeouts under one
         //    DB lock. Lock duration is bounded (two indexed SELECTs).
         let lookup = {

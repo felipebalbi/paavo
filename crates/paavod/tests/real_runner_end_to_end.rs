@@ -172,7 +172,12 @@ fn real_runner_passes_against_real_mcxa266() {
     cancellation.register(job_id);
 
     let runner = RealRunner::new(db.clone(), JobLogsBroker::new(), cancellation, cfg.clone());
-    let outcome = runner.run(job_id, board_id);
+    let outcome = runner.run(paavo_core::RunContext {
+        job_id,
+        board_id,
+        log_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        job_start: std::time::Instant::now(),
+    });
 
     assert_eq!(
         outcome.outcome,

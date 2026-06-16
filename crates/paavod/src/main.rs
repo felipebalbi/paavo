@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use paavo_proto::{JobId, JobOutcome};
+use paavo_proto::JobOutcome;
 use paavod::app::build_router;
 use paavod::app_state::{AppState, DrainState};
 use paavod::cancellation::CancellationRegistry;
@@ -148,7 +148,7 @@ fn load_inventory(
 struct FakeRunner;
 
 impl paavo_core::Runner for FakeRunner {
-    fn run(&self, _job_id: JobId, _board_id: &str) -> paavo_core::RunOutcome {
+    fn run(&self, _ctx: paavo_core::RunContext<'_>) -> paavo_core::RunOutcome {
         paavo_core::RunOutcome {
             outcome: JobOutcome::Passed,
             probe_released_cleanly: true,
