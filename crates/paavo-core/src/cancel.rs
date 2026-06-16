@@ -51,3 +51,36 @@ pub fn cancel_if_submitted(
     )?;
     Ok(Some(outcome))
 }
+
+/// Inline-cancel a job that is waiting (no worker, no board): `Submitted`
+/// or `AwaitingBoard`. Marks `Aborted { User }` and returns the outcome.
+/// Any other state returns `NotCancellable` so the caller can route
+/// Building → kill-the-build and Running → run watchdog. This supersedes
+/// `cancel_if_submitted` for the two-stage build-pool model.
+///
+/// Single-writer assumption matches `cancel_if_submitted`: the dispatch
+/// thread is the only other writer, and `JobRow::finalize`'s WHERE-state
+/// guard catches a racing terminal transition.
+pub fn cancel_if_pending(
+    conn: &Connection,
+    id: &JobId,
+    now_ms: i64,
+) -> Result<Option<JobOutcome>> {
+    let row = paavo_db::JobRow::get(conn, id)?;
+    if !matches!(row.state, JobState::Submitted | JobState::AwaitingBoard) {
+        return Err(CoreError::NotCancellable { state: row.state });
+    }
+    let outcome = JobOutcome::Aborted {
+        by: AbortReason::User,
+    };
+    paavo_db::JobRow::finalize(
+        conn,
+        id,
+        &paavo_db::OutcomeRecord {
+            state: JobState::Aborted,
+            outcome: outcome.clone(),
+            finished_at_ms: now_ms,
+        },
+    )?;
+    Ok(Some(outcome))
+}

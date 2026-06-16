@@ -99,3 +99,48 @@ fn cancel_building_job_returns_not_cancellable() {
         "{err}"
     );
 }
+
+#[test]
+fn cancel_if_pending_aborts_submitted() {
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+    let id = enqueue_with(&db, NOW, |_| {});
+    let out = paavo_core::cancel_if_pending(db.raw_conn(), &id, NOW + 1).unwrap();
+    assert_eq!(out, Some(JobOutcome::Aborted { by: AbortReason::User }));
+    assert_eq!(
+        paavo_db::JobRow::get(db.raw_conn(), &id).unwrap().state,
+        JobState::Aborted
+    );
+}
+
+#[test]
+fn cancel_if_pending_aborts_awaiting_board() {
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+    let id = enqueue_with(&db, NOW, |_| {});
+    paavo_db::JobRow::transition_submitted_to_building(db.raw_conn(), &id, NOW + 1).unwrap();
+    paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &id, "/e.elf").unwrap();
+
+    let out = paavo_core::cancel_if_pending(db.raw_conn(), &id, NOW + 2).unwrap();
+    assert_eq!(out, Some(JobOutcome::Aborted { by: AbortReason::User }));
+    assert_eq!(
+        paavo_db::JobRow::get(db.raw_conn(), &id).unwrap().state,
+        JobState::Aborted
+    );
+}
+
+#[test]
+fn cancel_if_pending_rejects_running() {
+    let db = fresh_db();
+    insert_board(&db, "mcxa266-01", "mcxa266", BoardHealth::Healthy);
+    let id = enqueue_with(&db, NOW, |_| {});
+    paavo_db::JobRow::transition_submitted_to_building(db.raw_conn(), &id, NOW + 1).unwrap();
+    paavo_db::JobRow::transition_building_to_awaiting_board(db.raw_conn(), &id, "/e.elf").unwrap();
+    paavo_db::JobRow::transition_awaiting_to_running(db.raw_conn(), &id, "mcxa266-01").unwrap();
+    assert!(matches!(
+        paavo_core::cancel_if_pending(db.raw_conn(), &id, NOW + 2),
+        Err(CoreError::NotCancellable {
+            state: JobState::Running
+        })
+    ));
+}
