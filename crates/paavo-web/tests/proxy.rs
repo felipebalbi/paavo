@@ -57,7 +57,11 @@ fn paavo_web_router(paavod_addr: SocketAddr) -> (tempfile::TempDir, axum::Router
     let _ = Db::open(&path).unwrap(); // run migrations
     let db = WebDb::open(&path).unwrap();
     let paavod = PaavodClient::new(&format!("http://{paavod_addr}")).expect("valid URL");
-    let state = AppState { db, paavod };
+    let state = AppState {
+        db,
+        paavod,
+        feed: paavo_web::feed::JobFeed::new(paavo_web::feed::EMPTY_PAYLOAD.to_string()),
+    };
     let app = paavo_web::app::build_router(state);
     (dir, app)
 }

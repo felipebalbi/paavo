@@ -109,6 +109,8 @@ pub struct AppState {
     pub db: crate::db::WebDb,
     /// paavod HTTP client (for the SSE proxy; pages don't use it).
     pub paavod: PaavodClient,
+    /// Dashboard live-feed channel (poller → SSE fan-out).
+    pub feed: crate::feed::JobFeed,
 }
 
 /// `GET /api/jobs/:id/stream` — open a streaming connection to

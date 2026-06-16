@@ -26,6 +26,12 @@ impl FromRef<AppState> for PaavodClient {
     }
 }
 
+impl FromRef<AppState> for crate::feed::JobFeed {
+    fn from_ref(s: &AppState) -> Self {
+        s.feed.clone()
+    }
+}
+
 /// `/static/style.css` — serves the baked-in ef-cyprus + ef-symbiosis
 /// stylesheet. The bytes are pulled in at compile time via
 /// `include_str!` so paavo-web stays a single binary deploy and the
@@ -80,6 +86,28 @@ async fn serve_live_log_js() -> impl IntoResponse {
     )
 }
 
+/// `/static/dashboard-live.js` — serves the dashboard live-feed
+/// consumer. Same caching contract as `/static/live-log.js`: baked in
+/// at compile time, day-long cache, must-revalidate, version-busted via
+/// `?v={CARGO_PKG_VERSION}` on the `<script src=...>` link.
+async fn serve_dashboard_live_js() -> impl IntoResponse {
+    const JS: &str = include_str!("assets/dashboard-live.js");
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, must-revalidate"),
+            ),
+        ],
+        JS,
+    )
+}
+
 /// Build the router from a fully-constructed [`AppState`].
 ///
 /// Used by both `paavo-web`'s `main` (real config + real reqwest
@@ -96,6 +124,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/schedule", get(crate::pages::schedule::render))
         .route("/static/style.css", get(serve_css))
         .route("/static/live-log.js", get(serve_live_log_js))
+        .route("/static/dashboard-live.js", get(serve_dashboard_live_js))
         .route("/api/jobs/:id/stream", get(crate::proxy::stream_job))
+        .route("/api/dashboard/feed", get(crate::feed::dashboard_feed))
         .with_state(state)
 }
