@@ -57,6 +57,31 @@ fn list_all_returns_inserted_boards_sorted_by_id() {
 }
 
 #[test]
+fn list_page_and_count_paginate_by_id_ascending() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    // Insert out of order so the ORDER BY id ASC actually matters.
+    for id in ["mcxa266-03", "mcxa266-01", "mcxa266-02"] {
+        let mut spec = sample_board();
+        spec.id = id.into();
+        BoardRow::insert(db.raw_conn(), &spec, now).unwrap();
+    }
+
+    assert_eq!(BoardRow::count(db.raw_conn()).unwrap(), 3);
+
+    // First page of two, id-ascending.
+    let page = BoardRow::list_page(db.raw_conn(), 0, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].spec.id, "mcxa266-01");
+    assert_eq!(page[1].spec.id, "mcxa266-02");
+
+    // Second page picks up the remaining row after the offset.
+    let page2 = BoardRow::list_page(db.raw_conn(), 2, 2).unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].spec.id, "mcxa266-03");
+}
+
+#[test]
 fn find_healthy_for_selector_filters_by_kind_and_excludes_quarantined() {
     let db = fresh_db();
     let now = Utc::now().timestamp_millis();

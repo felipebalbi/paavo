@@ -80,6 +80,27 @@ impl BoardRow {
         Ok(rows)
     }
 
+    /// Page of boards ordered by id ascending. The board fleet is small
+    /// and id-stable (no live churn like the jobs table), so a plain
+    /// `LIMIT/OFFSET` on the same `id ASC` order as `list_all` is
+    /// sufficient — no `as_of` pin is needed.
+    pub fn list_page(conn: &Connection, offset: u32, limit: u32) -> Result<Vec<Self>> {
+        let mut stmt = conn.prepare("SELECT * FROM board ORDER BY id ASC LIMIT ?1 OFFSET ?2")?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total board count. Paired with `list_page` so paavo-web can render
+    /// the total page count for the boards list.
+    pub fn count(conn: &Connection) -> Result<u64> {
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM board", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
     /// Find healthy boards matching the selector AND not currently
     /// dispatched (no `job` row in `running` state on this board — only
     /// the run phase holds a board; the build phase is board-free).
