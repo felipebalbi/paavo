@@ -283,6 +283,58 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// Page of full job rows, newest-first, optionally pinned to
+    /// `submitted_at <= as_of` for stable pagination under live inserts.
+    ///
+    /// The `as_of` pin freezes the result set against the live insert
+    /// stream: paavo-web captures `as_of` once (the newest
+    /// `submitted_at` at the moment the user opened the list) and threads
+    /// it through every page request, so a job submitted mid-scroll
+    /// cannot shift rows across page boundaries. `None` means "no pin"
+    /// (newest snapshot, used for the very first page). Ordering matches
+    /// `list_recent`/`list_index`: `submitted_at DESC, id DESC`.
+    pub fn list_page(
+        conn: &Connection,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Self>> {
+        let (sql, bind): (&str, Vec<i64>) = match as_of {
+            Some(t) => (
+                "SELECT * FROM job WHERE submitted_at <= ?1
+                 ORDER BY submitted_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                vec![t, limit as i64, offset as i64],
+            ),
+            None => (
+                "SELECT * FROM job
+                 ORDER BY submitted_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+                vec![limit as i64, offset as i64],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bind), from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count of jobs (optionally `submitted_at <= as_of`). Paired with
+    /// `list_page` so paavo-web can render the total page count against
+    /// the same `as_of` snapshot the page window is pinned to.
+    pub fn count(conn: &Connection, as_of: Option<i64>) -> Result<u64> {
+        let n: i64 = match as_of {
+            Some(t) => conn.query_row(
+                "SELECT COUNT(*) FROM job WHERE submitted_at <= ?1",
+                params![t],
+                |r| r.get(0),
+            )?,
+            None => conn.query_row("SELECT COUNT(*) FROM job", [], |r| r.get(0))?,
+        };
+        Ok(n as u64)
+    }
+
     /// `Submitted → Building`, recording the chosen board and start time.
     /// Errors if the job is not in `Submitted` state (0 rows updated).
     pub fn transition_to_building(

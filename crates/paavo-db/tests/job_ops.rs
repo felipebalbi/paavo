@@ -495,3 +495,36 @@ fn list_index_returns_lightweight_rows_newest_first() {
     assert!(index[1].board_id.is_none());
     assert_eq!(index[1].submitted_at, now);
 }
+
+#[test]
+fn list_page_and_count_honor_as_of_pin() {
+    let db = fresh_db();
+
+    // Three jobs at fixed submitted_at: 100, 200, 300.
+    let j100 = JobId::new();
+    let j200 = JobId::new();
+    let j300 = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(j100), 100).unwrap();
+    JobRow::insert(db.raw_conn(), &sample_new_job(j200), 200).unwrap();
+    JobRow::insert(db.raw_conn(), &sample_new_job(j300), 300).unwrap();
+
+    // count: unpinned sees all three; pinned at 250 sees only 100 + 200.
+    assert_eq!(JobRow::count(db.raw_conn(), None).unwrap(), 3);
+    assert_eq!(JobRow::count(db.raw_conn(), Some(250)).unwrap(), 2);
+
+    // First page (limit 2), unpinned: newest two, newest-first.
+    let page = JobRow::list_page(db.raw_conn(), None, 0, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].id, j300);
+    assert_eq!(page[1].id, j200);
+
+    // Pinned at 150: only the oldest (100) job is visible.
+    let pinned = JobRow::list_page(db.raw_conn(), Some(150), 0, 10).unwrap();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].id, j100);
+
+    // Offset walks the unpinned page window: skip the newest, get the rest.
+    let second = JobRow::list_page(db.raw_conn(), None, 2, 2).unwrap();
+    assert_eq!(second.len(), 1, "only one row remains after offset 2");
+    assert_eq!(second[0].id, j100);
+}
