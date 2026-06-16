@@ -20,7 +20,11 @@ fn fresh_app() -> (tempfile::TempDir, axum::Router) {
     let _ = Db::open(&path).unwrap(); // run migrations
     let db = WebDb::open(&path).unwrap();
     let paavod = PaavodClient::new("http://127.0.0.1:1").expect("valid URL");
-    let state = AppState { db, paavod };
+    let state = AppState {
+        db,
+        paavod,
+        feed: paavo_web::feed::JobFeed::new(paavo_web::feed::EMPTY_PAYLOAD.to_string()),
+    };
     let app = paavo_web::app::build_router(state);
     (dir, app)
 }
@@ -359,7 +363,11 @@ async fn job_detail_emits_data_since_seq_when_frames_exist() {
 
     let webdb = WebDb::open(&path).unwrap();
     let paavod = PaavodClient::new("http://127.0.0.1:1").expect("valid URL");
-    let state = AppState { db: webdb, paavod };
+    let state = AppState {
+        db: webdb,
+        paavod,
+        feed: paavo_web::feed::JobFeed::new(paavo_web::feed::EMPTY_PAYLOAD.to_string()),
+    };
     let app = paavo_web::app::build_router(state);
 
     let (status, body) = fetch(app, &format!("/jobs/{id}")).await;

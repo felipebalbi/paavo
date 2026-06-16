@@ -26,6 +26,12 @@ impl FromRef<AppState> for PaavodClient {
     }
 }
 
+impl FromRef<AppState> for crate::feed::JobFeed {
+    fn from_ref(s: &AppState) -> Self {
+        s.feed.clone()
+    }
+}
+
 /// `/static/style.css` — serves the baked-in ef-cyprus + ef-symbiosis
 /// stylesheet. The bytes are pulled in at compile time via
 /// `include_str!` so paavo-web stays a single binary deploy and the
