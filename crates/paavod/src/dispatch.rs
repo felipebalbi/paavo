@@ -204,7 +204,7 @@ fn run_one_inner(
     //    chasing a flaky chip can force a fresh build + flash by
     //    submitting with `--skip-cache` (paavo-cli) / `skip_cache:
     //    true` (JobSpec); see `JobRow::skip_cache`.
-    let elf_path = match build_or_cache(state, job) {
+    let elf_path = match build_or_cache(state, job, &log_seq, job_start) {
         Ok(p) => p,
         Err(stderr) => {
             return (
@@ -269,7 +269,12 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// `paavo_build::build_release` and store the result in the cache.
 /// Returns the ELF path. On build failure returns the captured
 /// stderr tail so the caller can produce a `BuildErr` outcome.
-fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path::PathBuf, String> {
+fn build_or_cache(
+    state: &AppState,
+    job: &paavo_db::JobRow,
+    log_seq: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    job_start: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
     let now_ms = Utc::now().timestamp_millis();
     // `skip_cache` is the operator's explicit "rebuild, don't reuse a
     // cached ELF for this tar_blake3" knob (set via paavo-cli
@@ -333,51 +338,56 @@ fn build_or_cache(state: &AppState, job: &paavo_db::JobRow) -> Result<std::path:
     };
 
     // Build-forwarder: drains BuildLine messages from
-    // build_release_streaming, converts each line to a LogFrame, and
-    // publishes it on the JobLogsBroker so live `/jobs/:id/stream`
-    // subscribers see cargo's progress in real time. Mirrors the
-    // shape of real_runner's run-forwarder thread.
+    // build_release_streaming and feeds each into a FrameSink, which
+    // assigns the shared per-job seq, stamps ts_us against the shared
+    // job-start clock, publishes on the JobLogsBroker for live
+    // `/jobs/:id/stream` subscribers, and batch-persists to
+    // `log_frame`. The run forwarder feeds an identically-constructed
+    // FrameSink from the same `log_seq` + `job_start`, so build- and
+    // run-phase frames share one contiguous seq space and one
+    // monotonic timeline.
     //
     // Frame translation:
     //   - target = "cargo:stdout" / "cargo:stderr" — the colon-
-    //     namespaced convention from the architect's design (see
-    //     paavo-build/src/build.rs::BuildStream rustdoc). Operators
-    //     filter on the `cargo:` prefix to isolate build lines.
+    //     namespaced convention the UI infers the build phase from.
+    //     Operators filter on the `cargo:` prefix to isolate build
+    //     lines.
     //   - level = Info uniformly. Cargo's stderr is mostly progress
     //     output ("Compiling foo v0.1.0", "Finished release [...]"),
     //     not warn/error severity. Real failures surface as
     //     `JobOutcome::Failed(BuildErr {...})` on the terminal event.
-    //   - seq is build-forwarder-local (starts at 0 per build, bumped
-    //     per emitted line). Build frames are NOT persisted to
-    //     `log_frame` in this commit (commit C2 will add persistence
-    //     with a shared per-job seq counter); for now the seq is just
-    //     a wire-debug aid for live subscribers.
-    //   - ts_us is microseconds since the build forwarder started.
-    //     Same monotonic clock the runtime forwarder will use after
-    //     C2; from a viewer's perspective time flows monotonically
-    //     across the build → run boundary.
+    //
+    // `recv_timeout` (not `recv`) so the FrameSink's 50 ms flush
+    // deadline fires even when cargo goes quiet mid-compile.
     let (build_tx, build_rx) = crossbeam_channel::unbounded::<paavo_build::BuildLine>();
+    let mut sink = crate::log_sink::FrameSink::new(
+        job.id,
+        state.job_logs.clone(),
+        state.db.clone(),
+        log_seq.clone(),
+        job_start,
+    );
     let job_id_for_fwd = job.id;
-    let broker_for_fwd = state.job_logs.clone();
-    let build_started = std::time::Instant::now();
     let build_fwd = std::thread::Builder::new()
         .name("paavod-build-forwarder".into())
-        .spawn(move || {
-            let mut seq: u64 = 0;
-            while let Ok(bl) = build_rx.recv() {
-                let target = match bl.stream {
-                    paavo_build::BuildStream::Stdout => "cargo:stdout",
-                    paavo_build::BuildStream::Stderr => "cargo:stderr",
-                };
-                let frame = paavo_proto::LogFrame {
-                    seq,
-                    ts_us: u64::try_from(build_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    level: paavo_proto::LogLevel::Info,
-                    target: Some(target.into()),
-                    message: bl.text,
-                };
-                broker_for_fwd.publish(job_id_for_fwd, crate::job_logs::LiveEvent::Frame(frame));
-                seq = seq.saturating_add(1);
+        .spawn(move || loop {
+            match build_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(bl) => {
+                    let target = match bl.stream {
+                        paavo_build::BuildStream::Stdout => "cargo:stdout",
+                        paavo_build::BuildStream::Stderr => "cargo:stderr",
+                    };
+                    sink.push(
+                        paavo_proto::LogLevel::Info,
+                        Some(target.to_string()),
+                        bl.text,
+                    );
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => sink.tick(),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    sink.finish();
+                    break;
+                }
             }
         })
         .expect("spawn paavod-build-forwarder thread");
