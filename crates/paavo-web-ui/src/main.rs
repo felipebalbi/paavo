@@ -1,13 +1,10 @@
-use leptos::prelude::*;
+//! Binary entry point: install the panic hook (so Rust panics surface in the
+//! browser console with a backtrace) and mount the [`App`] root onto `<body>`.
+//! All actual UI lives in the library crate (`paavo_web_ui`).
+//!
+//! [`App`]: paavo_web_ui::App
 
 fn main() {
     console_error_panic_hook::set_once();
-    leptos::mount::mount_to_body(|| {
-        let id = "01JZ8K3Q9FXM2H7B4N0PXR5T6A".parse::<paavo_proto::JobId>();
-        let text = match id {
-            Ok(j) => j.to_string(),
-            Err(_) => "parse-failed".into(),
-        };
-        view! { <p>"hello paavo: " {text}</p> }
-    });
+    leptos::mount::mount_to_body(paavo_web_ui::App);
 }

@@ -19,6 +19,19 @@ publish = false
 # Cargo.lock, decoupled from the host workspace.
 [workspace]
 
+# Split into a library (all the app code: modules, components, the `App` root)
+# plus a thin binary that only mounts it. The library form lets the handful of
+# `wasm-bindgen-test` unit tests reach internal logic, and lets `App` be named
+# (`paavo_web_ui::App`) from the bin. `trunk` (via `<link data-trunk rel="rust">`)
+# compiles the single `[[bin]]` target to wasm.
+[lib]
+name = "paavo_web_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "paavo-web-ui"
+path = "src/main.rs"
+
 [dependencies]
 leptos = { version = "=0.7.8", features = ["csr"] }
 leptos_router = "=0.7.8"
