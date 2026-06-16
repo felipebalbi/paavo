@@ -7,6 +7,9 @@ Cargo.lock.bak
 *.swo
 .DS_Store
 
+# Git worktrees for isolated feature work (using-git-worktrees skill).
+/.worktrees/
+
 # paavod runtime state (when run locally for dev)
 /var-paavo/
 *.sqlite
