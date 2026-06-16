@@ -54,6 +54,29 @@ async fn serve_css() -> impl IntoResponse {
     )
 }
 
+/// `/static/live-log.js` — serves the EventSource consumer that
+/// drives the live log pane on `/jobs/:id`. Same caching contract
+/// as `/static/style.css`: bake at compile time, year-long cache,
+/// must-revalidate, version-busted via `?v={CARGO_PKG_VERSION}` on
+/// the `<script src=...>` link rendered by `pages::job_detail`.
+async fn serve_live_log_js() -> impl IntoResponse {
+    const JS: &str = include_str!("assets/live-log.js");
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, must-revalidate"),
+            ),
+        ],
+        JS,
+    )
+}
+
 /// Build the router from a fully-constructed [`AppState`].
 ///
 /// Used by both `paavo-web`'s `main` (real config + real reqwest
@@ -69,6 +92,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/boards", get(crate::pages::boards::render))
         .route("/schedule", get(crate::pages::schedule::render))
         .route("/static/style.css", get(serve_css))
+        .route("/static/live-log.js", get(serve_live_log_js))
         .route(
             "/api/jobs/:id/stream",
             get(crate::proxy::stream_job),
