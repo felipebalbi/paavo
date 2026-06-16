@@ -230,6 +230,7 @@ pre.logpane {
 .s-running,
 .s-building  { color: var(--ef-state-running); font-weight: 600; }
 .s-submitted { color: var(--ef-state-pending); }
+.s-awaiting_board { color: var(--ef-state-pending); }
 
 /* --- board health -------------------------------------------- */
 .health-healthy     { color: var(--ef-state-pass); font-weight: 600; }

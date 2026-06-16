@@ -123,6 +123,7 @@ pub(crate) fn state_class(s: paavo_proto::JobState) -> &'static str {
         Aborted => "s-aborted",
         Running => "s-running",
         Building => "s-building",
+        AwaitingBoard => "s-awaiting_board",
         Submitted => "s-submitted",
     }
 }

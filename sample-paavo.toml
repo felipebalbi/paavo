@@ -44,6 +44,11 @@ nightly_cron = "0 0 19 * * *"
 # Scheduled jobs older than this get promoted to Interactive priority
 # (6 h).
 starvation_threshold_s = 21600
+# Maximum number of cargo builds that run at once. Each build gets its
+# own target directory so they truly run in parallel. Jobs beyond this
+# wait in the queue (Submitted) and start as build slots free up. The
+# hardware run phase is still serialized per board. Default: 5.
+max_concurrent_builds = 5
 
 [build_cache]
 # 5 GiB. blake3 keyed; LRU evicted when over.

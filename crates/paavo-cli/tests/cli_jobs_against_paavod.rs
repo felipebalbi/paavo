@@ -59,7 +59,7 @@ async fn paavo_cli_jobs_lists_seeded_job() {
         timeouts: TimeoutsConfig::default(),
         scheduler: SchedulerConfig {
             nightly_cron: "0 0 19 * * *".into(),
-            starvation_threshold_s: 21_600,
+            starvation_threshold_s: 21_600, max_concurrent_builds: 5,
         },
         build_cache: BuildCacheConfig::default(),
         retention: RetentionConfig::default(),
@@ -71,7 +71,7 @@ async fn paavo_cli_jobs_lists_seeded_job() {
         config: cfg,
         inventory: Arc::new(Mutex::new(vec![])),
         drain: DrainState::default(),
-        cancellation: CancellationRegistry::default(),
+        cancellation: CancellationRegistry::default(), build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -64,6 +64,7 @@ pub async fn render(State(db): State<WebDb>, Path(id): Path<String>) -> Html<Str
         paavo_proto::JobState::Building => ("build", "phase: building"),
         paavo_proto::JobState::Running => ("run", "phase: running"),
         paavo_proto::JobState::Submitted => ("", "phase: submitted"),
+        paavo_proto::JobState::AwaitingBoard => ("", "phase: awaiting board"),
         _ => ("done", "phase: done"),
     };
     body.push_str(&format!(

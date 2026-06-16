@@ -146,6 +146,33 @@ async fn post_jobs_accepts_multipart_and_persists_tar() {
 }
 
 #[tokio::test]
+async fn ten_submits_are_all_accepted() {
+    // INV-1: the build cap never gates acceptance. Ten back-to-back
+    // submits each get a 202 + a distinct persisted job row.
+    let tmp = tempdir().unwrap();
+    let s = state(tmp.path());
+    let mut ids = std::collections::HashSet::new();
+    for i in 0..10 {
+        let app = build_router(s.clone());
+        let body =
+            make_multipart_body(format!("tar-{i}").as_bytes(), &default_meta().to_string());
+        let resp = app.oneshot(submit_request(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "submit {i} must be accepted"
+        );
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        ids.insert(v["job_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(ids.len(), 10, "10 distinct job ids");
+    let rows =
+        paavo_db::JobRow::list_by_state(s.db.lock().raw_conn(), JobState::Submitted, 500).unwrap();
+    assert_eq!(rows.len(), 10, "all 10 jobs persisted as Submitted");
+}
+
+#[tokio::test]
 async fn post_jobs_forces_source_to_cli_even_if_client_sends_scheduler() {
     // Defect 5 from review: client can't claim Scheduler source over HTTP
     // (which would unlock the 4h default hard_max). Even if the wire
