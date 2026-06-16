@@ -1,0 +1,255 @@
+/*
+ * paavo-web — ef-cyprus (light) + ef-symbiosis (dark) palette.
+ *
+ * Source palettes are Protesilaos Stavrou's `ef-themes` for GNU Emacs:
+ *   ef-cyprus:    https://github.com/protesilaos/ef-themes/blob/main/ef-cyprus-theme.el
+ *   ef-symbiosis: https://github.com/protesilaos/ef-themes/blob/main/ef-symbiosis-theme.el
+ * (GPL-3.0-or-later — palette colour values are facts, not creative
+ * expression, so this is mechanical reuse, not a derivative work.
+ * Attribution included for courtesy.)
+ *
+ * The light theme is "Legible light ochre with green, yellow, teal,
+ * red colors" — warm cream background with deep brown text and
+ * verdant accents. The dark companion is "Legible dark brown-black
+ * with blue, green, cyan, gold colors" — both themes share the same
+ * warm-undertone family so a viewer flipping system preference
+ * mid-page sees a related palette rather than a clash.
+ *
+ * The active theme is chosen automatically via `prefers-color-scheme`.
+ * No manual toggle yet — it can be added later as a localStorage flag
+ * driving a `data-theme="light|dark"` attribute on <html>; the CSS
+ * variables stay where they are.
+ *
+ * Variable namespace: every custom property is prefixed `--ef-` so
+ * they're easy to grep and never collide with future utility
+ * frameworks. Values are bound twice (`:root` for light, the dark
+ * `@media` for dark); component rules below reference `var(--ef-*)`
+ * exclusively, so adding a manual toggle later only needs ONE rule
+ * per theme — the cascade does the rest.
+ */
+
+/* --- light theme (ef-cyprus) ----------------------------------- */
+:root {
+  /* neutrals */
+  --ef-bg-main:   #fcf7ef;  /* page canvas */
+  --ef-bg-dim:    #f0ece0;  /* alt-row, code panels */
+  --ef-bg-alt:    #e5e3d8;  /* table headers, pills */
+  --ef-bg-hl:     #f0e0d4;  /* row hover */
+  --ef-bg-active: #c5c3b8;  /* pressed state */
+
+  --ef-fg-main:   #242521;  /* body text */
+  --ef-fg-alt:    #7f475a;  /* secondary text (h2, table th) */
+  --ef-fg-dim:    #59786f;  /* placeholder, "—", timestamp */
+  --ef-border:    #c4c0b6;
+
+  /* accents */
+  --ef-red:       #9f0d0f;
+  --ef-green:     #006f00;
+  --ef-yellow:    #a7601f;
+  --ef-blue:      #375cc6;
+  --ef-magenta:   #9a456f;
+  --ef-cyan:      #1f70af;
+
+  /* state aliases — page templates reference these, not raw accents,
+     so a future theme that wants e.g. yellow-for-warn can rebind once
+     here without touching templates. */
+  --ef-state-pass:    var(--ef-green);
+  --ef-state-fail:    var(--ef-red);
+  --ef-state-running: var(--ef-blue);
+  --ef-state-pending: var(--ef-fg-dim);
+  --ef-state-warn:    var(--ef-yellow);
+
+  /* phase aliases — used by commit 5 to colour build vs. run frame
+     badges. Picked so build (compiler) and run (probe) read as
+     "different stages of the same job", not as state. */
+  --ef-phase-build: var(--ef-magenta);
+  --ef-phase-run:   var(--ef-cyan);
+
+  /* semantic colour pairs */
+  --ef-link:       var(--ef-blue);
+  --ef-link-hover: var(--ef-cyan);
+}
+
+/* --- dark theme (ef-symbiosis) -------------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ef-bg-main:   #130911;
+    --ef-bg-dim:    #221920;
+    --ef-bg-alt:    #372d32;
+    --ef-bg-hl:     #1f2f3f;
+    --ef-bg-active: #4b3f47;
+
+    --ef-fg-main:   #d0d0d0;
+    --ef-fg-alt:    #89afef;
+    --ef-fg-dim:    #857f8f;
+    --ef-border:    #4d4a4b;
+
+    --ef-red:       #ef6360;
+    --ef-green:     #0faa26;
+    --ef-yellow:    #bf9032;
+    --ef-blue:      #3f95f6;
+    --ef-magenta:   #d369af;
+    --ef-cyan:      #4fbaef;
+
+    /* state and phase aliases auto-rebind via the accent vars; nothing
+       to do here. */
+  }
+}
+
+/* --- baseline ------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  background: var(--ef-bg-main);
+  color: var(--ef-fg-main);
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono",
+               "Fira Code", Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0;
+  /* Smoother colour transitions when the OS flips light/dark. */
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+/* Link defaults — the in-table links pick this up; the `nav.top a`
+   override below tightens it for the navbar. */
+a            { color: var(--ef-link); text-decoration: none; }
+a:hover      { color: var(--ef-link-hover); text-decoration: underline; }
+
+/* --- top nav -------------------------------------------------- */
+nav.top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  /* color-mix lets us tint a translucent overlay on top of bg-main
+     so the page content scrolls under the bar with a hint of blur. */
+  background: color-mix(in srgb, var(--ef-bg-main) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--ef-border);
+  padding: 0.7rem 1.5rem;
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.9rem;
+}
+nav.top a              { color: var(--ef-fg-main); text-decoration: none; }
+nav.top a:hover        { color: var(--ef-link); }
+nav.top a[aria-current="page"] {
+  color: var(--ef-link);
+  font-weight: 600;
+}
+
+/* --- main layout --------------------------------------------- */
+main {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+  color: var(--ef-fg-main);
+}
+h2 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 2rem 0 0.5rem;
+  color: var(--ef-fg-alt);
+}
+.muted   { color: var(--ef-fg-dim); }
+.subtle  { color: var(--ef-fg-alt); }
+
+/* --- tables --------------------------------------------------- */
+table.rows {
+  width: 100%;
+  font-size: 0.9rem;
+  border-collapse: collapse;
+}
+table.rows th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ef-fg-alt);
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--ef-border);
+}
+table.rows td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--ef-bg-alt);
+}
+table.rows tr:hover td { background: var(--ef-bg-hl); }
+table.rows td.dim, .ts { color: var(--ef-fg-dim); }
+table.rows td.empty {
+  font-style: italic;
+  color: var(--ef-fg-dim);
+  padding: 0.75rem 0.5rem;
+}
+
+/* --- inline pills + code ------------------------------------- */
+code, .pill, .id-pill {
+  background: var(--ef-bg-alt);
+  color: var(--ef-fg-main);
+  padding: 0.05rem 0.4em;
+  border-radius: 3px;
+  font-size: 0.92em;
+}
+.id-pill { font-size: 1rem; padding: 0.1rem 0.5em; }
+
+/* --- log pane ------------------------------------------------- */
+pre.logpane {
+  background: var(--ef-bg-dim);
+  color: var(--ef-fg-main);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 1rem;
+  border: 1px solid var(--ef-border);
+  border-radius: 6px;
+  overflow-x: auto;
+  max-height: 70vh;
+  margin: 0;
+}
+.log-line { white-space: pre; display: inline; }
+.log-ts   { color: var(--ef-fg-dim); }
+
+/* defmt-level colour cues for log frames */
+.lvl-error { color: var(--ef-state-fail); }
+.lvl-warn  { color: var(--ef-state-warn); }
+.lvl-info,
+.lvl-debug,
+.lvl-trace { color: var(--ef-fg-main); }
+
+/* phase tags on log lines (commit 5 sets these) */
+.phase-build { color: var(--ef-phase-build); }
+.phase-run   { color: var(--ef-phase-run); }
+
+/* --- state badges (job state) -------------------------------- */
+.s-passed    { color: var(--ef-state-pass); font-weight: 600; }
+.s-failed,
+.s-timedout,
+.s-aborted   { color: var(--ef-state-fail); font-weight: 600; }
+.s-running,
+.s-building  { color: var(--ef-state-running); font-weight: 600; }
+.s-submitted { color: var(--ef-state-pending); }
+
+/* --- board health -------------------------------------------- */
+.health-healthy     { color: var(--ef-state-pass); font-weight: 600; }
+.health-quarantined { color: var(--ef-state-fail); font-weight: 600; }
+
+/* --- schedule enabled --------------------------------------- */
+.enabled  { color: var(--ef-state-pass); font-weight: 600; }
+.disabled { color: var(--ef-state-pending); }
+
+/* --- phase banner (used on /jobs/:id by commit 5) ----------- */
+.phase-banner {
+  display: inline-block;
+  padding: 0.2rem 0.7rem;
+  border-radius: 999px;
+  background: var(--ef-bg-alt);
+  color: var(--ef-fg-main);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.phase-banner.build { color: var(--ef-phase-build); }
+.phase-banner.run   { color: var(--ef-phase-run); }
+.phase-banner.done  { color: var(--ef-fg-dim); }
