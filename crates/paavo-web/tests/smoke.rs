@@ -312,3 +312,60 @@ async fn job_detail_page_wires_live_log_consumer() {
         "job-detail page missing #outcome-card; body: {body}"
     );
 }
+
+#[tokio::test]
+async fn job_detail_emits_data_since_seq_when_frames_exist() {
+    use paavo_db::LogFrameDb;
+    use paavo_proto::{BoardSelector, JobId, JobSource, LogFrame, LogLevel, Priority};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("paavo.sqlite");
+    let id = JobId::new();
+    {
+        let db = Db::open(&path).unwrap();
+        paavo_db::JobRow::insert(
+            db.raw_conn(),
+            &paavo_db::NewJob {
+                id,
+                priority: Priority::Interactive,
+                submitter: "x".into(),
+                source: JobSource::Cli,
+                board_selector: BoardSelector {
+                    kind: "mcxa266".into(),
+                    instance: None,
+                    wiring_profile: None,
+                },
+                inactivity_timeout_ms: 120_000,
+                hard_max_ms: 900_000,
+                tar_blake3: "x".into(),
+                tar_path: "/tmp/x.tar".into(),
+                cargo_update_packages: vec![],
+                skip_cache: false,
+            },
+            0,
+        )
+        .unwrap();
+        let frames: Vec<LogFrame> = (0..3u64)
+            .map(|seq| LogFrame {
+                seq,
+                ts_us: seq * 1000,
+                level: LogLevel::Info,
+                target: Some("cargo:stdout".into()),
+                message: format!("l{seq}"),
+            })
+            .collect();
+        LogFrame::append_batch(db.raw_conn(), &id, &frames).unwrap();
+    }
+
+    let webdb = WebDb::open(&path).unwrap();
+    let paavod = PaavodClient::new("http://127.0.0.1:1").expect("valid URL");
+    let state = AppState { db: webdb, paavod };
+    let app = paavo_web::app::build_router(state);
+
+    let (status, body) = fetch(app, &format!("/jobs/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(r#"data-since-seq="2""#),
+        "expected data-since-seq=\"2\" (max of seqs 0,1,2); body:\n{body}"
+    );
+}

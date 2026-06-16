@@ -86,10 +86,21 @@ pub async fn render(State(db): State<WebDb>, Path(id): Path<String>) -> Html<Str
     // Log section.
     body.push_str(r#"<h2>log</h2>"#);
     // The pane carries data-job-id so live-log.js can find which job
-    // to subscribe to. Pure DOM — no inline JS, keeps CSP-friendly.
+    // to subscribe to. data-since-seq is the max seq of the
+    // SSR-rendered frames: live-log.js seeds its dedup cursor from it
+    // and passes it to the stream so the proxy trims the prefix the
+    // page already shows. Omitted when there are no historical rows.
+    // Pure DOM — no inline JS, keeps CSP-friendly.
+    let since_seq_attr = logs
+        .iter()
+        .map(|f| f.seq)
+        .max()
+        .map(|m| format!(r#" data-since-seq="{m}""#))
+        .unwrap_or_default();
     body.push_str(&format!(
-        r#"<pre id="logpane" class="logpane" data-job-id="{id}">"#,
-        id = super::html_escape(&job.id.to_string())
+        r#"<pre id="logpane" class="logpane" data-job-id="{id}"{since}>"#,
+        id = super::html_escape(&job.id.to_string()),
+        since = since_seq_attr,
     ));
     for f in &logs {
         // Render `ts_us` as `mm:ss.fff` (relative to job start) for
