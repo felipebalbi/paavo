@@ -61,6 +61,36 @@ pub async fn start(state: AppState) -> anyhow::Result<CronHandle> {
     Ok(CronHandle { inner: sched })
 }
 
+/// Seed the `schedule` table from the configured `nightly_cron` at
+/// startup so paavo-web's `/schedule` page shows the registered cron
+/// immediately, without waiting for the first nightly fire. Mirrors the
+/// `boards.toml` → `board` table sync that paavod::main runs at boot
+/// (`load_inventory`): config is the declarative source of truth and
+/// paavod is the single writer.
+///
+/// Uses `ScheduleRow::upsert`, which `COALESCE`s the timestamp columns,
+/// so re-seeding on every boot refreshes `cron`/`enabled` (picking up an
+/// operator's edit to `nightly_cron`) while preserving any
+/// `last_triggered_at` / `last_completed_at` history written by prior
+/// nightly fires — that is why the seed passes `None` for both stamps.
+///
+/// Synchronous (no await), so holding the DB mutex here does not violate
+/// the never-hold-a-lock-across-await invariant.
+pub fn seed_schedule(state: &AppState) -> anyhow::Result<()> {
+    let db = state.db.lock();
+    paavo_db::ScheduleRow::upsert(
+        db.raw_conn(),
+        &paavo_db::ScheduleRow {
+            id: "nightly".into(),
+            cron: state.config.scheduler.nightly_cron.clone(),
+            enabled: true,
+            last_triggered_at: None,
+            last_completed_at: None,
+        },
+    )?;
+    Ok(())
+}
+
 async fn run_nightly_corpus(state: &AppState) -> anyhow::Result<()> {
     if state.drain.is_draining() {
         tracing::info!("nightly cron: draining — skipping corpus run");
