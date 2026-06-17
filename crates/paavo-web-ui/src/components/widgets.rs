@@ -8,7 +8,7 @@
 //! byte-identical state colours and timestamps.
 
 use leptos::prelude::*;
-use paavo_proto::JobState;
+use paavo_proto::{BoardHealth, JobState};
 use wasm_bindgen::JsValue;
 
 /// Format an epoch-millisecond timestamp as a terse "x ago" string relative
@@ -85,4 +85,106 @@ pub fn StateBadge(
     state: JobState,
 ) -> impl IntoView {
     view! { <span class=format!("badge is-{}", state_css(state))>{state_label(state)}</span> }
+}
+
+/// The CSS modifier suffix for a board health, matching the `.badge.is-*`
+/// classes in `style.css` (`Healthy` → `"healthy"`/green, `Quarantined` →
+/// `"quarantined"`/red). Shared by [`HealthBadge`] and the dashboard fleet
+/// list so a board's colour is identical wherever it renders.
+pub fn health_css(health: BoardHealth) -> &'static str {
+    match health {
+        BoardHealth::Healthy => "healthy",
+        BoardHealth::Quarantined => "quarantined",
+    }
+}
+
+/// Human-facing label for a board health (the badge text): the lowercase
+/// variant name, matching [`state_label`]'s lowercase convention so health
+/// and job-state badges read the same in a table.
+pub fn health_label(health: BoardHealth) -> &'static str {
+    match health {
+        BoardHealth::Healthy => "healthy",
+        BoardHealth::Quarantined => "quarantined",
+    }
+}
+
+/// A pill badge for a [`BoardHealth`]:
+/// `<span class="badge is-healthy|is-quarantined">label</span>`. Used in both
+/// the boards table and the dashboard fleet list.
+#[component]
+pub fn HealthBadge(
+    /// The board health to render.
+    health: BoardHealth,
+) -> impl IntoView {
+    view! { <span class=format!("badge is-{}", health_css(health))>{health_label(health)}</span> }
+}
+
+/// Compute the set of page numbers to surface in the pager: always the first
+/// and last page, plus a ±2 window around the current page. Returned sorted
+/// and de-duplicated; gaps (where consecutive numbers jump by more than one)
+/// are rendered as an ellipsis by [`pager`].
+pub fn page_numbers(current: u32, total_pages: u32) -> Vec<u32> {
+    if total_pages <= 1 {
+        return vec![1];
+    }
+    let mut set = std::collections::BTreeSet::new();
+    set.insert(1);
+    set.insert(total_pages);
+    let lo = current.saturating_sub(2).max(1);
+    let hi = (current + 2).min(total_pages);
+    for p in lo..=hi {
+        set.insert(p);
+    }
+    set.into_iter().collect()
+}
+
+/// Render the pagination footer: a Prev button, the windowed page numbers
+/// (with ellipses for gaps), and a Next button. Each control writes the
+/// shared `page` signal, which re-keys the caller's data resource. Shared by
+/// the jobs, boards, and schedule tables so every paginated view paginates
+/// identically.
+pub fn pager(page: RwSignal<u32>, current: u32, total_pages: u32) -> impl IntoView {
+    let mut items: Vec<AnyView> = Vec::new();
+    let mut prev_n = 0u32;
+    for n in page_numbers(current, total_pages) {
+        if prev_n != 0 && n > prev_n + 1 {
+            items.push(view! { <span class="pager-gap muted">"…"</span> }.into_any());
+        }
+        let is_current = n == current;
+        let cls = if is_current {
+            "pager-btn is-current"
+        } else {
+            "pager-btn"
+        };
+        items.push(
+            view! {
+                <button class=cls on:click=move |_| page.set(n) disabled=is_current>
+                    {n}
+                </button>
+            }
+            .into_any(),
+        );
+        prev_n = n;
+    }
+    let prev_disabled = current <= 1;
+    let next_disabled = current >= total_pages;
+    view! {
+        <div class="pager">
+            <button
+                class="pager-btn"
+                on:click=move |_| page.update(|p| *p = p.saturating_sub(1).max(1))
+                disabled=prev_disabled
+            >
+                "‹ Prev"
+            </button>
+            {items}
+            <button
+                class="pager-btn"
+                on:click=move |_| page.update(|p| { if *p < total_pages { *p += 1 } })
+                disabled=next_disabled
+            >
+                "Next ›"
+            </button>
+        </div>
+    }
 }

@@ -278,6 +278,14 @@ main {
 .badge.is-submitted { --badge-color: var(--grey); }
 .badge.is-aborted { --badge-color: var(--grey); }
 
+/* board health (boards table + dashboard fleet) */
+.badge.is-healthy { --badge-color: var(--green); }
+.badge.is-quarantined { --badge-color: var(--red); }
+
+/* schedule enabled flag */
+.badge.is-enabled { --badge-color: var(--green); }
+.badge.is-disabled { --badge-color: var(--grey); }
+
 /* Running jobs get a subtly pulsing dot. */
 .badge.is-running::before {
   content: "";

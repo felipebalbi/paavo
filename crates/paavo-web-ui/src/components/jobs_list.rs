@@ -35,7 +35,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::widgets::{abs_time, rel_time, StateBadge};
+use crate::components::widgets::{abs_time, pager, rel_time, StateBadge};
 use crate::live::LiveSignals;
 
 /// The `/jobs` list page.
@@ -193,73 +193,5 @@ pub fn JobsList() -> impl IntoView {
                 }
             })}
         </Suspense>
-    }
-}
-
-/// Compute the set of page numbers to surface in the pager: always the first
-/// and last page, plus a ±2 window around the current page. Returned sorted
-/// and de-duplicated; gaps (where consecutive numbers jump by more than one)
-/// are rendered as an ellipsis by [`pager`].
-fn page_numbers(current: u32, total_pages: u32) -> Vec<u32> {
-    if total_pages <= 1 {
-        return vec![1];
-    }
-    let mut set = std::collections::BTreeSet::new();
-    set.insert(1);
-    set.insert(total_pages);
-    let lo = current.saturating_sub(2).max(1);
-    let hi = (current + 2).min(total_pages);
-    for p in lo..=hi {
-        set.insert(p);
-    }
-    set.into_iter().collect()
-}
-
-/// Render the pagination footer: a Prev button, the windowed page numbers
-/// (with ellipses for gaps), and a Next button. Each control writes the
-/// shared `page` signal, which re-keys the data resource.
-fn pager(page: RwSignal<u32>, current: u32, total_pages: u32) -> impl IntoView {
-    let mut items: Vec<AnyView> = Vec::new();
-    let mut prev_n = 0u32;
-    for n in page_numbers(current, total_pages) {
-        if prev_n != 0 && n > prev_n + 1 {
-            items.push(view! { <span class="pager-gap muted">"…"</span> }.into_any());
-        }
-        let is_current = n == current;
-        let cls = if is_current {
-            "pager-btn is-current"
-        } else {
-            "pager-btn"
-        };
-        items.push(
-            view! {
-                <button class=cls on:click=move |_| page.set(n) disabled=is_current>
-                    {n}
-                </button>
-            }
-            .into_any(),
-        );
-        prev_n = n;
-    }
-    let prev_disabled = current <= 1;
-    let next_disabled = current >= total_pages;
-    view! {
-        <div class="pager">
-            <button
-                class="pager-btn"
-                on:click=move |_| page.update(|p| *p = p.saturating_sub(1).max(1))
-                disabled=prev_disabled
-            >
-                "‹ Prev"
-            </button>
-            {items}
-            <button
-                class="pager-btn"
-                on:click=move |_| page.update(|p| { if *p < total_pages { *p += 1 } })
-                disabled=next_disabled
-            >
-                "Next ›"
-            </button>
-        </div>
     }
 }
