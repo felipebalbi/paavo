@@ -421,6 +421,115 @@ main {
   font-size: 0.95em;
 }
 
+/* ---- job detail: header, phase, outcome, log ------------------------- */
+
+.job-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.job-header-top {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.id-pill {
+  padding: 0.2rem 0.6rem;
+  border-radius: 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  word-break: break-all;
+}
+
+/* Responsive label/value grid; collapses to one column on narrow screens. */
+.kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: 0.75rem 1.25rem;
+  margin: 0;
+}
+
+.kv > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.kv dt {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.outcome-card h2 {
+  font-size: 1rem;
+  margin: 0 0 0.6rem;
+}
+
+.outcome-json {
+  margin: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.75rem 1rem;
+  font-family: var(--mono-font);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 28rem;
+}
+
+/* log line: phase tag + per-level colours */
+.logpane .tag {
+  font-weight: 600;
+}
+
+.logpane .tag-build {
+  color: var(--amber);
+}
+
+.logpane .tag-run {
+  color: var(--blue);
+}
+
+.logpane .lvl {
+  font-weight: 600;
+}
+
+.logpane .lvl-info,
+.logpane .lvl-debug {
+  color: var(--text-muted);
+}
+
+.logpane .lvl-trace {
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.logpane .lvl-warn {
+  color: var(--amber);
+}
+
+.logpane .lvl-error {
+  color: var(--red);
+}
+
+.logpane .ts {
+  color: var(--text-muted);
+}
+
 /* ---- responsive: collapse sidebar to a top row, scroll tables -------- */
 
 @media (max-width: 48rem) {
