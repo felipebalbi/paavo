@@ -27,6 +27,8 @@ exclude = [
     # Cross-compiles to thumbv8m.main-none-eabihf; the spike binary flashes
     # this and confirms the RTT path end to end.
     "dev/spike-fixture-mcxa266",
+    # Dev-only DB seeder for UI stress-testing; standalone, links paavo-db.
+    "dev/seed-demo",
     # Leptos CSR app; cross-compiles to wasm32, built by trunk (see AGENTS.md).
     "crates/paavo-web-ui",
 ]
