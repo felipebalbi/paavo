@@ -8,13 +8,26 @@
 
 use crate::app_state::AppState;
 use crate::state_dir::StateDir;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use std::path::Path;
 use tracing::{error, info, warn};
 
 /// Shorthand for handler results.
 type HandlerResult<T> = Result<T, (StatusCode, String)>;
+
+/// Query string for `POST /admin/purge`.
+///
+/// `boards=true` additionally wipes the entire `board` inventory (in
+/// addition to the job/log/cache/artifact reset). Omitted or `false`
+/// preserves boards — the original, backward-compatible behavior, so
+/// existing callers that POST with no query string are unaffected.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct PurgeQuery {
+    /// Also delete every board row.
+    #[serde(default)]
+    pub boards: bool,
+}
 
 /// `POST /admin/purge` — see §9.5.
 ///
@@ -34,7 +47,10 @@ type HandlerResult<T> = Result<T, (StatusCode, String)>;
 /// operation; the filesystem wipe is opportunistic — if a directory
 /// is locked (e.g. by an antivirus scanner), we warn and continue.
 /// Operators can re-run the purge to retry the disk side.
-pub async fn purge(State(s): State<AppState>) -> HandlerResult<StatusCode> {
+pub async fn purge(
+    State(s): State<AppState>,
+    Query(q): Query<PurgeQuery>,
+) -> HandlerResult<StatusCode> {
     // 1. Authoritative DB-side gate + truncate.
     {
         let db = s.db.lock();
@@ -75,6 +91,16 @@ pub async fn purge(State(s): State<AppState>) -> HandlerResult<StatusCode> {
                 })?;
         }
         info!("purge: db rows cleared (job + log_frame + build_cache)");
+        if q.boards {
+            conn.execute("DELETE FROM board", []).map_err(|e| {
+                error!(error = %e, "purge: DELETE FROM board failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("DELETE FROM board: {e}"),
+                )
+            })?;
+            info!("purge: board inventory cleared");
+        }
     }
 
     // 2. Best-effort filesystem wipe. The DB is now authoritative —
@@ -89,6 +115,18 @@ pub async fn purge(State(s): State<AppState>) -> HandlerResult<StatusCode> {
     // build_cache rows are already gone, so the on-disk ELFs are
     // orphans too — sweep them.
     wipe_dir_contents_lossy(&sd.cache_elfs_dir);
+
+    if q.boards {
+        // Empty the in-memory inventory cache to match the now-empty
+        // `board` table. Lossy: the DB is authoritative and paavod
+        // re-hydrates the cache from it on restart, so a failed refresh
+        // only leaves a briefly-stale cache, never a wrong DB. Called
+        // after dropping our db guard — refresh_inventory takes the db
+        // then inventory locks itself, preserving lock ordering.
+        if let Err(e) = crate::routes::boards::refresh_inventory(&s) {
+            warn!(error = %e, "purge: inventory cache refresh failed after board wipe");
+        }
+    }
 
     info!("purge: complete");
     Ok(StatusCode::NO_CONTENT)

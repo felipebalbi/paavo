@@ -321,3 +321,34 @@ async fn purge_serves_during_drain() {
     // shutdown.
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn purge_with_boards_true_deletes_boards_and_clears_inventory() {
+    let (_sd, s) = state_with_dir();
+    let spec = seed_board(&s);
+    // Pre-populate the in-memory inventory cache so we can prove the
+    // handler clears it (not just the DB table).
+    *s.inventory.lock() = vec![spec.clone()];
+    let _job = seed_terminal_job(&s);
+
+    let app = build_router(s.clone());
+    let resp = post_empty(app, "/admin/purge?boards=true").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let db = s.db.lock();
+    let n_board: i64 = db
+        .raw_conn()
+        .query_row("SELECT COUNT(*) FROM board", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_board, 0, "boards should be wiped with ?boards=true");
+    let n_job: i64 = db
+        .raw_conn()
+        .query_row("SELECT COUNT(*) FROM job", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_job, 0);
+    drop(db);
+    assert!(
+        s.inventory.lock().is_empty(),
+        "in-memory inventory cache should be empty after board purge"
+    );
+}
