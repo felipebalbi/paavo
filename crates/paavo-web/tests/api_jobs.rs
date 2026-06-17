@@ -118,3 +118,18 @@ async fn jobs_list_paginates_and_searches() {
     assert_eq!(q.items.len(), 1);
     assert_eq!(q.items[0].submitter, "alice");
 }
+
+#[tokio::test]
+async fn jobs_default_page_size_is_20_and_explicit_is_echoed() {
+    let (_dir, rw, app) = jobs_app(Duration::from_millis(20));
+    JobRow::insert(rw.raw_conn(), &new_job(JobId::new(), "alice"), 0).unwrap();
+    wait_for_total(&app, 1, Duration::from_secs(5)).await;
+
+    // No per_page in the query → server falls back to the default page size.
+    let p = get_page(&app, "/api/jobs").await;
+    assert_eq!(p.per_page, 20, "default jobs page size should be 20");
+
+    // An explicit, in-range per_page is echoed back unchanged.
+    let p30 = get_page(&app, "/api/jobs?per_page=30").await;
+    assert_eq!(p30.per_page, 30);
+}
