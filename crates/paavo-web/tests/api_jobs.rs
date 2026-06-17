@@ -1,9 +1,9 @@
-//! Integration tests for `GET /api/jobs`: pagination + fuzzy search
-//! over the poller-maintained in-memory index.
+//! Integration tests for `GET /api/jobs`: pagination + fuzzy search.
 //!
-//! The index is populated asynchronously by the background poller, so
-//! these tests seed rows via a live RW `Db` writer and then poll the
-//! HTTP endpoint until the index reflects them before asserting.
+//! Rows are seeded via a live RW `Db` writer and read back through the
+//! read-only `WebDb` (WAL), which the handler now queries directly — there
+//! is no in-memory index. A short poll loop tolerates WAL read-visibility
+//! latency before asserting.
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -24,8 +24,9 @@ fn jobs_app(interval: Duration) -> (tempfile::TempDir, Db, axum::Router) {
     let path = dir.path().join("paavo.sqlite");
     let rw = Db::open(&path).unwrap();
     let webdb = WebDb::open(&path).unwrap();
-    // The router and the poller must share the SAME `LiveState`: the
-    // poller writes the index, `GET /api/jobs` reads it.
+    // The poller drives only the live `jobs` revision now; `GET /api/jobs`
+    // reads SQLite directly. The shared `LiveState` still supplies the
+    // revision echoed on each page.
     let live = LiveState::new();
     paavo_web::index::spawn_poller(webdb.clone(), live.clone(), interval);
     let paavod = PaavodClient::new("http://127.0.0.1:1").expect("valid URL");
@@ -69,8 +70,9 @@ async fn get_page(app: &axum::Router, uri: &str) -> Page<JobListItem> {
     serde_json::from_slice(&bytes).expect("Page<JobListItem> JSON")
 }
 
-/// Poll `GET /api/jobs` until the index reports `want` total rows or the
-/// timeout elapses.
+/// Poll `GET /api/jobs` until it reports `want` total rows (WAL read
+/// visibility is effectively immediate; the loop guards against any
+/// checkpoint lag) or the timeout elapses.
 async fn wait_for_total(app: &axum::Router, want: u64, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
