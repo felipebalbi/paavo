@@ -1,8 +1,8 @@
 use chrono::Utc;
 use paavo_db::{BoardRow, Db, JobRow, NewJob, OutcomeRecord};
 use paavo_proto::{
-    BoardHealth, BoardSelector, BoardSpec, JobId, JobOutcome, JobSource, JobState, Priority,
-    ProbeSelector, TerminalOutcome,
+    AbortReason, BoardHealth, BoardSelector, BoardSpec, JobId, JobOutcome, JobSource, JobState,
+    Priority, ProbeSelector, TerminalOutcome, TimeoutReason,
 };
 use tempfile::tempdir;
 
@@ -554,7 +554,20 @@ fn state_counts_tallies_each_state() {
     JobRow::insert(db.raw_conn(), &sample_new_job(b), now).unwrap();
     JobRow::transition_submitted_to_building(db.raw_conn(), &b, now + 1).unwrap();
 
-    // One passed (full lifecycle on the seeded board).
+    // One awaiting_board (built, no board claimed).
+    let aw = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(aw), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &aw, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &aw, "/elf").unwrap();
+
+    // One running (claims the board, left running).
+    let r = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(r), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &r, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &r, "/elf").unwrap();
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &r, "mcxa266-01").unwrap();
+
+    // One passed (full lifecycle).
     let p = JobId::new();
     JobRow::insert(db.raw_conn(), &sample_new_job(p), now).unwrap();
     JobRow::transition_submitted_to_building(db.raw_conn(), &p, now + 1).unwrap();
@@ -590,15 +603,54 @@ fn state_counts_tallies_each_state() {
     )
     .unwrap();
 
+    // One timed out.
+    let t = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(t), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &t, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &t, "/elf").unwrap();
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &t, "mcxa266-01").unwrap();
+    JobRow::finalize(
+        db.raw_conn(),
+        &t,
+        &OutcomeRecord {
+            state: JobState::TimedOut,
+            outcome: JobOutcome::TimedOut {
+                reason: TimeoutReason::Inactivity,
+                elapsed_ms: 120_000,
+            },
+            finished_at_ms: now + 2,
+        },
+    )
+    .unwrap();
+
+    // One aborted.
+    let ab = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(ab), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &ab, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &ab, "/elf").unwrap();
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &ab, "mcxa266-01").unwrap();
+    JobRow::finalize(
+        db.raw_conn(),
+        &ab,
+        &OutcomeRecord {
+            state: JobState::Aborted,
+            outcome: JobOutcome::Aborted {
+                by: AbortReason::User,
+            },
+            finished_at_ms: now + 2,
+        },
+    )
+    .unwrap();
+
     let c = JobRow::state_counts(db.raw_conn()).unwrap();
     assert_eq!(c.submitted, 2);
     assert_eq!(c.building, 1);
-    assert_eq!(c.awaiting_board, 0);
-    assert_eq!(c.running, 0);
+    assert_eq!(c.awaiting_board, 1);
+    assert_eq!(c.running, 1);
     assert_eq!(c.passed, 1);
     assert_eq!(c.failed, 1);
-    assert_eq!(c.timed_out, 0);
-    assert_eq!(c.aborted, 0);
-    assert_eq!(c.queue(), 3);
-    assert_eq!(c.terminal(), 2);
+    assert_eq!(c.timed_out, 1);
+    assert_eq!(c.aborted, 1);
+    assert_eq!(c.queue(), 4);
+    assert_eq!(c.terminal(), 4);
 }
