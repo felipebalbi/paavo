@@ -10,7 +10,9 @@
 //! them directly in an error branch — the UI has nothing actionable to do with
 //! a structured transport error beyond showing it.
 
-use paavo_proto::{BoardView, JobListItem, JobView, LogFrame, Page, ScheduleView};
+use paavo_proto::{
+    BoardView, DashboardOverview, JobListItem, JobView, LogFrame, Page, ScheduleView,
+};
 
 /// Stringify any `Display` error (gloo-net transport error, serde decode
 /// error) into a render-ready message.
@@ -87,6 +89,13 @@ pub async fn boards_page(page: u32, per_page: u32, q: &str) -> Result<Page<Board
 /// over [`boards_page`].
 pub async fn boards(page: u32, q: &str) -> Result<Page<BoardView>, String> {
     boards_page(page, 20, q).await
+}
+
+/// `GET /api/dashboard` — the consolidated landing-page payload: exact
+/// aggregate counts plus the recent-jobs and fleet display slices, in one
+/// bounded response. Replaces the dashboard's old wide jobs+boards fetch.
+pub async fn dashboard() -> Result<DashboardOverview, String> {
+    fetch_json("/api/dashboard").await
 }
 
 /// `GET /api/schedules?page=&per_page=20` — one page of cron schedules.
