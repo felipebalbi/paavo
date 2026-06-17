@@ -1,7 +1,7 @@
 //! Thin HTTP client around the paavod surface.
 
 use anyhow::{Context, Result};
-use paavo_proto::{BoardSpec, JobSpec};
+use paavo_proto::{BoardSpec, BoardView, JobSpec};
 use serde::de::DeserializeOwned;
 
 /// HTTP client.
@@ -95,6 +95,13 @@ impl Client {
     /// Add a board.
     pub async fn add_board(&self, spec: &BoardSpec) -> Result<()> {
         self.post_json("/boards", Some(spec)).await
+    }
+
+    /// List the daemon's board inventory (`GET /boards`). Returns the
+    /// same `BoardView` shape paavo-web consumes; `run` uses it to
+    /// resolve the board kind client-side.
+    pub async fn list_boards(&self) -> Result<Vec<BoardView>> {
+        self.get_json::<Vec<BoardView>>("/boards").await
     }
 
     /// DELETE the given path. Non-2xx is surfaced as an anyhow error
