@@ -223,6 +223,30 @@ main {
   font-size: 0.875rem;
 }
 
+/* Optional third line under a stat: a small muted qualifier
+ * (e.g. "2 quarantined", "18 runs"). */
+.stat .stat-sub {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* Two-column dashboard content row: recent activity (wider) + board fleet
+ * (narrower). minmax(0, …) lets either column's table shrink/scroll instead
+ * of forcing the grid wider than its container. Collapses to one column on
+ * narrow screens (see the max-width media query below). */
+.grid2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: clamp(0.875rem, 2vw, 1.5rem);
+  align-items: start;
+}
+
+/* Heading inside a .card (dashboard panels). */
+.card-title {
+  font-size: 1rem;
+  margin: 0 0 0.75rem;
+}
+
 /* ---- tables ---------------------------------------------------------- */
 
 .table {
@@ -573,6 +597,11 @@ main {
     display: block;
     overflow-x: auto;
     white-space: nowrap;
+  }
+
+  /* Stack the dashboard's two-column content row. */
+  .grid2 {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

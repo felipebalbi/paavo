@@ -25,15 +25,31 @@ fn encode(value: &str) -> String {
     js_sys::encode_uri_component(value).into()
 }
 
-/// `GET /api/jobs?q=&page=&per_page=50&as_of=` — one page of the (optionally
-/// fuzzy-filtered) jobs index. Blank `q` returns the time-ordered list;
-/// `as_of` pins the page to `submitted_at <= as_of` for stable paging.
-pub async fn jobs(q: &str, page: u32, as_of: Option<i64>) -> Result<Page<JobListItem>, String> {
-    let mut url = format!("/api/jobs?page={page}&per_page=50&q={}", encode(q));
+/// `GET /api/jobs?q=&page=&per_page=&as_of=` — one page of the (optionally
+/// fuzzy-filtered) jobs index with an explicit page size. The general form
+/// backing [`jobs`]; the dashboard calls it with a large window
+/// (`per_page=200`, the server's clamp ceiling) to count in-flight jobs
+/// accurately — in-flight rows are always the newest, so a recent window
+/// captures them all. Blank `q` returns the time-ordered list; `as_of` pins
+/// the page to `submitted_at <= as_of` for stable paging.
+pub async fn jobs_page(
+    q: &str,
+    page: u32,
+    per_page: u32,
+    as_of: Option<i64>,
+) -> Result<Page<JobListItem>, String> {
+    let mut url = format!("/api/jobs?page={page}&per_page={per_page}&q={}", encode(q));
     if let Some(t) = as_of {
         url.push_str(&format!("&as_of={t}"));
     }
     fetch_json(&url).await
+}
+
+/// `GET /api/jobs?q=&page=&per_page=50&as_of=` — one page of the (optionally
+/// fuzzy-filtered) jobs index at the default 50-row page size. Thin wrapper
+/// over [`jobs_page`].
+pub async fn jobs(q: &str, page: u32, as_of: Option<i64>) -> Result<Page<JobListItem>, String> {
+    jobs_page(q, page, 50, as_of).await
 }
 
 /// `GET /api/jobs/{id}` — one job's full view (404 → `Err`).
@@ -52,9 +68,18 @@ pub async fn job_log(id: &str, offset: u32) -> Result<Vec<LogFrame>, String> {
     .await
 }
 
-/// `GET /api/boards?page=&per_page=20` — one page of the board fleet.
+/// `GET /api/boards?page=&per_page=` — one page of the board fleet with an
+/// explicit page size. The general form backing [`boards`]; the dashboard
+/// calls it with `per_page=100` (the server's clamp ceiling) so its "boards
+/// healthy" tally covers the whole fleet in one request.
+pub async fn boards_page(page: u32, per_page: u32) -> Result<Page<BoardView>, String> {
+    fetch_json(&format!("/api/boards?page={page}&per_page={per_page}")).await
+}
+
+/// `GET /api/boards?page=&per_page=20` — one page of the board fleet at the
+/// default 20-row page size. Thin wrapper over [`boards_page`].
 pub async fn boards(page: u32) -> Result<Page<BoardView>, String> {
-    fetch_json(&format!("/api/boards?page={page}&per_page=20")).await
+    boards_page(page, 20).await
 }
 
 /// `GET /api/schedules?page=&per_page=20` — one page of cron schedules.

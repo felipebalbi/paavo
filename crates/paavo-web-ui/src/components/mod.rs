@@ -1,8 +1,7 @@
 //! UI components: the app [`shell`] plus one module per route page
 //! ([`dashboard`], [`jobs_list`], [`job_detail`], [`boards`], [`schedule`])
-//! and shared [`widgets`]. The page components are placeholders for this
-//! shell task; later tasks (4.6–4.10) flesh each one out into its live,
-//! paginated table.
+//! and shared [`widgets`] (state/health badges, relative-time helpers, and the
+//! windowed pagination footer reused by every paginated table).
 
 pub mod boards;
 pub mod dashboard;
