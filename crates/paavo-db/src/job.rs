@@ -283,6 +283,53 @@ impl JobRow {
         Ok(rows)
     }
 
+    /// One page of fuzzy-search results, ranked by `fuzzy_score`. `q` is
+    /// matched as a case-insensitive subsequence over the lowercased
+    /// `id + submitter + state + board_id` haystack; ranking uses the same
+    /// `SkimMatcherV2` the web UI ran in memory. The `LIKE` pre-filter
+    /// decides membership (cheap), so `fuzzy_score` runs only on matched
+    /// rows. Returns the lightweight [`paavo_proto::JobListItem`] projection.
+    pub fn search_index_page(
+        conn: &Connection,
+        q: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<paavo_proto::JobListItem>> {
+        let needle = q.trim().to_lowercase();
+        let pattern = crate::like::subsequence_pattern(&needle);
+        let mut stmt = conn.prepare(
+            "SELECT id, state, priority, submitter, board_id, submitted_at, \
+                    fuzzy_score(lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')), ?1) AS score \
+             FROM job \
+             WHERE lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')) LIKE ?2 ESCAPE '\\' \
+             ORDER BY score DESC, submitted_at DESC, id DESC \
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![needle, pattern, limit as i64, offset as i64],
+                index_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total fuzzy-search matches for `q` (pagination total). Pure `LIKE`
+    /// membership — does **not** call `fuzzy_score`.
+    pub fn search_count(conn: &Connection, q: &str) -> Result<u64> {
+        let needle = q.trim().to_lowercase();
+        let pattern = crate::like::subsequence_pattern(&needle);
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job \
+             WHERE lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')) LIKE ?1 ESCAPE '\\'",
+            params![pattern],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Page of full job rows, newest-first, optionally pinned to
     /// `submitted_at <= as_of` for stable pagination under live inserts.
     ///
@@ -721,4 +768,110 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             skip_cache,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Db;
+    use tempfile::{tempdir, TempDir};
+
+    /// Open a fresh migrated temp DB (registers `fuzzy_score`).
+    fn test_db() -> (TempDir, Db) {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.sqlite")).unwrap();
+        (dir, db)
+    }
+
+    fn new_job(submitter: &str) -> NewJob {
+        NewJob {
+            id: JobId::new(),
+            priority: Priority::Interactive,
+            submitter: submitter.into(),
+            source: JobSource::Cli,
+            board_selector: BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "deadbeef".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+            skip_cache: false,
+        }
+    }
+
+    /// Insert a job; when `board` is `Some`, transition it to `building` so
+    /// the board id lands in the searchable haystack. Returns the job id.
+    fn insert_job(
+        conn: &Connection,
+        submitter: &str,
+        board: Option<&str>,
+        submitted_at: i64,
+    ) -> JobId {
+        let j = new_job(submitter);
+        let id = j.id;
+        JobRow::insert(conn, &j, submitted_at).unwrap();
+        if let Some(b) = board {
+            ensure_board(conn, b);
+            JobRow::transition_to_building(conn, &id, b, submitted_at).unwrap();
+        }
+        id
+    }
+
+    /// Seed board `id` (idempotent) so the `job.board_id` FK is satisfied
+    /// before `transition_to_building`. `job.board_id REFERENCES board(id)`
+    /// and foreign keys are ON.
+    fn ensure_board(conn: &Connection, id: &str) {
+        use crate::BoardRow;
+        use paavo_proto::{BoardHealth, BoardSpec, ProbeSelector};
+        if BoardRow::find(conn, id).unwrap().is_some() {
+            return;
+        }
+        let spec = BoardSpec {
+            id: id.into(),
+            kind: "mcxa266".into(),
+            probe_selector: ProbeSelector {
+                vid: "1366".into(),
+                pid: "1015".into(),
+                serial: id.into(),
+            },
+            chip_name: "MCXA266VFL".into(),
+            target_name: "frdm-mcx-a266".into(),
+            wiring_profile: Some("default".into()),
+            health: BoardHealth::Healthy,
+        };
+        BoardRow::insert(conn, &spec, 0).unwrap();
+    }
+
+    #[test]
+    fn fuzzy_search_isolates_by_submitter() {
+        // q="alice": bob/carol lack a,l,i,c,e in order (ULIDs exclude i,l).
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        insert_job(c, "carol", None, 1_000);
+
+        assert_eq!(JobRow::search_count(c, "alice").unwrap(), 1);
+        let rows = JobRow::search_index_page(c, "alice", 0, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].submitter, "alice");
+    }
+
+    #[test]
+    fn fuzzy_search_cross_field_subsequence_ranks_best_first() {
+        // "almcx" spans submitter+board; "alice" (al contiguous) + mcxa
+        // ranks above "carol" (a..l split) + mcxa.
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", Some("mcxa266-01"), 3_000);
+        insert_job(c, "carol", Some("mcxa266-03"), 1_000);
+
+        let rows = JobRow::search_index_page(c, "almcx", 0, 50).unwrap();
+        assert!(rows.iter().any(|r| r.submitter == "alice"));
+        assert_eq!(rows[0].submitter, "alice", "best fuzzy match ranks first");
+    }
 }

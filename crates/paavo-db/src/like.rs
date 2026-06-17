@@ -22,12 +22,6 @@ pub(crate) fn escape_like(s: &str) -> String {
 /// — the same membership test `SkimMatcherV2` uses. An empty query yields
 /// `"%"` (matches everything). The caller lowercases `query` first so the
 /// pattern and the `fuzzy_score` needle agree.
-// Introduced ahead of its consumer: the only non-test caller is the
-// fuzzy-search query in `job.rs`, added later in this series. Until that
-// lands, the non-test build sees this helper as dead code, so allow it
-// explicitly to keep `clippy -D warnings` green; drop the attribute once
-// `job.rs` calls it.
-#[allow(dead_code)]
 pub(crate) fn subsequence_pattern(query: &str) -> String {
     let mut p = String::from("%");
     for c in query.chars() {
