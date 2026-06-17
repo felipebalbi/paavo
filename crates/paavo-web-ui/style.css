@@ -8,25 +8,28 @@
  * on <html> (see src/theme.rs). */
 
 /* ---- palette tokens -------------------------------------------------- */
+/* Derived from Prot's ef-maris-light / ef-maris-dark (ef-themes).
+ * https://github.com/protesilaos/ef-themes */
 
 :root {
   color-scheme: light;
 
-  --bg: #f5f7fa;
-  --surface: #ffffff;
-  --surface-2: #eef1f5;
-  --text: #1b2430;
-  --text-muted: #5c6776;
-  --border: #dde3ea;
-  --accent: #2f6feb;
+  /* ef-maris-light core */
+  --bg: #edf4f8;
+  --surface: #e6ecf2;
+  --surface-2: #e0e7ef;
+  --text: #151a27;
+  --text-muted: #676470;
+  --border: #a2a6af;
+  --accent: #375cc6;
   --accent-contrast: #ffffff;
 
-  /* badge hues (state colours), tuned for the light palette */
-  --green: #1a7f4b;
-  --red: #c2362f;
-  --blue: #2f6feb;
-  --amber: #a96a0b;
-  --grey: #5c6776;
+  /* badge hues (state colours) from ef-maris-light */
+  --green: #007010;
+  --red: #c3303a;
+  --blue: #375cc6;
+  --amber: #8b4400;
+  --grey: #676470;
 
   --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans-font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -36,20 +39,22 @@
 :root.dark {
   color-scheme: dark;
 
-  --bg: #0e1217;
-  --surface: #161b22;
-  --surface-2: #1f2630;
-  --text: #e6eaf0;
-  --text-muted: #97a2b1;
-  --border: #2a323d;
-  --accent: #5b9bff;
-  --accent-contrast: #0e1217;
+  /* ef-maris-dark core */
+  --bg: #131c2b;
+  --surface: #1d2c39;
+  --surface-2: #2a3644;
+  --text: #eaedef;
+  --text-muted: #969faf;
+  --border: #595a63;
+  --accent: #57b0ff;
+  --accent-contrast: #131c2b;
 
-  --green: #3fb27a;
-  --red: #e5675f;
-  --blue: #5b9bff;
-  --amber: #e0a23c;
-  --grey: #97a2b1;
+  /* badge hues (state colours) from ef-maris-dark */
+  --green: #41bf4f;
+  --red: #ff6f6f;
+  --blue: #57b0ff;
+  --amber: #f0c060;
+  --grey: #969faf;
 }
 
 /* ---- base / reset ---------------------------------------------------- */
