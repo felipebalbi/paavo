@@ -9,6 +9,7 @@
 //! [`crate::proxy`] (it bridges paavod's NDJSON, so it is not a plain
 //! DB read like the rest of this module).
 pub mod boards;
+pub mod dashboard;
 pub mod events;
 pub mod jobs;
 pub mod schedules;

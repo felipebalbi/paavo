@@ -60,7 +60,7 @@ pub async fn list(
 /// Project a `paavo_db::BoardRow` onto the wire [`BoardView`]. The
 /// `spec` is flattened on the wire (see the `BoardView` definition);
 /// there are no server-local fields to drop.
-fn board_view(r: paavo_db::BoardRow) -> paavo_proto::BoardView {
+pub(crate) fn board_view(r: paavo_db::BoardRow) -> paavo_proto::BoardView {
     paavo_proto::BoardView {
         spec: r.spec,
         quarantine_reason: r.quarantine_reason,

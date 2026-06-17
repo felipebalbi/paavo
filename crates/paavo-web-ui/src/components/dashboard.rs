@@ -1,22 +1,25 @@
 //! Dashboard landing page (`/`).
 //!
-//! The at-a-glance operator view, derived entirely from two fetched windows:
-//! a recent jobs page and the board fleet. Both are [`LocalResource`]s keyed
-//! on their matching live revision, so a server-pushed `jobs` / `boards` bump
-//! refetches and the whole dashboard recomputes in place.
+//! The at-a-glance operator view, derived from a single consolidated
+//! fetch: [`api::dashboard`] returns exact SQL aggregate counts plus two
+//! short display lists (the 8 newest jobs and the relevant fleet slice).
+//! The [`LocalResource`] is keyed on both the `jobs` and `boards` live
+//! revisions, so a server-pushed bump on either refetches and the whole
+//! dashboard recomputes in place.
 //!
 //! ## Accuracy of the counts
 //!
-//! In-flight jobs (`Running` / `Building` / `AwaitingBoard` / `Submitted`) are
-//! always the *newest* rows, so counting them within a recent window
-//! (`per_page=200`, the server's clamp ceiling) is exact, not an estimate.
-//! The "pass rate (recent)" is explicitly scoped to that window — it is the
-//! recent rate, not an all-time figure. The fleet stats fetch up to 100 boards
-//! (the server's ceiling), which covers any realistic lab in one request.
+//! The stat cards are exact at any scale: the counts are computed by the
+//! database (`COUNT(*) ... GROUP BY state`, board health tally), not by
+//! counting a capped page in the browser. "Pass rate" is all-time over
+//! every retained job (bounded by the retention window). The fleet list
+//! is intentionally a small, relevant slice (quarantined first, then
+//! most-recently-used); the "Boards" card still reports the true
+//! healthy/total for the whole fleet.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
-use paavo_proto::{BoardHealth, BoardView, JobListItem, JobState, Page};
+use paavo_proto::DashboardOverview;
 
 use crate::api;
 use crate::components::widgets::{abs_time, rel_time, HealthBadge, StateBadge};
@@ -27,31 +30,24 @@ use crate::live::LiveSignals;
 pub fn Dashboard() -> impl IntoView {
     let live = expect_context::<LiveSignals>();
 
-    // A wide, newest-first jobs window — large enough that every in-flight job
-    // is captured (they are always the newest rows). Refetched on a jobs bump.
-    let jobs_res = LocalResource::new(move || {
+    // One consolidated fetch, refetched when either the jobs or the
+    // boards revision bumps.
+    let over_res = LocalResource::new(move || {
         let _ = live.jobs.get();
-        async move { api::jobs_page("", 1, 200, None).await }
-    });
-    // The board fleet (up to the server's 100-row ceiling). Refetched on a
-    // boards bump.
-    let boards_res = LocalResource::new(move || {
         let _ = live.boards.get();
-        async move { api::boards_page(1, 100, "").await }
+        async move { api::dashboard().await }
     });
 
     view! {
         <h1>"Dashboard"</h1>
         {move || {
-            let jobs = jobs_res.get().map(|w| (*w).clone());
-            let boards = boards_res.get().map(|w| (*w).clone());
-            match (jobs, boards) {
-                (Some(Ok(j)), Some(Ok(b))) => render(j, b).into_any(),
-                (Some(Err(e)), _) | (_, Some(Err(e))) => {
+            match over_res.get().map(|w| (*w).clone()) {
+                Some(Ok(o)) => render(o).into_any(),
+                Some(Err(e)) => {
                     view! { <p class="muted">{format!("failed to load dashboard: {e}")}</p> }
                         .into_any()
                 }
-                _ => view! { <p class="muted">"loading…"</p> }.into_any(),
+                None => view! { <p class="muted">"loading…"</p> }.into_any(),
             }
         }}
     }
@@ -68,59 +64,26 @@ fn stat_card(value: String, label: &'static str, sub: Option<String>) -> impl In
     }
 }
 
-/// Build the full dashboard from the two fetched windows: the stat-card grid
-/// on top, then a two-column row of recent activity (wider) + the board fleet
-/// (narrower) that collapses to one column on narrow screens.
-fn render(jobs: Page<JobListItem>, boards: Page<BoardView>) -> impl IntoView {
-    // --- stat tallies over the jobs window ---
-    let running = jobs
-        .items
-        .iter()
-        .filter(|i| i.state == JobState::Running)
-        .count();
-    let queue = jobs
-        .items
-        .iter()
-        .filter(|i| {
-            matches!(
-                i.state,
-                JobState::Submitted | JobState::Building | JobState::AwaitingBoard
-            )
-        })
-        .count();
-    let mut terminal = 0usize;
-    let mut passed = 0usize;
-    for i in &jobs.items {
-        if i.state.is_terminal() {
-            terminal += 1;
-            if i.state == JobState::Passed {
-                passed += 1;
-            }
-        }
-    }
-    let pass_rate = if terminal > 0 {
-        format!(
-            "{}%",
-            (passed as f64 / terminal as f64 * 100.0).round() as u64
-        )
-    } else {
-        "—".to_string()
+/// Build the full dashboard from the consolidated overview: the stat-card
+/// grid on top, then a two-column row of recent activity (wider) + the
+/// board fleet (narrower) that collapses to one column on narrow screens.
+fn render(over: DashboardOverview) -> impl IntoView {
+    // --- stat tallies (exact, from SQL aggregates) ---
+    let running = over.jobs.running;
+    let queue = over.jobs.queue();
+    let terminal = over.jobs.terminal();
+    let pass_rate = match over.jobs.pass_rate_pct() {
+        Some(p) => format!("{p}%"),
+        None => "—".to_string(),
     };
+    let fleet_total = over.boards.total;
+    let healthy = over.boards.healthy();
+    let quarantined = over.boards.quarantined;
 
-    // --- fleet tallies over the boards window ---
-    let fleet_total = boards.items.len();
-    let healthy = boards
-        .items
+    // --- recent activity: the newest jobs (already capped server-side) ---
+    let recent = over
+        .recent_jobs
         .iter()
-        .filter(|b| b.spec.health == BoardHealth::Healthy)
-        .count();
-    let quarantined = fleet_total - healthy;
-
-    // --- recent activity: the 8 newest jobs ---
-    let recent = jobs
-        .items
-        .iter()
-        .take(8)
         .map(|it| {
             let id = it.id.to_string();
             let href = format!("/jobs/{id}");
@@ -146,9 +109,9 @@ fn render(jobs: Page<JobListItem>, boards: Page<BoardView>) -> impl IntoView {
         .collect::<Vec<_>>();
     let no_recent = recent.is_empty();
 
-    // --- board fleet: a compact health + last-used list ---
-    let fleet = boards
-        .items
+    // --- board fleet: the relevant slice (quarantined first, then LRU) ---
+    let fleet = over
+        .fleet
         .iter()
         .map(|b| {
             let id = b.spec.id.clone();
@@ -182,7 +145,7 @@ fn render(jobs: Page<JobListItem>, boards: Page<BoardView>) -> impl IntoView {
                 "Boards",
                 (quarantined > 0).then(|| format!("{quarantined} quarantined")),
             )}
-            {stat_card(pass_rate, "Pass rate (recent)", Some(format!("{terminal} runs")))}
+            {stat_card(pass_rate, "Pass rate", Some(format!("{terminal} runs")))}
         </div>
         <div class="grid2">
             <div class="card">

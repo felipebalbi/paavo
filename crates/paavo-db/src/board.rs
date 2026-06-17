@@ -117,6 +117,24 @@ impl BoardRow {
         Ok(rows)
     }
 
+    /// The N most operationally-relevant boards for the dashboard fleet
+    /// card: quarantined first, then most-recently-used, "never used"
+    /// last (`last_used_at` NULL sorts last under DESC), `id` as the
+    /// deterministic tiebreak.
+    pub fn list_dashboard(conn: &Connection, limit: u32) -> Result<Vec<Self>> {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM board \
+             ORDER BY (health = 'quarantined') DESC, last_used_at DESC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Total board count, optionally filtered exactly like [`list_page`]
     /// (`id`/`kind` case-insensitive substring). Paired with `list_page`
     /// so paavo-web can render the total page count for the (filtered)
@@ -135,6 +153,22 @@ impl BoardRow {
             None => conn.query_row("SELECT COUNT(*) FROM board", [], |r| r.get(0))?,
         };
         Ok(n as u64)
+    }
+
+    /// Total board count and how many are quarantined, in one pass.
+    /// Healthy is derived on the wire type (`total - quarantined`).
+    pub fn health_counts(conn: &Connection) -> Result<paavo_proto::BoardHealthCounts> {
+        let (total, quarantined): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(CASE WHEN health = 'quarantined' THEN 1 ELSE 0 END), 0) \
+             FROM board",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(paavo_proto::BoardHealthCounts {
+            total: total as u64,
+            quarantined: quarantined as u64,
+        })
     }
 
     /// Find healthy boards matching the selector AND not currently
