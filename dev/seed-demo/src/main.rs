@@ -100,13 +100,19 @@ fn label(t: Target) -> &'static str {
     }
 }
 
-/// Map a job index to a target state via fixed 0..100 buckets. The weights
-/// reproduce a realistic fleet history: a strong majority pass, a tail of
-/// failures and timeouts, and a handful of jobs frozen in each non-terminal
-/// state so the UI shows every badge plus live (running/building/awaiting/
-/// submitted) rows.
-fn plan_for(idx: u32) -> Target {
-    match idx % 100 {
+/// Map a random roll in `0..100` to a target state via fixed percentage bands.
+/// The weights reproduce a realistic fleet history: a strong majority pass, a
+/// tail of failures and timeouts, and a handful of jobs frozen in each
+/// non-terminal state so the UI shows every badge plus live (running/building/
+/// awaiting/submitted) rows.
+///
+/// We draw *per job* rather than slicing the job *index* into the bands: an
+/// `idx % 100` bucket only reaches the in-flight bands (80..=99) once there are
+/// at least ~100 jobs, so small runs (`--jobs 80`) produced zero running/
+/// building/awaiting/submitted rows. A fresh draw keeps the mix proportional at
+/// any `--jobs` count.
+fn plan_for(roll: u32) -> Target {
+    match roll {
         0..=54 => Target::Passed,         // 55%
         55..=66 => Target::FailedTest,    // 12%
         67..=71 => Target::FailedInfra,   //  5%
@@ -402,7 +408,9 @@ fn main() -> Result<()> {
     let trickle_start = args.jobs - trickle_tail;
 
     for idx in 0..args.jobs {
-        let target = plan_for(idx);
+        // Per-job draw (not an index bucket) so the state mix stays proportional
+        // for any `--jobs` count — see `plan_for`.
+        let target = plan_for(rng.gen_range(0..100));
         let submitter = submitters[idx as usize % submitters.len()];
         let board_id = board_ids[idx as usize % board_ids.len()].as_str();
         let priority = if idx % 4 == 0 {
