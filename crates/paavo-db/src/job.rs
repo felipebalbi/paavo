@@ -376,6 +376,38 @@ impl JobRow {
         Ok(n as u64)
     }
 
+    /// A cheap, bounded fingerprint of the job table for the live poller.
+    /// `GROUP BY state` yields ≤ 8 rows; folding each
+    /// `(state, count, max(submitted_at))` into a hash detects every insert
+    /// (a group's count/max moves) and every state transition (counts shift
+    /// between groups) without materializing the table. Heuristic: it misses
+    /// only offsetting same-tick transitions that leave all tallies
+    /// identical, which self-heals next tick. See design doc §3.3.
+    pub fn activity_digest(conn: &Connection) -> Result<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut stmt = conn.prepare(
+            "SELECT state, COUNT(*), COALESCE(MAX(submitted_at), 0) \
+             FROM job GROUP BY state ORDER BY state",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.len().hash(&mut h);
+        for (state, count, max_sub) in &rows {
+            state.hash(&mut h);
+            count.hash(&mut h);
+            max_sub.hash(&mut h);
+        }
+        Ok(h.finish())
+    }
+
     /// Page of full job rows, newest-first, optionally pinned to
     /// `submitted_at <= as_of` for stable pagination under live inserts.
     ///
@@ -957,5 +989,27 @@ mod tests {
         assert_eq!(JobRow::count_newer(c, Some(3_000)).unwrap(), 0, "exclusive");
         assert_eq!(JobRow::count_newer(c, Some(2_000)).unwrap(), 1);
         assert_eq!(JobRow::count_newer(c, Some(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn activity_digest_changes_on_insert_and_transition() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        let empty = JobRow::activity_digest(c).unwrap();
+        let id = insert_job(c, "alice", None, 1_000);
+        let after_insert = JobRow::activity_digest(c).unwrap();
+        assert_ne!(empty, after_insert, "insert must change the digest");
+        assert_eq!(
+            after_insert,
+            JobRow::activity_digest(c).unwrap(),
+            "stable no-op"
+        );
+        ensure_board(c, "mcxa266-01");
+        JobRow::transition_to_building(c, &id, "mcxa266-01", 2_000).unwrap();
+        let after_transition = JobRow::activity_digest(c).unwrap();
+        assert_ne!(
+            after_insert, after_transition,
+            "transition must change the digest"
+        );
     }
 }
