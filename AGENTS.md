@@ -7,7 +7,9 @@ itself.)
 
 **paavo** is a self-hosted Linux **hardware-in-the-loop (HIL) test runner**
 for the `embassy-mcxa` HAL (and any future embassy chip wired into the lab).
-It is a Rust workspace of 10 crates producing 3 binaries:
+It is a Rust workspace of 10 crates — plus a workspace-*excluded* `wasm32` UI
+crate (`paavo-web-ui`, the Leptos CSR SPA, embedded into `paavo-web`) —
+producing 3 binaries:
 
 - **`paavod`** — the daemon. Owns the job queue, the board fleet, the SQLite
   database, the build sandbox, and the HTTP API.
@@ -96,6 +98,14 @@ PAAVO_HOST=http://127.0.0.1:8090 cargo run -p paavo-cli -- jobs
 
 # Serve the read-only web UI
 cargo run -p paavo-web -- --config sample-paavo.toml
+
+# Build the WASM UI (Leptos SPA → crates/paavo-web-ui/dist), embedded into
+# paavo-web at compile time. One-time prereqs: the wasm target + trunk.
+#   rustup target add wasm32-unknown-unknown
+#   cargo install trunk            # or: cargo binstall trunk (prebuilt, faster)
+just build-ui                          # = cd crates/paavo-web-ui && trunk build --release
+# paavo-web still compiles WITHOUT a built dist/ (rust-embed #[allow_missing]
+# serves a "UI not built" placeholder); run build-ui to embed the real SPA.
 ```
 
 **System dependency:** `probe-rs` needs `libudev-dev` and `pkg-config` on Linux
@@ -236,12 +246,18 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
 
 ## Landmines & gotchas
 
-- **Workspace-excluded crates won't build with the host toolchain.** These are
-  intentionally outside `[workspace] members` (see `Cargo.toml` `exclude`):
-  `tests/fixtures/smoke-crate`, `soak-tests/`, `dev/probe-rs-spike`,
-  `dev/spike-fixture-mcxa266`. The fixtures cross-compile to
-  `thumbv8m.main-none-eabihf`. `cargo test --workspace` does **not** touch
-  them; don't "fix" them into the workspace.
+- **Workspace-excluded crates won't build with the host toolchain** (with one
+  exception, noted below). These are intentionally outside `[workspace] members`
+  (see `Cargo.toml` `exclude`): `tests/fixtures/smoke-crate`, `soak-tests/`,
+  `dev/probe-rs-spike`, `dev/spike-fixture-mcxa266`, `crates/paavo-web-ui`, and
+  `dev/seed-demo`. The fixtures cross-compile to `thumbv8m.main-none-eabihf`;
+  `crates/paavo-web-ui` (the Leptos SPA) cross-compiles to
+  `wasm32-unknown-unknown` and is built by `trunk` (`just build-ui`).
+  `dev/seed-demo` is the **exception** — a standalone *host* binary (links
+  `paavo-db` to flood a dev SQLite DB with fake boards + jobs for UI
+  stress-testing) excluded only to keep it out of the workspace build, not
+  because of a target mismatch. `cargo test --workspace` does **not** touch any
+  of them; don't "fix" them into the workspace.
 - **`.cargo/config.toml` inside test crates is load-bearing.** `paavo-cli run`
   strips `target/`, `.git/`, and `Cargo.lock` from the tar but **keeps
   `.cargo/config.toml`** — it sets the defmt log level so the info-level
