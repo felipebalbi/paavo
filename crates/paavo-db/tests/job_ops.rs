@@ -528,3 +528,77 @@ fn list_page_and_count_honor_as_of_pin() {
     assert_eq!(second.len(), 1, "only one row remains after offset 2");
     assert_eq!(second[0].id, j100);
 }
+
+#[test]
+fn state_counts_empty_db_all_zero() {
+    let db = fresh_db();
+    let c = JobRow::state_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.submitted, 0);
+    assert_eq!(c.running, 0);
+    assert_eq!(c.terminal(), 0);
+    assert_eq!(c.queue(), 0);
+}
+
+#[test]
+fn state_counts_tallies_each_state() {
+    let db = fresh_db();
+    insert_default_board(&db);
+    let now = Utc::now().timestamp_millis();
+
+    // Two submitted (left as-is).
+    JobRow::insert(db.raw_conn(), &sample_new_job(JobId::new()), now).unwrap();
+    JobRow::insert(db.raw_conn(), &sample_new_job(JobId::new()), now).unwrap();
+
+    // One building.
+    let b = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(b), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &b, now + 1).unwrap();
+
+    // One passed (full lifecycle on the seeded board).
+    let p = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(p), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &p, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &p, "/elf").unwrap();
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &p, "mcxa266-01").unwrap();
+    JobRow::finalize(
+        db.raw_conn(),
+        &p,
+        &OutcomeRecord {
+            state: JobState::Passed,
+            outcome: JobOutcome::Passed,
+            finished_at_ms: now + 2,
+        },
+    )
+    .unwrap();
+
+    // One failed (test error).
+    let f = JobId::new();
+    JobRow::insert(db.raw_conn(), &sample_new_job(f), now).unwrap();
+    JobRow::transition_submitted_to_building(db.raw_conn(), &f, now + 1).unwrap();
+    JobRow::transition_building_to_awaiting_board(db.raw_conn(), &f, "/elf").unwrap();
+    JobRow::transition_awaiting_to_running(db.raw_conn(), &f, "mcxa266-01").unwrap();
+    JobRow::finalize(
+        db.raw_conn(),
+        &f,
+        &OutcomeRecord {
+            state: JobState::Failed,
+            outcome: JobOutcome::Failed(TerminalOutcome::TestErr {
+                message: "boom".into(),
+            }),
+            finished_at_ms: now + 2,
+        },
+    )
+    .unwrap();
+
+    let c = JobRow::state_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.submitted, 2);
+    assert_eq!(c.building, 1);
+    assert_eq!(c.awaiting_board, 0);
+    assert_eq!(c.running, 0);
+    assert_eq!(c.passed, 1);
+    assert_eq!(c.failed, 1);
+    assert_eq!(c.timed_out, 0);
+    assert_eq!(c.aborted, 0);
+    assert_eq!(c.queue(), 3);
+    assert_eq!(c.terminal(), 2);
+}
