@@ -179,8 +179,17 @@ pub enum BoardOp {
 pub enum AdminOp {
     /// Dev-loop reset: wipe job artifacts on disk (sandboxes, uploads,
     /// cargo-target, cached ELFs) and truncate `job` / `log_frame` /
-    /// `build_cache` in the DB. Preserves boards and schedules.
-    /// Refused if any job is currently building or running. See
-    /// spec §9.5 / §10.3.
-    Purge,
+    /// `build_cache` in the DB. Preserves boards and schedules unless
+    /// `--boards` is given. Refused if any job is currently building,
+    /// awaiting a board, or running. See spec §9.5 / §10.3.
+    Purge {
+        /// Also permanently delete every board from the inventory, in
+        /// addition to the job/artifact wipe. Prompts for confirmation
+        /// unless `--yes` is given.
+        #[arg(long)]
+        boards: bool,
+        /// Skip the `--boards` confirmation prompt (for scripts/CI).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
