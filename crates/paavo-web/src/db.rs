@@ -113,6 +113,24 @@ impl WebDb {
         paavo_db::BoardRow::count(self.inner.lock().raw_conn(), filter)
     }
 
+    /// All-time job counts by state (SQL GROUP BY aggregate). Backs the
+    /// dashboard stat cards.
+    pub fn job_state_counts(&self) -> paavo_db::Result<paavo_proto::JobStateCounts> {
+        paavo_db::JobRow::state_counts(self.inner.lock().raw_conn())
+    }
+
+    /// Board fleet health tally (total + quarantined). Backs the
+    /// dashboard "Boards" stat card.
+    pub fn board_health_counts(&self) -> paavo_db::Result<paavo_proto::BoardHealthCounts> {
+        paavo_db::BoardRow::health_counts(self.inner.lock().raw_conn())
+    }
+
+    /// The dashboard fleet slice: quarantined-first then most-recently-used,
+    /// capped at `limit` (see [`paavo_db::BoardRow::list_dashboard`]).
+    pub fn boards_dashboard(&self, limit: u32) -> paavo_db::Result<Vec<paavo_db::BoardRow>> {
+        paavo_db::BoardRow::list_dashboard(self.inner.lock().raw_conn(), limit)
+    }
+
     /// Page of schedules (id ASC).
     pub fn schedules_page(
         &self,
