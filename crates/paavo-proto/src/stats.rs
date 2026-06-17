@@ -122,8 +122,32 @@ mod tests {
 
     #[test]
     fn pass_rate_rounds_over_terminal() {
-        // 6 passed of 10 terminal => 60%.
+        // 6 passed of 10 terminal => 60% (exact).
         assert_eq!(counts().pass_rate_pct(), Some(60));
+        // 2 of 3 terminal => 66.66.. rounds up to 67 (truncation would give 66).
+        let two_thirds = JobStateCounts {
+            submitted: 0,
+            building: 0,
+            awaiting_board: 0,
+            running: 0,
+            passed: 2,
+            failed: 1,
+            timed_out: 0,
+            aborted: 0,
+        };
+        assert_eq!(two_thirds.pass_rate_pct(), Some(67));
+        // 1 of 8 terminal => 12.5 pins the round-half-away-from-zero boundary.
+        let one_eighth = JobStateCounts {
+            submitted: 0,
+            building: 0,
+            awaiting_board: 0,
+            running: 0,
+            passed: 1,
+            failed: 7,
+            timed_out: 0,
+            aborted: 0,
+        };
+        assert_eq!(one_eighth.pass_rate_pct(), Some(13));
     }
 
     #[test]
