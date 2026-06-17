@@ -27,8 +27,9 @@ use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 
 use crate::api;
-use crate::components::widgets::{abs_time, pager, rel_time, HealthBadge};
+use crate::components::widgets::{abs_time, pager, per_page_selector, rel_time, HealthBadge};
 use crate::live::LiveSignals;
+use crate::per_page;
 
 /// The `/boards` page.
 #[component]
@@ -43,6 +44,8 @@ pub fn Boards() -> impl IntoView {
     let gen = RwSignal::new(0u32);
     // 1-based page number.
     let page = RwSignal::new(1u32);
+    // Rows-per-page, restored from this list's browser-local preference.
+    let per_page = RwSignal::new(per_page::load(per_page::KEY_BOARDS));
 
     // One page of boards. Re-runs when the debounced query, page, OR the live
     // boards revision changes — the last of those is how a server-pushed bump
@@ -50,8 +53,9 @@ pub fn Boards() -> impl IntoView {
     let res = LocalResource::new(move || {
         let q = dq.get();
         let p = page.get();
+        let pp = per_page.get();
         let _ = live.boards.get();
-        async move { api::boards(p, &q).await }
+        async move { api::boards_page(p, pp, &q).await }
     });
 
     // When the committed query transitions, reset to page 1. Skip the very
@@ -61,6 +65,20 @@ pub fn Boards() -> impl IntoView {
         if prev.is_some() {
             page.set(1);
         }
+    });
+
+    // Persist the page-size choice and jump back to page 1 whenever it changes.
+    // First run (prev = None) is the mount; restoring a stored size must NOT
+    // reset paging.
+    Effect::new(move |prev: Option<u32>| {
+        let pp = per_page.get();
+        if let Some(old) = prev {
+            if old != pp {
+                per_page::store(per_page::KEY_BOARDS, pp);
+                page.set(1);
+            }
+        }
+        pp
     });
 
     let on_input = move |ev| {
@@ -99,8 +117,9 @@ pub fn Boards() -> impl IntoView {
                     Ok(data) => {
                         let total = data.total;
                         let cur_page = data.page;
-                        let per_page = data.per_page.max(1) as u64;
-                        let total_pages = total.div_ceil(per_page).max(1) as u32;
+                        let cur_per_page = data.per_page;
+                        let per_page_n = data.per_page.max(1) as u64;
+                        let total_pages = total.div_ceil(per_page_n).max(1) as u32;
                         let rows = data
                             .items
                             .iter()
@@ -165,7 +184,11 @@ pub fn Boards() -> impl IntoView {
                                         })}
                                 </tbody>
                             </table>
-                            {(total_pages > 1).then(|| pager(page, cur_page, total_pages))}
+                            <div class="list-footer">
+                                {per_page_selector(per_page, cur_per_page)}
+                                {(total_pages > 1)
+                                    .then(|| pager(page, cur_page, total_pages))}
+                            </div>
                         }
                             .into_any()
                     }

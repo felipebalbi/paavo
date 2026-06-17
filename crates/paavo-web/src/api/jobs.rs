@@ -37,7 +37,7 @@ pub async fn list(
     let per_page: u32 = q
         .get("per_page")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(50)
+        .unwrap_or(20)
         .clamp(1, 200);
     let query = q.get("q").cloned().unwrap_or_default();
     let as_of: Option<i64> = q.get("as_of").and_then(|v| v.parse().ok());
