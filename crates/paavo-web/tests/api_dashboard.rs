@@ -145,7 +145,11 @@ async fn dashboard_reports_sql_counts_recent_jobs_and_fleet() {
 async fn dashboard_counts_are_uncapped_while_recent_jobs_are_capped() {
     let (_dir, rw, app) = app(Duration::from_millis(20));
 
-    // Seed more submitted jobs than the recent-jobs display cap (8).
+    // Seed more boards than the fleet display cap (8) ...
+    for i in 0..9 {
+        BoardRow::insert(rw.raw_conn(), &board(&format!("board-{i:02}")), 0).unwrap();
+    }
+    // ... and more submitted jobs than the recent-jobs display cap (8).
     for i in 0..10 {
         JobRow::insert(
             rw.raw_conn(),
@@ -163,6 +167,9 @@ async fn dashboard_counts_are_uncapped_while_recent_jobs_are_capped() {
     // Counts are EXACT, UNCAPPED SQL aggregates over the whole table...
     assert_eq!(ov.jobs.submitted, 10);
     assert_eq!(ov.jobs.queue(), 10);
-    // ...while the recent-activity list is the capped index slice.
+    assert_eq!(ov.boards.total, 9);
+    assert_eq!(ov.boards.healthy(), 9);
+    // ...while both display lists are capped server-side at 8.
     assert_eq!(ov.recent_jobs.len(), 8);
+    assert_eq!(ov.fleet.len(), 8);
 }
