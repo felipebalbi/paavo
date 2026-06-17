@@ -355,6 +355,61 @@ main {
   max-height: 70vh;
 }
 
+/* ---- jobs list: search meta + pagination ----------------------------- */
+
+/* The row above the table: match count on the left, "N new" pill trailing. */
+.list-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.pager-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.25rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.pager-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+/* The current page is rendered as a disabled button; keep it looking active
+ * (accent fill) rather than greyed. Only the end-stop Prev/Next dim. */
+.pager-btn.is-current {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+}
+
+.pager-btn:disabled:not(.is-current) {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pager-gap {
+  padding: 0 0.25rem;
+}
+
 /* ---- utilities ------------------------------------------------------- */
 
 .muted {
