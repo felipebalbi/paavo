@@ -61,6 +61,12 @@ web-sys = { version = "=0.3.77", features = [
     "Element",
     "DomTokenList",
     "MediaQueryList",
+    # Responsive nav drawer (shell.rs): Escape-to-close reads KeyboardEvent.key();
+    # focus management calls HtmlElement::focus() on the nav and the toggle
+    # button (NodeRef<html::Button> resolves to HtmlButtonElement).
+    "HtmlElement",
+    "HtmlButtonElement",
+    "KeyboardEvent",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
