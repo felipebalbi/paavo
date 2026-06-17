@@ -78,9 +78,10 @@ pub async fn dashboard() -> Result<DashboardOverview, String> {
     fetch_json("/api/dashboard").await
 }
 
-/// `GET /api/schedules?page=&per_page=20` — one page of cron schedules.
-pub async fn schedules(page: u32) -> Result<Page<ScheduleView>, String> {
-    fetch_json(&format!("/api/schedules?page={page}&per_page=20")).await
+/// `GET /api/schedules?page=&per_page=` — one page of cron schedules at an
+/// explicit page size.
+pub async fn schedules_page(page: u32, per_page: u32) -> Result<Page<ScheduleView>, String> {
+    fetch_json(&format!("/api/schedules?page={page}&per_page={per_page}")).await
 }
 
 /// Issue a GET for `url` and decode the JSON body as `T`. Shared by every

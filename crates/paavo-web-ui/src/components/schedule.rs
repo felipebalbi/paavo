@@ -9,8 +9,9 @@
 use leptos::prelude::*;
 
 use crate::api;
-use crate::components::widgets::{abs_time, pager, rel_time};
+use crate::components::widgets::{abs_time, pager, per_page_selector, rel_time};
 use crate::live::LiveSignals;
+use crate::per_page;
 
 /// The `/schedule` page.
 #[component]
@@ -18,13 +19,30 @@ pub fn Schedule() -> impl IntoView {
     let live = expect_context::<LiveSignals>();
     // 1-based page number.
     let page = RwSignal::new(1u32);
+    // Rows-per-page, restored from this list's browser-local preference.
+    let per_page = RwSignal::new(per_page::load(per_page::KEY_SCHEDULE));
 
     // One page of schedules. Re-runs when the page OR the live schedules
     // revision changes — the latter is how a server-pushed bump refreshes.
     let res = LocalResource::new(move || {
         let p = page.get();
+        let pp = per_page.get();
         let _ = live.schedules.get();
-        async move { api::schedules(p).await }
+        async move { api::schedules_page(p, pp).await }
+    });
+
+    // Persist the page-size choice and jump back to page 1 whenever it changes.
+    // First run (prev = None) is the mount; restoring a stored size must NOT
+    // reset paging.
+    Effect::new(move |prev: Option<u32>| {
+        let pp = per_page.get();
+        if let Some(old) = prev {
+            if old != pp {
+                per_page::store(per_page::KEY_SCHEDULE, pp);
+                page.set(1);
+            }
+        }
+        pp
     });
 
     view! {
@@ -41,8 +59,9 @@ pub fn Schedule() -> impl IntoView {
                     Ok(data) => {
                         let total = data.total;
                         let cur_page = data.page;
-                        let per_page = data.per_page.max(1) as u64;
-                        let total_pages = total.div_ceil(per_page).max(1) as u32;
+                        let cur_per_page = data.per_page;
+                        let per_page_n = data.per_page.max(1) as u64;
+                        let total_pages = total.div_ceil(per_page_n).max(1) as u32;
                         let empty = data.items.is_empty();
                         let rows = data
                             .items
@@ -111,7 +130,11 @@ pub fn Schedule() -> impl IntoView {
                                         })}
                                 </tbody>
                             </table>
-                            {(total_pages > 1).then(|| pager(page, cur_page, total_pages))}
+                            <div class="list-footer">
+                                {per_page_selector(per_page, cur_per_page)}
+                                {(total_pages > 1)
+                                    .then(|| pager(page, cur_page, total_pages))}
+                            </div>
                         }
                             .into_any()
                     }
