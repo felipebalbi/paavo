@@ -11,6 +11,8 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_location;
 
+use crate::theme::ThemeToggle;
+
 /// Map a URL path to a human breadcrumb label.
 fn breadcrumb(path: &str) -> &'static str {
     // Match on the first path segment; detail routes fold into their section.
@@ -40,6 +42,7 @@ pub fn Shell(children: Children) -> impl IntoView {
             </nav>
             <header class="topbar">
                 <span class="breadcrumb">{crumb}</span>
+                <ThemeToggle/>
             </header>
             <main>{children()}</main>
         </div>
