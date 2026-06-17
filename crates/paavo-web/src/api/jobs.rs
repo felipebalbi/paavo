@@ -1,13 +1,13 @@
 //! `/api/jobs*` JSON handlers.
 //!
-//! - `GET /api/jobs` reads the in-memory [`crate::index::JobIndex`]
-//!   (poller-maintained) so list + fuzzy search never touch sqlite on
-//!   the request path.
+//! - `GET /api/jobs` reads SQLite directly: fuzzy search via the
+//!   `fuzzy_score` function, or a time-ordered page for a blank query.
+//!   The live `jobs` revision still comes from the poller.
 //! - `GET /api/jobs/:id` and `GET /api/jobs/:id/log` read the RO sqlite
 //!   handle directly (single-row / bounded-page queries; see the
 //!   rationale on [`crate::db`]).
 use crate::db::WebDb;
-use crate::index::LiveState;
+use crate::proxy::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -15,20 +15,22 @@ use paavo_proto::{JobId, JobListItem, JobView, LogFrame, Page};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-/// `GET /api/jobs?q=&page=&per_page=&as_of=` — paginated fuzzy search
-/// over the in-memory jobs index.
+/// `GET /api/jobs?q=&page=&per_page=&as_of=` — paginated jobs read
+/// straight from the RO sqlite handle.
 ///
 /// Blank `q` returns the time-ordered list (optionally pinned to
-/// `submitted_at <= as_of` so a paging session sees a stable window);
-/// a non-blank `q` switches to fuzzy ranking. `new_count` (jobs newer
-/// than `as_of`) is only meaningful in list mode, so it is forced to 0
-/// whenever a query is present. The lock guard is dropped before the
-/// `Json` is built — and this handler has no `.await`, so it never
-/// holds the index lock across a suspension point.
+/// `submitted_at <= as_of` so a paging session sees a stable window),
+/// with `new_count` reporting rows newer than `as_of`. A non-blank `q`
+/// switches to fuzzy ranking via the `fuzzy_score` SQL function;
+/// `new_count` is meaningless there and forced to 0. The `jobs`
+/// revision still comes from the live poller so the SPA can de-dup
+/// against the `jobs` SSE event. Each `WebDb` call takes and drops its
+/// own short lock, and this handler has no `.await` between them, so it
+/// never holds a lock across a suspension point.
 pub async fn list(
-    State(live): State<LiveState>,
+    State(s): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Page<JobListItem>> {
+) -> Result<Json<Page<JobListItem>>, (StatusCode, String)> {
     let page: u32 = q
         .get("page")
         .and_then(|v| v.parse().ok())
@@ -39,28 +41,36 @@ pub async fn list(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
         .clamp(1, 200);
-    let query = q.get("q").cloned().unwrap_or_default();
+    // Trim so `?q=` (or trailing spaces) behaves like no filter.
+    let query = q.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
     let as_of: Option<i64> = q.get("as_of").and_then(|v| v.parse().ok());
-    let (items, total, new_count) = {
-        let idx = live.index.read();
-        let (items, total) = idx.search(&query, as_of, page, per_page);
-        let new_count = if query.trim().is_empty() {
-            idx.new_count(as_of)
-        } else {
-            0
-        };
+    let err = |e: paavo_db::DbError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    // saturating_mul: an unclamped hostile `?page=` must yield an empty
+    // page, not overflow.
+    let offset = (page - 1).saturating_mul(per_page);
+
+    let (items, total, new_count) = if query.is_empty() {
+        let items = s.db.jobs_list_page(as_of, offset, per_page).map_err(err)?;
+        let total = s.db.jobs_count(as_of).map_err(err)?;
+        let new_count = s.db.jobs_new_count(as_of).map_err(err)?;
         (items, total, new_count)
+    } else {
+        let items =
+            s.db.jobs_search_page(&query, offset, per_page)
+                .map_err(err)?;
+        let total = s.db.jobs_search_count(&query).map_err(err)?;
+        (items, total, 0)
     };
-    let revision = live.revisions().jobs;
-    Json(Page {
+
+    Ok(Json(Page {
         items,
         total,
         page,
         per_page,
-        revision,
+        revision: s.live.revisions().jobs,
         new_count,
         as_of,
-    })
+    }))
 }
 
 /// `GET /api/jobs/:id` — one job (404 if unknown, 400 if not a ULID).

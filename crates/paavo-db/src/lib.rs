@@ -16,6 +16,7 @@ mod build_cache;
 mod db;
 mod error;
 mod job;
+mod like;
 mod log;
 mod schedule;
 

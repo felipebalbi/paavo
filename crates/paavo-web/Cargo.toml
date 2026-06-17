@@ -31,10 +31,6 @@ anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
-# Fuzzy ranking for the in-memory jobs index search (`crate::index`).
-# A small, dependency-light skim-style matcher; not workspace-pinned
-# because paavo-web is the only crate that searches the jobs list.
-fuzzy-matcher = "0.3"
 # Human-readable timestamps. paavod and every other crate already
 # pin chrono via the workspace; paavo-web pulls the same `0.4 +
 # serde` pin in. Used by `crate::time` for the `epoch_ms_to_local`,

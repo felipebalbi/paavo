@@ -2,10 +2,9 @@
 //!
 //! One bounded response for the dashboard: exact SQL aggregate counts
 //! (`job_state_counts`, `board_health_counts`) plus the two short display
-//! lists the page renders — the 8 newest jobs (from the poller-maintained
-//! in-memory index, so the jobs list never touches sqlite on the request
-//! path) and the relevant fleet slice (`boards_dashboard`, SQL). Its size
-//! does not grow with the fleet or job history.
+//! lists the page renders — the 8 newest jobs (`jobs_list_page`, SQL) and
+//! the relevant fleet slice (`boards_dashboard`, SQL). Its size does not
+//! grow with the fleet or job history.
 use crate::api::boards::board_view;
 use crate::proxy::AppState;
 use axum::extract::State;
@@ -19,10 +18,10 @@ const RECENT_JOBS: u32 = 8;
 const FLEET_SLICE: u32 = 8;
 
 /// `GET /api/dashboard` — see the module docs. Extracts the whole
-/// `AppState`: it needs the DB (counts + fleet slice) and the live state
-/// (recent-jobs index + current revisions). There is no `.await` between
-/// taking the index read-guard and dropping it, so no lock is held across
-/// a suspension point.
+/// `AppState`: it needs the DB (counts, recent jobs, and fleet slice) and
+/// the live state (current revisions). Each `s.db` call locks the RO
+/// connection only for its own query, so no lock is held across an
+/// `.await`.
 pub async fn get(
     State(s): State<AppState>,
 ) -> Result<Json<DashboardOverview>, (StatusCode, String)> {
@@ -35,10 +34,9 @@ pub async fn get(
             .into_iter()
             .map(board_view)
             .collect();
-    let recent_jobs = {
-        let (items, _) = s.live.index.read().search("", None, 1, RECENT_JOBS);
-        items
-    };
+    // Newest-first, capped — the SQL counterpart to the old in-memory index
+    // read (no `as_of` pin: the dashboard always wants the latest jobs).
+    let recent_jobs = s.db.jobs_list_page(None, 0, RECENT_JOBS).map_err(err)?;
     let rev = s.live.revisions();
     Ok(Json(DashboardOverview {
         jobs,

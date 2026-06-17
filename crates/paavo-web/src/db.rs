@@ -74,9 +74,40 @@ impl WebDb {
         ScheduleRow::list_all(self.inner.lock().raw_conn())
     }
 
-    /// Lightweight jobs index projection (id/state/priority/submitter/board/ts).
-    pub fn jobs_index(&self) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
-        paavo_db::JobRow::list_index(self.inner.lock().raw_conn())
+    /// One page of fuzzy-search results (lightweight projection), ranked.
+    pub fn jobs_search_page(
+        &self,
+        q: &str,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
+        paavo_db::JobRow::search_index_page(self.inner.lock().raw_conn(), q, offset, limit)
+    }
+
+    /// Total fuzzy-search matches for `q` (pagination total).
+    pub fn jobs_search_count(&self, q: &str) -> paavo_db::Result<u64> {
+        paavo_db::JobRow::search_count(self.inner.lock().raw_conn(), q)
+    }
+
+    /// One page of the time-ordered jobs list (lightweight), optionally
+    /// pinned to `submitted_at <= as_of`.
+    pub fn jobs_list_page(
+        &self,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
+        paavo_db::JobRow::list_index_page(self.inner.lock().raw_conn(), as_of, offset, limit)
+    }
+
+    /// Count of jobs newer than `as_of` (the "N new" pill); 0 when unpinned.
+    pub fn jobs_new_count(&self, as_of: Option<i64>) -> paavo_db::Result<u64> {
+        paavo_db::JobRow::count_newer(self.inner.lock().raw_conn(), as_of)
+    }
+
+    /// Bounded change-detection fingerprint for the live poller.
+    pub fn jobs_activity_digest(&self) -> paavo_db::Result<u64> {
+        paavo_db::JobRow::activity_digest(self.inner.lock().raw_conn())
     }
 
     /// Page of full job rows, optionally pinned to `submitted_at <= as_of`.

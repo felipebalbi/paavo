@@ -1,6 +1,7 @@
 //! Board table typed helpers.
 
 use crate::error::{DbError, Result};
+use crate::like::escape_like;
 use paavo_proto::{BoardHealth, BoardSelector, BoardSpec, ProbeSelector};
 use rusqlite::{params, Connection, Error as RusqliteError, ErrorCode, OptionalExtension, Row};
 
@@ -361,21 +362,6 @@ fn require_one_row(n: usize, id: &str) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-/// Escape `LIKE` wildcards in a user-supplied substring so `%`, `_`, and
-/// `\` are matched literally (paired with `ESCAPE '\'` in the query). Used
-/// by [`BoardRow::list_page`] / [`BoardRow::count`] so a filter like `a_b`
-/// matches the literal characters rather than `_` standing for any char.
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c == '%' || c == '_' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn health_to_str(h: BoardHealth) -> &'static str {

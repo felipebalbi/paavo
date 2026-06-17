@@ -9,7 +9,7 @@ description = "SQLite schema, migrations, and typed queries for paavo."
 
 [dependencies]
 paavo-proto = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 refinery = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +17,10 @@ ulid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Skim-style fuzzy matcher backing the `fuzzy_score` SQLite scalar function
+# (crate::db). Not workspace-pinned — paavo-db is the only crate that ranks
+# fuzzy matches. Mirrors the dep paavo-web previously carried.
+fuzzy-matcher = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

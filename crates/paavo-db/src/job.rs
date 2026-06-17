@@ -261,26 +261,129 @@ impl JobRow {
         Ok(rows)
     }
 
-    /// Lightweight projection feeding paavo-web's in-memory jobs index.
-    /// Only the columns the list/search need; newest-first.
-    ///
-    /// Returns [`paavo_proto::JobListItem`] rows rather than full
-    /// [`JobRow`]s so the web viewer can hold the entire jobs index in
-    /// memory cheaply (no JSON-encoded selector/outcome/path columns).
-    /// Same ordering as `list_recent` — `submitted_at DESC, id DESC` —
-    /// so ties on the same millisecond stay deterministic via the
-    /// monotonic ULID id.
-    pub fn list_index(conn: &Connection) -> Result<Vec<paavo_proto::JobListItem>> {
+    /// One page of fuzzy-search results, ranked by `fuzzy_score`. `q` is
+    /// matched as a case-insensitive subsequence over the lowercased
+    /// `id + submitter + state + board_id` haystack; ranking uses the same
+    /// `SkimMatcherV2` the web UI ran in memory. The `LIKE` pre-filter
+    /// decides membership (cheap), so `fuzzy_score` runs only on matched
+    /// rows. Returns the lightweight [`paavo_proto::JobListItem`] projection.
+    pub fn search_index_page(
+        conn: &Connection,
+        q: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<paavo_proto::JobListItem>> {
+        let needle = q.trim().to_lowercase();
+        let pattern = crate::like::subsequence_pattern(&needle);
         let mut stmt = conn.prepare(
-            "SELECT id, state, priority, submitter, board_id, submitted_at
-             FROM job ORDER BY submitted_at DESC, id DESC",
+            "SELECT id, state, priority, submitter, board_id, submitted_at, \
+                    fuzzy_score(lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')), ?1) AS score \
+             FROM job \
+             WHERE lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')) LIKE ?2 ESCAPE '\\' \
+             ORDER BY score DESC, submitted_at DESC, id DESC \
+             LIMIT ?3 OFFSET ?4",
         )?;
         let rows = stmt
-            .query_map([], index_row)?
+            .query_map(
+                params![needle, pattern, limit as i64, offset as i64],
+                index_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Total fuzzy-search matches for `q` (pagination total). Pure `LIKE`
+    /// membership — does **not** call `fuzzy_score`.
+    pub fn search_count(conn: &Connection, q: &str) -> Result<u64> {
+        let needle = q.trim().to_lowercase();
+        let pattern = crate::like::subsequence_pattern(&needle);
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job \
+             WHERE lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')) LIKE ?1 ESCAPE '\\'",
+            params![pattern],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// One page of the time-ordered jobs list, newest-first
+    /// (`submitted_at DESC, id DESC`), optionally pinned to
+    /// `submitted_at <= as_of` for stable pagination under live inserts.
+    /// Lightweight [`paavo_proto::JobListItem`] projection — the blank-query
+    /// counterpart to `search_index_page`.
+    pub fn list_index_page(
+        conn: &Connection,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<paavo_proto::JobListItem>> {
+        let (sql, bind): (&str, Vec<i64>) = match as_of {
+            Some(t) => (
+                "SELECT id, state, priority, submitter, board_id, submitted_at FROM job \
+                 WHERE submitted_at <= ?1 ORDER BY submitted_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                vec![t, limit as i64, offset as i64],
+            ),
+            None => (
+                "SELECT id, state, priority, submitter, board_id, submitted_at FROM job \
+                 ORDER BY submitted_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+                vec![limit as i64, offset as i64],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bind), index_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count of jobs strictly newer than `as_of` (drives the "N new" pill);
+    /// 0 when `as_of` is `None`. Index-backed by `idx_job_submitted_at`.
+    pub fn count_newer(conn: &Connection, as_of: Option<i64>) -> Result<u64> {
+        let n: i64 = match as_of {
+            Some(t) => conn.query_row(
+                "SELECT COUNT(*) FROM job WHERE submitted_at > ?1",
+                params![t],
+                |r| r.get(0),
+            )?,
+            None => 0,
+        };
+        Ok(n as u64)
+    }
+
+    /// A cheap, bounded fingerprint of the job table for the live poller.
+    /// `GROUP BY state` yields ≤ 8 rows; folding each
+    /// `(state, count, max(submitted_at))` into a hash detects every insert
+    /// (a group's count/max moves) and every state transition (counts shift
+    /// between groups) without materializing the table. Heuristic: it misses
+    /// only offsetting same-tick transitions that leave all tallies
+    /// identical, which self-heals next tick. See design doc §3.3.
+    pub fn activity_digest(conn: &Connection) -> Result<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut stmt = conn.prepare(
+            "SELECT state, COUNT(*), COALESCE(MAX(submitted_at), 0) \
+             FROM job GROUP BY state ORDER BY state",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.len().hash(&mut h);
+        for (state, count, max_sub) in &rows {
+            state.hash(&mut h);
+            count.hash(&mut h);
+            max_sub.hash(&mut h);
+        }
+        Ok(h.finish())
     }
 
     /// Page of full job rows, newest-first, optionally pinned to
@@ -292,7 +395,7 @@ impl JobRow {
     /// it through every page request, so a job submitted mid-scroll
     /// cannot shift rows across page boundaries. `None` means "no pin"
     /// (newest snapshot, used for the very first page). Ordering matches
-    /// `list_recent`/`list_index`: `submitted_at DESC, id DESC`.
+    /// `list_recent`/`list_index_page`: `submitted_at DESC, id DESC`.
     pub fn list_page(
         conn: &Connection,
         as_of: Option<i64>,
@@ -646,8 +749,9 @@ fn state_from_str(s: &str) -> Result<JobState> {
     })
 }
 
-/// Map a row from the `list_index` projection to a
-/// [`paavo_proto::JobListItem`]. Follows the same double-`Result` shape
+/// Map a row from the lightweight index projection (`list_index_page` /
+/// `search_index_page`) to a [`paavo_proto::JobListItem`]. Follows the
+/// same double-`Result` shape
 /// as `from_row` (outer = rusqlite row error, inner = decode error) so
 /// the caller can collect both layers in one chain.
 fn index_row(r: &Row<'_>) -> rusqlite::Result<Result<paavo_proto::JobListItem>> {
@@ -755,4 +859,227 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Result<JobRow>> {
             skip_cache,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Db;
+    use tempfile::{tempdir, TempDir};
+
+    /// Open a fresh migrated temp DB (registers `fuzzy_score`).
+    fn test_db() -> (TempDir, Db) {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.sqlite")).unwrap();
+        (dir, db)
+    }
+
+    fn new_job(submitter: &str) -> NewJob {
+        NewJob {
+            id: JobId::new(),
+            priority: Priority::Interactive,
+            submitter: submitter.into(),
+            source: JobSource::Cli,
+            board_selector: BoardSelector {
+                kind: "mcxa266".into(),
+                instance: None,
+                wiring_profile: None,
+            },
+            inactivity_timeout_ms: 120_000,
+            hard_max_ms: 900_000,
+            tar_blake3: "deadbeef".into(),
+            tar_path: "/tmp/x.tar".into(),
+            cargo_update_packages: vec![],
+            skip_cache: false,
+        }
+    }
+
+    /// Insert a job; when `board` is `Some`, transition it to `building` so
+    /// the board id lands in the searchable haystack. Returns the job id.
+    fn insert_job(
+        conn: &Connection,
+        submitter: &str,
+        board: Option<&str>,
+        submitted_at: i64,
+    ) -> JobId {
+        let j = new_job(submitter);
+        let id = j.id;
+        JobRow::insert(conn, &j, submitted_at).unwrap();
+        if let Some(b) = board {
+            ensure_board(conn, b);
+            JobRow::transition_to_building(conn, &id, b, submitted_at).unwrap();
+        }
+        id
+    }
+
+    /// Seed board `id` (idempotent) so the `job.board_id` FK is satisfied
+    /// before `transition_to_building`. `job.board_id REFERENCES board(id)`
+    /// and foreign keys are ON.
+    fn ensure_board(conn: &Connection, id: &str) {
+        use crate::BoardRow;
+        use paavo_proto::{BoardHealth, BoardSpec, ProbeSelector};
+        if BoardRow::find(conn, id).unwrap().is_some() {
+            return;
+        }
+        let spec = BoardSpec {
+            id: id.into(),
+            kind: "mcxa266".into(),
+            probe_selector: ProbeSelector {
+                vid: "1366".into(),
+                pid: "1015".into(),
+                serial: id.into(),
+            },
+            chip_name: "MCXA266VFL".into(),
+            target_name: "frdm-mcx-a266".into(),
+            wiring_profile: Some("default".into()),
+            health: BoardHealth::Healthy,
+        };
+        BoardRow::insert(conn, &spec, 0).unwrap();
+    }
+
+    #[test]
+    fn fuzzy_search_isolates_by_submitter() {
+        // q="alice": bob/carol lack a,l,i,c,e in order (ULIDs exclude i,l).
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        insert_job(c, "carol", None, 1_000);
+
+        assert_eq!(JobRow::search_count(c, "alice").unwrap(), 1);
+        let rows = JobRow::search_index_page(c, "alice", 0, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].submitter, "alice");
+    }
+
+    #[test]
+    fn fuzzy_search_cross_field_subsequence_ranks_best_first() {
+        // "almcx" spans submitter+board; "alice" (al contiguous) + mcxa
+        // ranks above "carol" (a..l split) + mcxa.
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", Some("mcxa266-01"), 3_000);
+        insert_job(c, "carol", Some("mcxa266-03"), 1_000);
+
+        let rows = JobRow::search_index_page(c, "almcx", 0, 50).unwrap();
+        assert!(rows.iter().any(|r| r.submitter == "alice"));
+        assert_eq!(rows[0].submitter, "alice", "best fuzzy match ranks first");
+    }
+
+    #[test]
+    fn list_index_page_orders_and_pins() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        insert_job(c, "carol", None, 1_000);
+
+        let all = JobRow::list_index_page(c, None, 0, 50).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.submitter.as_str()).collect::<Vec<_>>(),
+            ["alice", "bob", "carol"]
+        );
+        let pinned = JobRow::list_index_page(c, Some(2_000), 0, 50).unwrap();
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|r| r.submitter.as_str())
+                .collect::<Vec<_>>(),
+            ["bob", "carol"]
+        );
+        let p2 = JobRow::list_index_page(c, None, 2, 2).unwrap();
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].submitter, "carol");
+    }
+
+    #[test]
+    fn count_newer_is_strictly_greater() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        assert_eq!(JobRow::count_newer(c, None).unwrap(), 0);
+        assert_eq!(JobRow::count_newer(c, Some(3_000)).unwrap(), 0, "exclusive");
+        assert_eq!(JobRow::count_newer(c, Some(2_000)).unwrap(), 1);
+        assert_eq!(JobRow::count_newer(c, Some(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn activity_digest_changes_on_insert_and_transition() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        let empty = JobRow::activity_digest(c).unwrap();
+        let id = insert_job(c, "alice", None, 1_000);
+        let after_insert = JobRow::activity_digest(c).unwrap();
+        assert_ne!(empty, after_insert, "insert must change the digest");
+        assert_eq!(
+            after_insert,
+            JobRow::activity_digest(c).unwrap(),
+            "stable no-op"
+        );
+        ensure_board(c, "mcxa266-01");
+        JobRow::transition_to_building(c, &id, "mcxa266-01", 2_000).unwrap();
+        let after_transition = JobRow::activity_digest(c).unwrap();
+        assert_ne!(
+            after_insert, after_transition,
+            "transition must change the digest"
+        );
+    }
+
+    #[test]
+    fn like_membership_matches_fuzzy_score_some() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", Some("mcxa266-01"), 5_000);
+        insert_job(c, "bob", Some("mcxa266-02"), 4_000);
+        insert_job(c, "carol", Some("mcxa266-03"), 3_000);
+        insert_job(c, "dave", None, 2_000);
+        insert_job(c, "almcx-bot", None, 1_000);
+
+        for needle in ["almcx", "alice", "mcx", "bob", "zzz", "266", ""] {
+            // LIKE-membership count (what search_count uses).
+            let like_n = JobRow::search_count(c, needle).unwrap();
+            // fuzzy_score-Some count over the SAME lowercased haystack.
+            let lowered = needle.trim().to_lowercase();
+            let udf_n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM job WHERE fuzzy_score(\
+                     lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')), ?1) IS NOT NULL",
+                    params![lowered],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                like_n, udf_n as u64,
+                "LIKE-membership and fuzzy_score-Some disagree for needle {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_index_page_paginates() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        for (s, t) in [
+            ("mcxone", 4_000),
+            ("mcxtwo", 3_000),
+            ("mcxthree", 2_000),
+            ("mcxfour", 1_000),
+        ] {
+            insert_job(c, s, None, t);
+        }
+        assert_eq!(JobRow::search_count(c, "mcx").unwrap(), 4);
+        let p1 = JobRow::search_index_page(c, "mcx", 0, 2).unwrap();
+        let p2 = JobRow::search_index_page(c, "mcx", 2, 2).unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 2);
+        // Pages are disjoint (no id in both).
+        for a in &p1 {
+            assert!(!p2.iter().any(|b| b.id == a.id), "search pages overlap");
+        }
+        // Offset past the end yields an empty page.
+        assert!(JobRow::search_index_page(c, "mcx", 4, 2)
+            .unwrap()
+            .is_empty());
+    }
 }

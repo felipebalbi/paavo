@@ -1,9 +1,8 @@
 //! Integration test for `GET /api/dashboard`: SQL aggregate counts +
-//! the recent-jobs (in-memory index) and fleet (SQL) display slices.
+//! the recent-jobs and fleet display slices (all read from sqlite).
 //!
-//! Counts/fleet read sqlite directly (immediate via WAL); recent_jobs is
-//! poller-maintained, so the test polls the endpoint until the index
-//! reflects the seeded jobs before asserting.
+//! Everything reads sqlite directly (immediate via WAL); the short poll
+//! loop only guards against WAL read-visibility latency before asserting.
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -88,7 +87,7 @@ async fn get_overview(app: &axum::Router) -> DashboardOverview {
     serde_json::from_slice(&bytes).expect("DashboardOverview JSON")
 }
 
-/// Poll until the in-memory index carries `want` recent jobs.
+/// Poll `GET /api/dashboard` until it reports `want` recent jobs.
 async fn wait_for_recent(app: &axum::Router, want: usize) -> DashboardOverview {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -159,9 +158,8 @@ async fn dashboard_counts_are_uncapped_while_recent_jobs_are_capped() {
         .unwrap();
     }
 
-    // The in-memory index holds every job but the handler caps the
-    // recent-activity slice at RECENT_JOBS (8); poll until it stabilises
-    // at 8 (it can never reach 10).
+    // The handler caps the recent-activity slice at RECENT_JOBS (8); it can
+    // never reach 10 even though 10 jobs exist.
     let ov = wait_for_recent(&app, 8).await;
 
     // Counts are EXACT, UNCAPPED SQL aggregates over the whole table...

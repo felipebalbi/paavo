@@ -24,7 +24,9 @@
 //!
 //! Keystrokes write the raw `query` signal immediately but only commit to the
 //! `dq` (debounced query) signal — which the data resource is keyed on —
-//! after a 150 ms quiet period. We implement that with a monotonically
+//! after a 250 ms quiet period. Each committed query now runs a DB-side
+//! table scan, so a longer quiet window is warranted. We implement that
+//! with a monotonically
 //! increasing generation counter: each keystroke schedules a
 //! [`Timeout`](gloo_timers::callback::Timeout) tagged with its generation and
 //! only the newest surviving timer commits. No timer handles to juggle, and
@@ -106,7 +108,7 @@ pub fn JobsList() -> impl IntoView {
         query.set(value.clone());
         let my_gen = gen.get_untracked() + 1;
         gen.set(my_gen);
-        Timeout::new(150, move || {
+        Timeout::new(250, move || {
             // Only commit if no newer keystroke superseded us.
             if gen.get_untracked() == my_gen {
                 dq.set(value);

@@ -460,43 +460,6 @@ fn finalize_allowed_from_awaiting_board() {
 }
 
 #[test]
-fn list_index_returns_lightweight_rows_newest_first() {
-    let db = fresh_db();
-    insert_default_board(&db);
-    let now = Utc::now().timestamp_millis();
-
-    // Older job, distinct submitter, left in Submitted.
-    let older = JobId::new();
-    let mut older_job = sample_new_job(older);
-    older_job.submitter = "alice".into();
-    JobRow::insert(db.raw_conn(), &older_job, now).unwrap();
-
-    // Newer job, distinct submitter, transitioned to Building so the
-    // projected `state` differs from the older row.
-    let newer = JobId::new();
-    let mut newer_job = sample_new_job(newer);
-    newer_job.submitter = "bob".into();
-    JobRow::insert(db.raw_conn(), &newer_job, now + 10).unwrap();
-    JobRow::transition_to_building(db.raw_conn(), &newer, "mcxa266-01", now + 11).unwrap();
-
-    let index = JobRow::list_index(db.raw_conn()).unwrap();
-    assert_eq!(index.len(), 2);
-
-    // Newest first.
-    assert_eq!(index[0].id, newer);
-    assert_eq!(index[0].state, JobState::Building);
-    assert_eq!(index[0].submitter, "bob");
-    assert_eq!(index[0].board_id.as_deref(), Some("mcxa266-01"));
-    assert_eq!(index[0].submitted_at, now + 10);
-
-    assert_eq!(index[1].id, older);
-    assert_eq!(index[1].state, JobState::Submitted);
-    assert_eq!(index[1].submitter, "alice");
-    assert!(index[1].board_id.is_none());
-    assert_eq!(index[1].submitted_at, now);
-}
-
-#[test]
 fn list_page_and_count_honor_as_of_pin() {
     let db = fresh_db();
 
