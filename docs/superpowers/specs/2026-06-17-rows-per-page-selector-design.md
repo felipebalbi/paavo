@@ -93,11 +93,13 @@ outside the allowed set by stale or hand-edited storage.
 
 ### 2. New widget in `widgets.rs`
 
-`pub fn per_page_selector(per_page: RwSignal<u32>) -> impl IntoView`:
+`pub fn per_page_selector(per_page: RwSignal<u32>, current: u32) -> impl IntoView`:
 
 - Renders `Rows per page: <select class="per-page">…</select>`.
-- Options come from `per_page::OPTIONS`; the `<option>` equal to
-  `per_page.get()` is marked `selected`.
+- Options come from `per_page::OPTIONS`; the `<option>` equal to `current` (the
+  server-echoed `Page.per_page`, passed in by the caller) is marked `selected`.
+  Keying the pre-selection off the echoed size — rather than reading the signal
+  inside the widget — mirrors how `pager` takes its `current` page by value.
 - `on:change` parses the selected value and calls `per_page.set(n)`.
 - Presentation-only and side-effect-free (no storage, no page reset) — exactly
   like the existing `pager`, so it stays reusable.
