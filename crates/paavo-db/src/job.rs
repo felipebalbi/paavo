@@ -330,6 +330,52 @@ impl JobRow {
         Ok(n as u64)
     }
 
+    /// One page of the time-ordered jobs list, newest-first
+    /// (`submitted_at DESC, id DESC`), optionally pinned to
+    /// `submitted_at <= as_of` for stable pagination under live inserts.
+    /// Lightweight [`paavo_proto::JobListItem`] projection — the blank-query
+    /// counterpart to `search_index_page`.
+    pub fn list_index_page(
+        conn: &Connection,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<paavo_proto::JobListItem>> {
+        let (sql, bind): (&str, Vec<i64>) = match as_of {
+            Some(t) => (
+                "SELECT id, state, priority, submitter, board_id, submitted_at FROM job \
+                 WHERE submitted_at <= ?1 ORDER BY submitted_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                vec![t, limit as i64, offset as i64],
+            ),
+            None => (
+                "SELECT id, state, priority, submitter, board_id, submitted_at FROM job \
+                 ORDER BY submitted_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+                vec![limit as i64, offset as i64],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bind), index_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count of jobs strictly newer than `as_of` (drives the "N new" pill);
+    /// 0 when `as_of` is `None`. Index-backed by `idx_job_submitted_at`.
+    pub fn count_newer(conn: &Connection, as_of: Option<i64>) -> Result<u64> {
+        let n: i64 = match as_of {
+            Some(t) => conn.query_row(
+                "SELECT COUNT(*) FROM job WHERE submitted_at > ?1",
+                params![t],
+                |r| r.get(0),
+            )?,
+            None => 0,
+        };
+        Ok(n as u64)
+    }
+
     /// Page of full job rows, newest-first, optionally pinned to
     /// `submitted_at <= as_of` for stable pagination under live inserts.
     ///
@@ -873,5 +919,43 @@ mod tests {
         let rows = JobRow::search_index_page(c, "almcx", 0, 50).unwrap();
         assert!(rows.iter().any(|r| r.submitter == "alice"));
         assert_eq!(rows[0].submitter, "alice", "best fuzzy match ranks first");
+    }
+
+    #[test]
+    fn list_index_page_orders_and_pins() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        insert_job(c, "carol", None, 1_000);
+
+        let all = JobRow::list_index_page(c, None, 0, 50).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.submitter.as_str()).collect::<Vec<_>>(),
+            ["alice", "bob", "carol"]
+        );
+        let pinned = JobRow::list_index_page(c, Some(2_000), 0, 50).unwrap();
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|r| r.submitter.as_str())
+                .collect::<Vec<_>>(),
+            ["bob", "carol"]
+        );
+        let p2 = JobRow::list_index_page(c, None, 2, 2).unwrap();
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].submitter, "carol");
+    }
+
+    #[test]
+    fn count_newer_is_strictly_greater() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", None, 3_000);
+        insert_job(c, "bob", None, 2_000);
+        assert_eq!(JobRow::count_newer(c, None).unwrap(), 0);
+        assert_eq!(JobRow::count_newer(c, Some(3_000)).unwrap(), 0, "exclusive");
+        assert_eq!(JobRow::count_newer(c, Some(2_000)).unwrap(), 1);
+        assert_eq!(JobRow::count_newer(c, Some(0)).unwrap(), 2);
     }
 }
