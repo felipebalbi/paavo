@@ -117,6 +117,24 @@ impl BoardRow {
         Ok(rows)
     }
 
+    /// The N most operationally-relevant boards for the dashboard fleet
+    /// card: quarantined first, then most-recently-used, "never used"
+    /// last (`last_used_at` NULL sorts last under DESC), `id` as the
+    /// deterministic tiebreak.
+    pub fn list_dashboard(conn: &Connection, limit: u32) -> Result<Vec<Self>> {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM board \
+             ORDER BY (health = 'quarantined') DESC, last_used_at DESC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Total board count, optionally filtered exactly like [`list_page`]
     /// (`id`/`kind` case-insensitive substring). Paired with `list_page`
     /// so paavo-web can render the total page count for the (filtered)
