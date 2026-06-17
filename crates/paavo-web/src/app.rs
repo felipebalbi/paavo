@@ -52,6 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/:id/log", get(crate::api::jobs::log))
         .route("/api/jobs/:id/stream", get(crate::proxy::stream_job))
         .route("/api/boards", get(crate::api::boards::list))
+        .route("/api/dashboard", get(crate::api::dashboard::get))
         .route("/api/schedules", get(crate::api::schedules::list))
         .route("/api/events", get(crate::api::events::events))
         .fallback(crate::embed::serve)

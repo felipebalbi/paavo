@@ -82,3 +82,16 @@ fn admin_purge_help_mentions_wipe() {
          so operators know it is destructive; got:\n{text}"
     );
 }
+
+#[test]
+fn admin_purge_help_lists_boards_and_yes() {
+    // Operators reading `admin purge --help` must discover the new
+    // opt-in board wipe and its confirmation bypass.
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["admin", "purge", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--boards"))
+        .stdout(contains("--yes"));
+}

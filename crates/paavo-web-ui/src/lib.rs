@@ -13,6 +13,8 @@
 //! - [`api`] — typed `fetch` wrappers returning `paavo-proto` wire types.
 //! - [`live`] — one `EventSource` over `/api/events` exposing per-resource
 //!   revision signals that drive refetches.
+//! - [`per_page`] — per-list rows-per-page preference: offered sizes, default,
+//!   and browser-local persistence.
 //! - [`theme`] — light/dark theme read/apply/toggle plus the sun/moon button.
 //! - [`components`] — the app shell and one component per route page.
 //!
@@ -22,6 +24,7 @@ pub mod api;
 pub mod app;
 pub mod components;
 pub mod live;
+pub mod per_page;
 pub mod theme;
 
 pub use app::App;

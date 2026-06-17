@@ -37,8 +37,9 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::widgets::{abs_time, pager, rel_time, StateBadge};
+use crate::components::widgets::{abs_time, pager, per_page_selector, rel_time, StateBadge};
 use crate::live::LiveSignals;
+use crate::per_page;
 
 /// The `/jobs` list page.
 #[component]
@@ -53,6 +54,8 @@ pub fn JobsList() -> impl IntoView {
     let gen = RwSignal::new(0u32);
     // 1-based page number.
     let page = RwSignal::new(1u32);
+    // Rows-per-page, restored from this list's browser-local preference.
+    let per_page = RwSignal::new(per_page::load(per_page::KEY_JOBS));
     // Pin the list window to "now" at mount so pagination is stable and the
     // "N new" pill is meaningful. `None` while searching (server ignores it).
     let as_of = RwSignal::new(Some(js_sys::Date::now() as i64));
@@ -63,9 +66,10 @@ pub fn JobsList() -> impl IntoView {
     let res = LocalResource::new(move || {
         let q = dq.get();
         let p = page.get();
+        let pp = per_page.get();
         let a = as_of.get();
         let _ = live.jobs.get();
-        async move { api::jobs(&q, p, a).await }
+        async move { api::jobs_page(&q, p, pp, a).await }
     });
 
     // When the committed query transitions, reset to page 1 and flip the pin:
@@ -82,6 +86,21 @@ pub fn JobsList() -> impl IntoView {
                 as_of.set(None);
             }
         }
+    });
+
+    // Persist the page-size choice and jump back to page 1 whenever it changes.
+    // The closure returns the size so the next run sees it as `prev`; the first
+    // run (prev = None) is the mount, where restoring a stored size must NOT
+    // reset paging.
+    Effect::new(move |prev: Option<u32>| {
+        let pp = per_page.get();
+        if let Some(old) = prev {
+            if old != pp {
+                per_page::store(per_page::KEY_JOBS, pp);
+                page.set(1);
+            }
+        }
+        pp
     });
 
     let on_input = move |ev| {
@@ -121,8 +140,9 @@ pub fn JobsList() -> impl IntoView {
                         let total = data.total;
                         let new_count = data.new_count;
                         let cur_page = data.page;
-                        let per_page = data.per_page.max(1) as u64;
-                        let total_pages = total.div_ceil(per_page).max(1) as u32;
+                        let cur_per_page = data.per_page;
+                        let per_page_n = data.per_page.max(1) as u64;
+                        let total_pages = total.div_ceil(per_page_n).max(1) as u32;
                         let rows = data
                             .items
                             .iter()
@@ -188,7 +208,11 @@ pub fn JobsList() -> impl IntoView {
                                 </thead>
                                 <tbody>{rows}</tbody>
                             </table>
-                            {(total_pages > 1).then(|| pager(page, cur_page, total_pages))}
+                            <div class="list-footer">
+                                {per_page_selector(per_page, cur_per_page)}
+                                {(total_pages > 1)
+                                    .then(|| pager(page, cur_page, total_pages))}
+                            </div>
                         }
                             .into_any()
                     }

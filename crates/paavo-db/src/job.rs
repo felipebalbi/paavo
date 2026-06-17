@@ -438,6 +438,40 @@ impl JobRow {
         Ok(n as u64)
     }
 
+    /// Job counts grouped by state, all-time over retained rows. Backed
+    /// by `idx_job_state` (SQLite satisfies the GROUP BY from the index).
+    /// Unknown state strings surface as `DbError::UnknownEnum`, matching
+    /// the `from_row` family. States with no rows stay zero.
+    pub fn state_counts(conn: &Connection) -> Result<paavo_proto::JobStateCounts> {
+        let mut counts = paavo_proto::JobStateCounts {
+            submitted: 0,
+            building: 0,
+            awaiting_board: 0,
+            running: 0,
+            passed: 0,
+            failed: 0,
+            timed_out: 0,
+            aborted: 0,
+        };
+        let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM job GROUP BY state")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (state_str, n) = row?;
+            let n = n as u64;
+            match state_from_str(&state_str)? {
+                JobState::Submitted => counts.submitted = n,
+                JobState::Building => counts.building = n,
+                JobState::AwaitingBoard => counts.awaiting_board = n,
+                JobState::Running => counts.running = n,
+                JobState::Passed => counts.passed = n,
+                JobState::Failed => counts.failed = n,
+                JobState::TimedOut => counts.timed_out = n,
+                JobState::Aborted => counts.aborted = n,
+            }
+        }
+        Ok(counts)
+    }
+
     /// `Submitted → Building`, recording the chosen board and start time.
     /// Errors if the job is not in `Submitted` state (0 rows updated).
     pub fn transition_to_building(

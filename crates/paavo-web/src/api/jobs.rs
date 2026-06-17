@@ -39,7 +39,7 @@ pub async fn list(
     let per_page: u32 = q
         .get("per_page")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(50)
+        .unwrap_or(20)
         .clamp(1, 200);
     // Trim so `?q=` (or trailing spaces) behaves like no filter.
     let query = q.get("q").map(|v| v.trim().to_string()).unwrap_or_default();

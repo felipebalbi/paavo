@@ -10,7 +10,9 @@
 //! them directly in an error branch — the UI has nothing actionable to do with
 //! a structured transport error beyond showing it.
 
-use paavo_proto::{BoardView, JobListItem, JobView, LogFrame, Page, ScheduleView};
+use paavo_proto::{
+    BoardView, DashboardOverview, JobListItem, JobView, LogFrame, Page, ScheduleView,
+};
 
 /// Stringify any `Display` error (gloo-net transport error, serde decode
 /// error) into a render-ready message.
@@ -26,12 +28,9 @@ fn encode(value: &str) -> String {
 }
 
 /// `GET /api/jobs?q=&page=&per_page=&as_of=` — one page of the (optionally
-/// fuzzy-filtered) jobs index with an explicit page size. The general form
-/// backing [`jobs`]; the dashboard calls it with a large window
-/// (`per_page=200`, the server's clamp ceiling) to count in-flight jobs
-/// accurately — in-flight rows are always the newest, so a recent window
-/// captures them all. Blank `q` returns the time-ordered list; `as_of` pins
-/// the page to `submitted_at <= as_of` for stable paging.
+/// fuzzy-filtered) jobs index with an explicit page size. Blank `q` returns the
+/// time-ordered list; `as_of` pins the page to `submitted_at <= as_of` for
+/// stable paging.
 pub async fn jobs_page(
     q: &str,
     page: u32,
@@ -43,13 +42,6 @@ pub async fn jobs_page(
         url.push_str(&format!("&as_of={t}"));
     }
     fetch_json(&url).await
-}
-
-/// `GET /api/jobs?q=&page=&per_page=50&as_of=` — one page of the (optionally
-/// fuzzy-filtered) jobs index at the default 50-row page size. Thin wrapper
-/// over [`jobs_page`].
-pub async fn jobs(q: &str, page: u32, as_of: Option<i64>) -> Result<Page<JobListItem>, String> {
-    jobs_page(q, page, 50, as_of).await
 }
 
 /// `GET /api/jobs/{id}` — one job's full view (404 → `Err`).
@@ -69,11 +61,8 @@ pub async fn job_log(id: &str, offset: u32) -> Result<Vec<LogFrame>, String> {
 }
 
 /// `GET /api/boards?page=&per_page=&q=` — one page of the (optionally
-/// filtered) board fleet with an explicit page size. The general form
-/// backing [`boards`]; the dashboard calls it with `per_page=100` (the
-/// server's clamp ceiling) and a blank `q` so its "boards healthy" tally
-/// covers the whole fleet in one request. A non-blank `q` narrows by an
-/// `id`/`kind` substring matched server-side across the *whole* table.
+/// filtered) board fleet with an explicit page size. A non-blank `q` narrows
+/// by an `id`/`kind` substring matched server-side across the *whole* table.
 pub async fn boards_page(page: u32, per_page: u32, q: &str) -> Result<Page<BoardView>, String> {
     fetch_json(&format!(
         "/api/boards?page={page}&per_page={per_page}&q={}",
@@ -82,16 +71,17 @@ pub async fn boards_page(page: u32, per_page: u32, q: &str) -> Result<Page<Board
     .await
 }
 
-/// `GET /api/boards?page=&per_page=20&q=` — one page of the (optionally
-/// filtered) board fleet at the default 20-row page size. Thin wrapper
-/// over [`boards_page`].
-pub async fn boards(page: u32, q: &str) -> Result<Page<BoardView>, String> {
-    boards_page(page, 20, q).await
+/// `GET /api/dashboard` — the consolidated landing-page payload: exact
+/// aggregate counts plus the recent-jobs and fleet display slices, in one
+/// bounded response. Replaces the dashboard's old wide jobs+boards fetch.
+pub async fn dashboard() -> Result<DashboardOverview, String> {
+    fetch_json("/api/dashboard").await
 }
 
-/// `GET /api/schedules?page=&per_page=20` — one page of cron schedules.
-pub async fn schedules(page: u32) -> Result<Page<ScheduleView>, String> {
-    fetch_json(&format!("/api/schedules?page={page}&per_page=20")).await
+/// `GET /api/schedules?page=&per_page=` — one page of cron schedules at an
+/// explicit page size.
+pub async fn schedules_page(page: u32, per_page: u32) -> Result<Page<ScheduleView>, String> {
+    fetch_json(&format!("/api/schedules?page={page}&per_page={per_page}")).await
 }
 
 /// Issue a GET for `url` and decode the JSON body as `T`. Shared by every

@@ -553,3 +553,68 @@ fn delete_board_with_referencing_job_returns_conflict_via_fk() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn health_counts_empty_db_is_zero() {
+    let db = fresh_db();
+    let c = BoardRow::health_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.total, 0);
+    assert_eq!(c.quarantined, 0);
+    assert_eq!(c.healthy(), 0);
+}
+
+#[test]
+fn health_counts_totals_and_quarantined() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    for id in ["b1", "b2", "b3"] {
+        let mut s = sample_board();
+        s.id = id.into();
+        BoardRow::insert(db.raw_conn(), &s, now).unwrap();
+    }
+    BoardRow::quarantine(db.raw_conn(), "b2", "broken").unwrap();
+
+    let c = BoardRow::health_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.total, 3);
+    assert_eq!(c.quarantined, 1);
+    assert_eq!(c.healthy(), 2);
+}
+
+#[test]
+fn list_dashboard_orders_quarantined_first_then_recently_used() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+
+    // Healthy, used most recently.
+    let mut a = sample_board();
+    a.id = "board-a".into();
+    BoardRow::insert(db.raw_conn(), &a, now).unwrap();
+    BoardRow::touch_last_used(db.raw_conn(), "board-a", now + 2000).unwrap();
+
+    // Healthy, used a while ago.
+    let mut b = sample_board();
+    b.id = "board-b".into();
+    BoardRow::insert(db.raw_conn(), &b, now).unwrap();
+    BoardRow::touch_last_used(db.raw_conn(), "board-b", now + 1000).unwrap();
+
+    // Healthy, never used (last_used_at NULL).
+    let mut c = sample_board();
+    c.id = "board-c".into();
+    BoardRow::insert(db.raw_conn(), &c, now).unwrap();
+
+    // Quarantined (never used) — must lead regardless of last_used_at.
+    let mut d = sample_board();
+    d.id = "board-d".into();
+    BoardRow::insert(db.raw_conn(), &d, now).unwrap();
+    BoardRow::quarantine(db.raw_conn(), "board-d", "broken").unwrap();
+
+    let rows = BoardRow::list_dashboard(db.raw_conn(), 8).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.spec.id.as_str()).collect();
+    assert_eq!(ids, vec!["board-d", "board-a", "board-b", "board-c"]);
+
+    // Limit is honoured.
+    let top2 = BoardRow::list_dashboard(db.raw_conn(), 2).unwrap();
+    assert_eq!(top2.len(), 2);
+    assert_eq!(top2[0].spec.id, "board-d");
+    assert_eq!(top2[1].spec.id, "board-a");
+}

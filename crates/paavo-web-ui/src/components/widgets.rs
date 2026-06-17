@@ -188,3 +188,37 @@ pub fn pager(page: RwSignal<u32>, current: u32, total_pages: u32) -> impl IntoVi
         </div>
     }
 }
+
+/// A `<select>` of the offered page sizes ([`crate::per_page::OPTIONS`]),
+/// two-way bound to the caller's `per_page` signal. `current` is the size the
+/// server echoed for the page on screen, used to pre-select the matching
+/// `<option>`.
+///
+/// Presentation-only: it neither persists the choice nor resets the page — the
+/// owning component does both in an `Effect` (see `jobs_list.rs`), mirroring how
+/// [`pager`] leaves page-state mutation to its `page` signal. Shared by the
+/// jobs, boards, and schedule footers so every list offers identical sizes.
+pub fn per_page_selector(per_page: RwSignal<u32>, current: u32) -> impl IntoView {
+    let options = crate::per_page::OPTIONS
+        .iter()
+        .map(|&n| {
+            view! {
+                <option value=n selected=n == current>
+                    {n}
+                </option>
+            }
+        })
+        .collect::<Vec<_>>();
+    view! {
+        <label class="per-page">
+            "Rows per page: "
+            <select on:change=move |ev| {
+                if let Ok(n) = event_target_value(&ev).parse::<u32>() {
+                    per_page.set(n);
+                }
+            }>
+                {options}
+            </select>
+        </label>
+    }
+}
