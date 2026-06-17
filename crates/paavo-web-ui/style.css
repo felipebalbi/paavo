@@ -196,6 +196,49 @@ main {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
+/* ---- mobile nav: hamburger toggle + drawer scrim ------------------- */
+/* Both are hidden on wide screens; the max-width:48rem block below reveals
+ * them and turns .sidebar into a left slide-in drawer. */
+
+/* Left cluster of the topbar: hamburger (mobile only) + breadcrumb. */
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+/* Hamburger button. Mirrors .theme-toggle's look; shown only on mobile. */
+.nav-toggle {
+  display: none; /* flipped to inline-grid in the mobile media query */
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.nav-toggle:hover {
+  border-color: var(--accent);
+}
+
+.nav-toggle:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* Dimmed backdrop behind the open drawer. Hidden (and inert) on desktop. */
+.nav-scrim {
+  display: none;
+}
+
 /* ---- cards & stats --------------------------------------------------- */
 
 .card {
@@ -567,34 +610,66 @@ main {
   color: var(--text-muted);
 }
 
-/* ---- responsive: collapse sidebar to a top row, scroll tables -------- */
+/* ---- responsive: sidebar → off-canvas drawer, scroll tables --------- */
 
 @media (max-width: 48rem) {
+  /* Single column: just the topbar and main. The sidebar leaves normal flow
+   * and becomes a left slide-in drawer toggled by `.app.nav-open`. */
   .app {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
     grid-template-areas:
-      "sidebar"
       "topbar"
       "main";
   }
 
+  /* Reveal the hamburger. */
+  .nav-toggle {
+    display: inline-grid;
+  }
+
+  /* Sidebar -> off-canvas drawer. It keeps its column layout, padding, and
+   * background from the base `.sidebar` rule; here we only re-position it and
+   * slide it in/out. */
   .sidebar {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.25rem;
-    overflow-x: auto;
-    padding: 0.5rem 0.75rem;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
+    position: fixed;
+    inset-block: 0;
+    left: 0;
+    z-index: 20;
+    width: clamp(14rem, 75vw, 18rem);
+    transform: translateX(-100%);
+    /* `visibility` keeps the off-screen (closed) drawer out of the tab order
+     * and away from assistive tech. The visibility transition holds it visible
+     * through the slide-out, then hides it at the end; on open it becomes
+     * visible immediately. */
+    visibility: hidden;
+    transition: transform 0.2s ease, visibility 0.2s ease;
+    overflow-y: auto;
   }
 
-  .brand {
-    padding: 0.25rem 0.6rem;
+  .app.nav-open .sidebar {
+    transform: translateX(0);
+    visibility: visible;
   }
 
-  .sidebar a {
-    white-space: nowrap;
+  /* Backdrop: covers the viewport, fades in with the drawer, and is
+   * click-through until the drawer is open. The dim is a deliberate
+   * theme-agnostic black overlay (intentionally a raw rgba literal, not a
+   * palette token) so it reads the same over both light and dark surfaces. */
+  .nav-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    background: rgba(0, 0, 0, 0.4);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  .app.nav-open .nav-scrim {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   /* Let wide tables scroll horizontally instead of overflowing the viewport. */
