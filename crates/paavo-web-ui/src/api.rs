@@ -61,23 +61,14 @@ pub async fn job_log(id: &str, offset: u32) -> Result<Vec<LogFrame>, String> {
 }
 
 /// `GET /api/boards?page=&per_page=&q=` — one page of the (optionally
-/// filtered) board fleet with an explicit page size. The general form
-/// backing [`boards`] (which fixes `per_page=20`). A non-blank `q` narrows
-/// by an `id`/`kind` substring matched server-side across the *whole*
-/// table.
+/// filtered) board fleet with an explicit page size. A non-blank `q` narrows
+/// by an `id`/`kind` substring matched server-side across the *whole* table.
 pub async fn boards_page(page: u32, per_page: u32, q: &str) -> Result<Page<BoardView>, String> {
     fetch_json(&format!(
         "/api/boards?page={page}&per_page={per_page}&q={}",
         encode(q)
     ))
     .await
-}
-
-/// `GET /api/boards?page=&per_page=20&q=` — one page of the (optionally
-/// filtered) board fleet at the default 20-row page size. Thin wrapper
-/// over [`boards_page`].
-pub async fn boards(page: u32, q: &str) -> Result<Page<BoardView>, String> {
-    boards_page(page, 20, q).await
 }
 
 /// `GET /api/dashboard` — the consolidated landing-page payload: exact
