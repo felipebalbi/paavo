@@ -991,4 +991,61 @@ mod tests {
             "transition must change the digest"
         );
     }
+
+    #[test]
+    fn like_membership_matches_fuzzy_score_some() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        insert_job(c, "alice", Some("mcxa266-01"), 5_000);
+        insert_job(c, "bob", Some("mcxa266-02"), 4_000);
+        insert_job(c, "carol", Some("mcxa266-03"), 3_000);
+        insert_job(c, "dave", None, 2_000);
+        insert_job(c, "almcx-bot", None, 1_000);
+
+        for needle in ["almcx", "alice", "mcx", "bob", "zzz", "266", ""] {
+            // LIKE-membership count (what search_count uses).
+            let like_n = JobRow::search_count(c, needle).unwrap();
+            // fuzzy_score-Some count over the SAME lowercased haystack.
+            let lowered = needle.trim().to_lowercase();
+            let udf_n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM job WHERE fuzzy_score(\
+                     lower(id || ' ' || submitter || ' ' || state || ' ' || coalesce(board_id,'')), ?1) IS NOT NULL",
+                    params![lowered],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                like_n, udf_n as u64,
+                "LIKE-membership and fuzzy_score-Some disagree for needle {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_index_page_paginates() {
+        let (_d, db) = test_db();
+        let c = db.raw_conn();
+        for (s, t) in [
+            ("mcxone", 4_000),
+            ("mcxtwo", 3_000),
+            ("mcxthree", 2_000),
+            ("mcxfour", 1_000),
+        ] {
+            insert_job(c, s, None, t);
+        }
+        assert_eq!(JobRow::search_count(c, "mcx").unwrap(), 4);
+        let p1 = JobRow::search_index_page(c, "mcx", 0, 2).unwrap();
+        let p2 = JobRow::search_index_page(c, "mcx", 2, 2).unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 2);
+        // Pages are disjoint (no id in both).
+        for a in &p1 {
+            assert!(!p2.iter().any(|b| b.id == a.id), "search pages overlap");
+        }
+        // Offset past the end yields an empty page.
+        assert!(JobRow::search_index_page(c, "mcx", 4, 2)
+            .unwrap()
+            .is_empty());
+    }
 }
