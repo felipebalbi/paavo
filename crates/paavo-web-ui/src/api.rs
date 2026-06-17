@@ -28,8 +28,7 @@ fn encode(value: &str) -> String {
 }
 
 /// `GET /api/jobs?q=&page=&per_page=&as_of=` — one page of the (optionally
-/// fuzzy-filtered) jobs index with an explicit page size. The general form
-/// backing [`jobs`] (which fixes `per_page=50`). Blank `q` returns the
+/// fuzzy-filtered) jobs index with an explicit page size. Blank `q` returns the
 /// time-ordered list; `as_of` pins the page to `submitted_at <= as_of` for
 /// stable paging.
 pub async fn jobs_page(
@@ -43,13 +42,6 @@ pub async fn jobs_page(
         url.push_str(&format!("&as_of={t}"));
     }
     fetch_json(&url).await
-}
-
-/// `GET /api/jobs?q=&page=&per_page=50&as_of=` — one page of the (optionally
-/// fuzzy-filtered) jobs index at the default 50-row page size. Thin wrapper
-/// over [`jobs_page`].
-pub async fn jobs(q: &str, page: u32, as_of: Option<i64>) -> Result<Page<JobListItem>, String> {
-    jobs_page(q, page, 50, as_of).await
 }
 
 /// `GET /api/jobs/{id}` — one job's full view (404 → `Err`).
