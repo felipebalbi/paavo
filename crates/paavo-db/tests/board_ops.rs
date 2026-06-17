@@ -553,3 +553,29 @@ fn delete_board_with_referencing_job_returns_conflict_via_fk() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn health_counts_empty_db_is_zero() {
+    let db = fresh_db();
+    let c = BoardRow::health_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.total, 0);
+    assert_eq!(c.quarantined, 0);
+    assert_eq!(c.healthy(), 0);
+}
+
+#[test]
+fn health_counts_totals_and_quarantined() {
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    for id in ["b1", "b2", "b3"] {
+        let mut s = sample_board();
+        s.id = id.into();
+        BoardRow::insert(db.raw_conn(), &s, now).unwrap();
+    }
+    BoardRow::quarantine(db.raw_conn(), "b2", "broken").unwrap();
+
+    let c = BoardRow::health_counts(db.raw_conn()).unwrap();
+    assert_eq!(c.total, 3);
+    assert_eq!(c.quarantined, 1);
+    assert_eq!(c.healthy(), 2);
+}

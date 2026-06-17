@@ -137,6 +137,22 @@ impl BoardRow {
         Ok(n as u64)
     }
 
+    /// Total board count and how many are quarantined, in one pass.
+    /// Healthy is derived on the wire type (`total - quarantined`).
+    pub fn health_counts(conn: &Connection) -> Result<paavo_proto::BoardHealthCounts> {
+        let (total, quarantined): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(CASE WHEN health = 'quarantined' THEN 1 ELSE 0 END), 0) \
+             FROM board",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(paavo_proto::BoardHealthCounts {
+            total: total as u64,
+            quarantined: quarantined as u64,
+        })
+    }
+
     /// Find healthy boards matching the selector AND not currently
     /// dispatched (no `job` row in `running` state on this board — only
     /// the run phase holds a board; the build phase is board-free).
