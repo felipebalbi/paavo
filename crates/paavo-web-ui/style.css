@@ -490,6 +490,36 @@ main {
   padding: 0 0.25rem;
 }
 
+/* The list footer: rows-per-page selector pinned left, pager pushed right.
+ * Always rendered (even on a single page) so the size is always changeable. */
+.list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+
+.per-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.per-page select {
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
 /* ---- utilities ------------------------------------------------------- */
 
 .muted {
