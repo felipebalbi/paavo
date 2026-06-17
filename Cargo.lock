@@ -2360,7 +2360,6 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "fuzzy-matcher",
  "paavo-db",
  "paavo-proto",
  "parking_lot",
