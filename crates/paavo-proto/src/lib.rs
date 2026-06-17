@@ -19,6 +19,7 @@ mod job;
 mod log;
 mod page;
 mod schedule;
+mod stats;
 mod stream;
 
 pub use board::{BoardHealth, BoardSelector, BoardSpec, BoardView, ProbeSelector};
@@ -30,4 +31,5 @@ pub use job::{
 pub use log::{LogFrame, LogLevel};
 pub use page::Page;
 pub use schedule::ScheduleView;
+pub use stats::{BoardHealthCounts, DashboardOverview, JobStateCounts};
 pub use stream::{JobPhase, WireMessage};
