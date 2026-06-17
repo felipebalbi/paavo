@@ -136,7 +136,33 @@ async fn dashboard_reports_sql_counts_recent_jobs_and_fleet() {
     assert_eq!(ov.recent_jobs[0].submitter, "bob");
     assert_eq!(ov.recent_jobs[1].submitter, "alice");
 
-    // Fleet slice: quarantined board leads.
-    assert!(!ov.fleet.is_empty());
+    // Fleet slice: both boards present, quarantined leads.
+    assert_eq!(ov.fleet.len(), 2);
     assert_eq!(ov.fleet[0].spec.id, "a-quarantined");
+}
+
+#[tokio::test]
+async fn dashboard_counts_are_uncapped_while_recent_jobs_are_capped() {
+    let (_dir, rw, app) = app(Duration::from_millis(20));
+
+    // Seed more submitted jobs than the recent-jobs display cap (8).
+    for i in 0..10 {
+        JobRow::insert(
+            rw.raw_conn(),
+            &new_job(JobId::new(), &format!("user{i}")),
+            1000 + i as i64,
+        )
+        .unwrap();
+    }
+
+    // The in-memory index holds every job but the handler caps the
+    // recent-activity slice at RECENT_JOBS (8); poll until it stabilises
+    // at 8 (it can never reach 10).
+    let ov = wait_for_recent(&app, 8).await;
+
+    // Counts are EXACT, UNCAPPED SQL aggregates over the whole table...
+    assert_eq!(ov.jobs.submitted, 10);
+    assert_eq!(ov.jobs.queue(), 10);
+    // ...while the recent-activity list is the capped index slice.
+    assert_eq!(ov.recent_jobs.len(), 8);
 }
