@@ -77,6 +77,15 @@ async fn main() -> Result<()> {
         job_logs: JobLogsBroker::new(),
     };
 
+    // Seed the `schedule` table from `scheduler.nightly_cron` so
+    // paavo-web's /schedule page shows the registered cron immediately,
+    // rather than staying empty until the first nightly actually fires.
+    // Mirrors the boards.toml → `board` seed above: config is the source
+    // of truth, paavod is the single writer. Idempotent — the upsert
+    // COALESCEs the trigger/complete timestamps, so a restart preserves
+    // firing history while picking up any edit to nightly_cron.
+    paavod::cron::seed_schedule(&state).context("seeding schedule row at startup")?;
+
     // Runner selection: production uses RealRunner (see
     // `paavod::real_runner`; M7.4-7.6 wire the probe-rs adapter).
     // Dev / CI can set PAAVO_FAKE_RUNNER=1 to use a FakeRunner that

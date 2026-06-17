@@ -3,6 +3,11 @@
 //! `[[corpus]]`, `cargo_update` threaded into `JobRow.cargo_update_packages`,
 //! `last_completed_at` only stamped on successful enqueues, schedule
 //! row updated on every fire.
+//!
+//! Also covers startup seeding: `seed_schedule` registers the configured
+//! `nightly_cron` in the `schedule` table at boot so paavo-web's
+//! `/schedule` page shows it immediately, without waiting for the first
+//! nightly fire.
 
 use paavo_db::Db;
 use paavo_proto::{BoardHealth, BoardSpec, JobSource, ProbeSelector};
@@ -83,6 +88,81 @@ fn make_state(corpus: Vec<CorpusEntry>, state_root: &std::path::Path) -> AppStat
         build_cancel: paavod::cancellation::BuildCancelRegistry::default(),
         job_logs: JobLogsBroker::new(),
     }
+}
+
+#[tokio::test]
+async fn seed_schedule_registers_nightly_row_from_config() {
+    // The bug: until the nightly cron actually fires, the `schedule`
+    // table is empty and paavo-web's /schedule page shows nothing.
+    // `seed_schedule` must register the configured cron at startup.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(vec![], &tmp.path().join("state"));
+
+    // Precondition: no cron has fired, so the row does not yet exist.
+    let before = paavo_db::ScheduleRow::get(state.db.lock().raw_conn(), "nightly").unwrap_err();
+    assert!(
+        matches!(before, paavo_db::DbError::NotFound { .. }),
+        "schedule row should not exist before seeding"
+    );
+
+    paavod::cron::seed_schedule(&state).unwrap();
+
+    let row = paavo_db::ScheduleRow::get(state.db.lock().raw_conn(), "nightly").unwrap();
+    assert_eq!(row.cron, "0 0 19 * * *");
+    assert!(row.enabled);
+    assert!(
+        row.last_triggered_at.is_none(),
+        "a freshly seeded schedule has never fired"
+    );
+    assert!(
+        row.last_completed_at.is_none(),
+        "a freshly seeded schedule has never completed"
+    );
+}
+
+#[tokio::test]
+async fn seed_schedule_preserves_history_and_refreshes_cron() {
+    // A restart re-seeds the schedule. The re-seed must REFRESH the
+    // cron/enabled (so edits to nightly_cron land) but PRESERVE any
+    // last_triggered_at / last_completed_at history from prior fires —
+    // i.e. seed must pass NULL timestamps so upsert's COALESCE keeps
+    // the existing values.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus_root = tmp.path().join("mcxa266");
+    write_test_crate(&corpus_root, "test-a");
+
+    let state = make_state(
+        vec![CorpusEntry {
+            name: "test-corpus".into(),
+            kind: "mcxa266".into(),
+            path: corpus_root,
+            cargo_update: vec![],
+        }],
+        &tmp.path().join("state"),
+    );
+
+    // Simulate a nightly fire that stamps both trigger and completion.
+    paavod::cron::__test_run_once(&state).await.unwrap();
+    let fired = paavo_db::ScheduleRow::get(state.db.lock().raw_conn(), "nightly").unwrap();
+    let triggered = fired.last_triggered_at.expect("fire stamps triggered_at");
+    let completed = fired.last_completed_at.expect("fire stamps completed_at");
+
+    // Restart-time re-seed must not clobber the stamps.
+    paavod::cron::seed_schedule(&state).unwrap();
+
+    let after = paavo_db::ScheduleRow::get(state.db.lock().raw_conn(), "nightly").unwrap();
+    assert_eq!(
+        after.last_triggered_at,
+        Some(triggered),
+        "re-seed must preserve last_triggered_at"
+    );
+    assert_eq!(
+        after.last_completed_at,
+        Some(completed),
+        "re-seed must preserve last_completed_at"
+    );
+    assert_eq!(after.cron, "0 0 19 * * *");
+    assert!(after.enabled);
 }
 
 #[tokio::test]
