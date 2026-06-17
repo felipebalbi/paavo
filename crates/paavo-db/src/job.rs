@@ -261,28 +261,6 @@ impl JobRow {
         Ok(rows)
     }
 
-    /// Lightweight projection feeding paavo-web's in-memory jobs index.
-    /// Only the columns the list/search need; newest-first.
-    ///
-    /// Returns [`paavo_proto::JobListItem`] rows rather than full
-    /// [`JobRow`]s so the web viewer can hold the entire jobs index in
-    /// memory cheaply (no JSON-encoded selector/outcome/path columns).
-    /// Same ordering as `list_recent` — `submitted_at DESC, id DESC` —
-    /// so ties on the same millisecond stay deterministic via the
-    /// monotonic ULID id.
-    pub fn list_index(conn: &Connection) -> Result<Vec<paavo_proto::JobListItem>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, state, priority, submitter, board_id, submitted_at
-             FROM job ORDER BY submitted_at DESC, id DESC",
-        )?;
-        let rows = stmt
-            .query_map([], index_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
     /// One page of fuzzy-search results, ranked by `fuzzy_score`. `q` is
     /// matched as a case-insensitive subsequence over the lowercased
     /// `id + submitter + state + board_id` haystack; ranking uses the same
@@ -417,7 +395,7 @@ impl JobRow {
     /// it through every page request, so a job submitted mid-scroll
     /// cannot shift rows across page boundaries. `None` means "no pin"
     /// (newest snapshot, used for the very first page). Ordering matches
-    /// `list_recent`/`list_index`: `submitted_at DESC, id DESC`.
+    /// `list_recent`/`list_index_page`: `submitted_at DESC, id DESC`.
     pub fn list_page(
         conn: &Connection,
         as_of: Option<i64>,
@@ -737,8 +715,9 @@ fn state_from_str(s: &str) -> Result<JobState> {
     })
 }
 
-/// Map a row from the `list_index` projection to a
-/// [`paavo_proto::JobListItem`]. Follows the same double-`Result` shape
+/// Map a row from the lightweight index projection (`list_index_page` /
+/// `search_index_page`) to a [`paavo_proto::JobListItem`]. Follows the
+/// same double-`Result` shape
 /// as `from_row` (outer = rusqlite row error, inner = decode error) so
 /// the caller can collect both layers in one chain.
 fn index_row(r: &Row<'_>) -> rusqlite::Result<Result<paavo_proto::JobListItem>> {

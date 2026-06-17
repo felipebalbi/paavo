@@ -74,11 +74,6 @@ impl WebDb {
         ScheduleRow::list_all(self.inner.lock().raw_conn())
     }
 
-    /// Lightweight jobs index projection (id/state/priority/submitter/board/ts).
-    pub fn jobs_index(&self) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
-        paavo_db::JobRow::list_index(self.inner.lock().raw_conn())
-    }
-
     /// One page of fuzzy-search results (lightweight projection), ranked.
     pub fn jobs_search_page(
         &self,
