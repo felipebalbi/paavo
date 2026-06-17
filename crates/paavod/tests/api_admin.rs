@@ -352,3 +352,32 @@ async fn purge_with_boards_true_deletes_boards_and_clears_inventory() {
         "in-memory inventory cache should be empty after board purge"
     );
 }
+
+#[tokio::test]
+async fn purge_with_boards_false_preserves_boards() {
+    let (_sd, s) = state_with_dir();
+    let spec = seed_board(&s);
+    let app = build_router(s.clone());
+    let resp = post_empty(app, "/admin/purge?boards=false").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let db = s.db.lock();
+    let board_row = paavo_db::BoardRow::get(db.raw_conn(), &spec.id).unwrap();
+    assert_eq!(
+        board_row.spec.id, spec.id,
+        "boards must survive ?boards=false"
+    );
+}
+
+#[tokio::test]
+async fn purge_with_boards_still_refuses_409_when_job_is_running() {
+    let (_sd, s) = state_with_dir();
+    let spec = seed_board(&s);
+    let _id = seed_in_flight_job(&s);
+    let app = build_router(s.clone());
+    let resp = post_empty(app, "/admin/purge?boards=true").await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // The in-flight gate runs before any deletion: the board survives.
+    let db = s.db.lock();
+    let board_row = paavo_db::BoardRow::get(db.raw_conn(), &spec.id).unwrap();
+    assert_eq!(board_row.spec.id, spec.id, "board wiped despite 409");
+}
