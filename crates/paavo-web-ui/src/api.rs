@@ -68,18 +68,25 @@ pub async fn job_log(id: &str, offset: u32) -> Result<Vec<LogFrame>, String> {
     .await
 }
 
-/// `GET /api/boards?page=&per_page=` — one page of the board fleet with an
-/// explicit page size. The general form backing [`boards`]; the dashboard
-/// calls it with `per_page=100` (the server's clamp ceiling) so its "boards
-/// healthy" tally covers the whole fleet in one request.
-pub async fn boards_page(page: u32, per_page: u32) -> Result<Page<BoardView>, String> {
-    fetch_json(&format!("/api/boards?page={page}&per_page={per_page}")).await
+/// `GET /api/boards?page=&per_page=&q=` — one page of the (optionally
+/// filtered) board fleet with an explicit page size. The general form
+/// backing [`boards`]; the dashboard calls it with `per_page=100` (the
+/// server's clamp ceiling) and a blank `q` so its "boards healthy" tally
+/// covers the whole fleet in one request. A non-blank `q` narrows by an
+/// `id`/`kind` substring matched server-side across the *whole* table.
+pub async fn boards_page(page: u32, per_page: u32, q: &str) -> Result<Page<BoardView>, String> {
+    fetch_json(&format!(
+        "/api/boards?page={page}&per_page={per_page}&q={}",
+        encode(q)
+    ))
+    .await
 }
 
-/// `GET /api/boards?page=&per_page=20` — one page of the board fleet at the
-/// default 20-row page size. Thin wrapper over [`boards_page`].
-pub async fn boards(page: u32) -> Result<Page<BoardView>, String> {
-    boards_page(page, 20).await
+/// `GET /api/boards?page=&per_page=20&q=` — one page of the (optionally
+/// filtered) board fleet at the default 20-row page size. Thin wrapper
+/// over [`boards_page`].
+pub async fn boards(page: u32, q: &str) -> Result<Page<BoardView>, String> {
+    boards_page(page, 20, q).await
 }
 
 /// `GET /api/schedules?page=&per_page=20` — one page of cron schedules.

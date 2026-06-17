@@ -11,11 +11,17 @@ use axum::Json;
 use paavo_proto::{BoardView, Page};
 use std::collections::HashMap;
 
-/// `GET /api/boards?page=&per_page=` — paginated boards (id ASC).
+/// `GET /api/boards?page=&per_page=&q=` — paginated boards (id ASC),
+/// optionally filtered by a fleet-wide `id`/`kind` substring (`q`).
 ///
 /// Takes the full [`AppState`] because it needs both the DB handle
 /// (the rows) and the live state (the current boards revision). There
 /// is no `as_of` cursor or `new_count` for boards, so both are 0/None.
+///
+/// `q` is matched server-side against the whole `board` table (not just
+/// the current page) so the SPA's fleet filter finds a board no matter
+/// which page it would otherwise land on. A blank/whitespace `q` is
+/// treated as no filter.
 pub async fn list(
     State(s): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
@@ -30,13 +36,15 @@ pub async fn list(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
         .clamp(1, 100);
+    // Fleet filter: trim and drop empties so `?q=` behaves like no filter.
+    let filter = q.get("q").map(|s| s.trim()).filter(|s| !s.is_empty());
     let err = |e: paavo_db::DbError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    let total = s.db.boards_count().map_err(err)?;
+    let total = s.db.boards_count(filter).map_err(err)?;
     // saturating_mul: `page` is unclamped above, so a hostile
     // `?page=4000000000` would overflow u32 (panic in debug, wrap in
     // release). Saturating to u32::MAX yields an empty page instead.
     let rows =
-        s.db.boards_page((page - 1).saturating_mul(per_page), per_page)
+        s.db.boards_page(filter, (page - 1).saturating_mul(per_page), per_page)
             .map_err(err)?;
     Ok(Json(Page {
         items: rows.into_iter().map(board_view).collect(),

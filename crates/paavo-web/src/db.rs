@@ -94,18 +94,23 @@ impl WebDb {
         paavo_db::JobRow::count(self.inner.lock().raw_conn(), as_of)
     }
 
-    /// Page of boards (id ASC).
+    /// Page of boards (id ASC), optionally narrowed to an `id`/`kind`
+    /// substring (see [`paavo_db::BoardRow::list_page`]). The filter is
+    /// applied across the whole `board` table server-side, so the SPA's
+    /// fleet search finds matches regardless of which page they fall on.
     pub fn boards_page(
         &self,
+        filter: Option<&str>,
         offset: u32,
         limit: u32,
     ) -> paavo_db::Result<Vec<paavo_db::BoardRow>> {
-        paavo_db::BoardRow::list_page(self.inner.lock().raw_conn(), offset, limit)
+        paavo_db::BoardRow::list_page(self.inner.lock().raw_conn(), filter, offset, limit)
     }
 
-    /// Total board count.
-    pub fn boards_count(&self) -> paavo_db::Result<u64> {
-        paavo_db::BoardRow::count(self.inner.lock().raw_conn())
+    /// Total board count, optionally filtered exactly like
+    /// [`Self::boards_page`] so the page count reflects the filtered set.
+    pub fn boards_count(&self, filter: Option<&str>) -> paavo_db::Result<u64> {
+        paavo_db::BoardRow::count(self.inner.lock().raw_conn(), filter)
     }
 
     /// Page of schedules (id ASC).

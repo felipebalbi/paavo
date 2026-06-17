@@ -67,18 +67,60 @@ fn list_page_and_count_paginate_by_id_ascending() {
         BoardRow::insert(db.raw_conn(), &spec, now).unwrap();
     }
 
-    assert_eq!(BoardRow::count(db.raw_conn()).unwrap(), 3);
+    assert_eq!(BoardRow::count(db.raw_conn(), None).unwrap(), 3);
 
     // First page of two, id-ascending.
-    let page = BoardRow::list_page(db.raw_conn(), 0, 2).unwrap();
+    let page = BoardRow::list_page(db.raw_conn(), None, 0, 2).unwrap();
     assert_eq!(page.len(), 2);
     assert_eq!(page[0].spec.id, "mcxa266-01");
     assert_eq!(page[1].spec.id, "mcxa266-02");
 
     // Second page picks up the remaining row after the offset.
-    let page2 = BoardRow::list_page(db.raw_conn(), 2, 2).unwrap();
+    let page2 = BoardRow::list_page(db.raw_conn(), None, 2, 2).unwrap();
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].spec.id, "mcxa266-03");
+}
+
+#[test]
+fn list_page_and_count_filter_by_id_or_kind_substring() {
+    // Server-side fleet filter: `Some(q)` narrows to boards whose id OR
+    // kind contains `q` (case-insensitive substring) across the WHOLE
+    // table, not just one page. `Some("")` is treated as no filter.
+    let db = fresh_db();
+    let now = Utc::now().timestamp_millis();
+    for (id, kind) in [
+        ("mcxa266-01", "mcxa266"),
+        ("mcxa266-02", "mcxa266"),
+        ("rp2040-01", "rp2040"),
+    ] {
+        let mut spec = sample_board();
+        spec.id = id.into();
+        spec.kind = kind.into();
+        BoardRow::insert(db.raw_conn(), &spec, now).unwrap();
+    }
+
+    // `rp2040` matches only the single rp2040 board (by id and kind).
+    assert_eq!(BoardRow::count(db.raw_conn(), Some("rp2040")).unwrap(), 1);
+
+    // `mcxa266` matches the two mcxa266 boards across the whole table —
+    // a generous limit proves the filter, not the page, does the work.
+    let hits = BoardRow::list_page(db.raw_conn(), Some("mcxa266"), 0, 10).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].spec.id, "mcxa266-01");
+    assert_eq!(hits[1].spec.id, "mcxa266-02");
+
+    // The match is case-insensitive (ASCII LIKE) for both id and kind.
+    assert_eq!(BoardRow::count(db.raw_conn(), Some("RP2040")).unwrap(), 1);
+
+    // An empty / whitespace filter behaves exactly like no filter.
+    assert_eq!(BoardRow::count(db.raw_conn(), Some("")).unwrap(), 3);
+    assert_eq!(BoardRow::count(db.raw_conn(), Some("   ")).unwrap(), 3);
+    assert_eq!(
+        BoardRow::list_page(db.raw_conn(), Some(""), 0, 10)
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[test]

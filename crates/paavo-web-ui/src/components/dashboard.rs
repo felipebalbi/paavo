@@ -37,7 +37,7 @@ pub fn Dashboard() -> impl IntoView {
     // boards bump.
     let boards_res = LocalResource::new(move || {
         let _ = live.boards.get();
-        async move { api::boards_page(1, 100).await }
+        async move { api::boards_page(1, 100, "").await }
     });
 
     view! {
