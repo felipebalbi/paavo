@@ -1,1 +1,417 @@
-body { font-family: system-ui; }
+/* paavo-web UI — fluid, responsive, semantic stylesheet.
+ *
+ * No fixed pixel dimensions for layout/sizing: every width, height, gap, font
+ * size, and breakpoint is expressed in rem / % / vw / clamp() / fr / minmax so
+ * the UI scales with the viewport and honours the user's root font size. Only
+ * hairline borders use 1px. Two palettes live in CSS custom properties under
+ * :root (light) and :root.dark (dark); the theme toggle flips the `dark` class
+ * on <html> (see src/theme.rs). */
+
+/* ---- palette tokens -------------------------------------------------- */
+
+:root {
+  color-scheme: light;
+
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --text: #1b2430;
+  --text-muted: #5c6776;
+  --border: #dde3ea;
+  --accent: #2f6feb;
+  --accent-contrast: #ffffff;
+
+  /* badge hues (state colours), tuned for the light palette */
+  --green: #1a7f4b;
+  --red: #c2362f;
+  --blue: #2f6feb;
+  --amber: #a96a0b;
+  --grey: #5c6776;
+
+  --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans-font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --radius: 0.7rem;
+}
+
+:root.dark {
+  color-scheme: dark;
+
+  --bg: #0e1217;
+  --surface: #161b22;
+  --surface-2: #1f2630;
+  --text: #e6eaf0;
+  --text-muted: #97a2b1;
+  --border: #2a323d;
+  --accent: #5b9bff;
+  --accent-contrast: #0e1217;
+
+  --green: #3fb27a;
+  --red: #e5675f;
+  --blue: #5b9bff;
+  --amber: #e0a23c;
+  --grey: #97a2b1;
+}
+
+/* ---- base / reset ---------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* Keep the root font size at the user's preference for a true rem scale. */
+  font-size: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--sans-font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+}
+
+h1 {
+  font-size: clamp(1.4rem, 1rem + 1.6vw, 1.9rem);
+  line-height: 1.2;
+  margin: 0 0 0.75rem;
+}
+
+/* Vertical rhythm between top-level blocks in the content area. */
+main > * + * {
+  margin-top: clamp(0.875rem, 2vw, 1.5rem);
+}
+
+/* ---- app layout (sidebar + topbar + main) ---------------------------- */
+
+.app {
+  display: grid;
+  grid-template-columns: clamp(8rem, 14vw, 12rem) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas:
+    "sidebar topbar"
+    "sidebar main";
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.sidebar {
+  grid-area: sidebar;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem 0.75rem;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+  font-size: clamp(1.1rem, 1rem + 0.6vw, 1.35rem);
+  letter-spacing: 0.02em;
+  color: var(--text);
+  padding: 0.25rem 0.6rem 1rem;
+}
+
+.sidebar a {
+  display: block;
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.5rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: 500;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.sidebar a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* leptos_router's <A> sets aria-current="page" on the active link (it has no
+ * active_class prop in 0.7); `.active` is kept for any manual use. */
+.sidebar a[aria-current="page"],
+.sidebar a.active {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem clamp(1rem, 3vw, 2rem);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.breadcrumb {
+  font-weight: 600;
+  color: var(--text);
+}
+
+main {
+  grid-area: main;
+  padding: clamp(1rem, 3vw, 2rem);
+  overflow: auto;
+}
+
+/* ---- theme toggle ---------------------------------------------------- */
+
+.theme-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+}
+
+.theme-toggle:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* ---- cards & stats --------------------------------------------------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: clamp(0.875rem, 2vw, 1.25rem);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: clamp(0.75rem, 2vw, 1.25rem);
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.stat .stat-value {
+  font-size: clamp(1.5rem, 1rem + 3vw, 2.25rem);
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.stat .stat-label {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+/* ---- tables ---------------------------------------------------------- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.table tbody tr:hover {
+  background: var(--surface-2);
+}
+
+/* ---- badges (job/board state) --------------------------------------- */
+
+.badge {
+  --badge-color: var(--grey);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.15em 0.6em;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--badge-color);
+  background: color-mix(in srgb, var(--badge-color) 14%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--badge-color) 35%, transparent);
+  white-space: nowrap;
+}
+
+.badge.is-passed { --badge-color: var(--green); }
+.badge.is-failed { --badge-color: var(--red); }
+.badge.is-running { --badge-color: var(--blue); }
+.badge.is-building { --badge-color: var(--amber); }
+.badge.is-timedout { --badge-color: var(--amber); }
+.badge.is-awaiting { --badge-color: var(--grey); }
+.badge.is-submitted { --badge-color: var(--grey); }
+.badge.is-aborted { --badge-color: var(--grey); }
+
+/* Running jobs get a subtly pulsing dot. */
+.badge.is-running::before {
+  content: "";
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.6);
+  }
+}
+
+/* ---- pills, inputs, log pane ---------------------------------------- */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.search,
+.filter {
+  width: 100%;
+  max-width: 32rem;
+  padding: 0.55rem 0.85rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.search:focus,
+.filter:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.search::placeholder,
+.filter::placeholder {
+  color: var(--text-muted);
+}
+
+.logpane {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.85rem 1rem;
+  font-family: var(--mono-font);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+/* ---- utilities ------------------------------------------------------- */
+
+.muted {
+  color: var(--text-muted);
+}
+
+.mono {
+  font-family: var(--mono-font);
+  font-size: 0.95em;
+}
+
+/* ---- responsive: collapse sidebar to a top row, scroll tables -------- */
+
+@media (max-width: 48rem) {
+  .app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "sidebar"
+      "topbar"
+      "main";
+  }
+
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.25rem;
+    overflow-x: auto;
+    padding: 0.5rem 0.75rem;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .brand {
+    padding: 0.25rem 0.6rem;
+  }
+
+  .sidebar a {
+    white-space: nowrap;
+  }
+
+  /* Let wide tables scroll horizontally instead of overflowing the viewport. */
+  .table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+/* ---- motion preferences --------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .badge.is-running::before {
+    animation: none;
+  }
+
+  * {
+    transition: none !important;
+  }
+}

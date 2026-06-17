@@ -53,6 +53,14 @@ web-sys = { version = "=0.3.77", features = [
     "Storage",
     "Window",
     "HtmlInputElement",
+    # Theme toggle: read/write the `dark` class on <html> and read the OS
+    # colour-scheme preference. Document/Element/DomTokenList back
+    # document.documentElement.classList.{add,remove}; MediaQueryList backs
+    # window.matchMedia("(prefers-color-scheme: dark)").
+    "Document",
+    "Element",
+    "DomTokenList",
+    "MediaQueryList",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
