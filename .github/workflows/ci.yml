@@ -48,7 +48,32 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       - name: Install system deps for probe-rs
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      # Build + lint the WASM UI BEFORE the workspace gate. paavo-web embeds
+      # ../paavo-web-ui/dist via rust-embed, so building it here means the
+      # `cargo test --workspace` step below ships the REAL Leptos bundle (not the
+      # "UI not built" placeholder), and a broken or unformatted UI fails CI here
+      # instead of degrading silently. trunk is installed as a pinned, checksum-
+      # verified prebuilt binary — we deliberately do NOT `cargo install` it,
+      # because that would compile trunk under the 1.95 pin + RUSTFLAGS=-Dwarnings
+      # (its MSRV may exceed 1.95). The wasm32 target + clippy/rustfmt components
+      # come from the toolchain step above.
+      - name: Install trunk (prebuilt, pinned + checksum-verified)
+        run: |
+          url=https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL "$url" -o /tmp/trunk.tar.gz
+          echo "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b  /tmp/trunk.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trunk.tar.gz -C "$HOME/.cargo/bin" trunk
+      - name: Build the WASM UI bundle (embedded by paavo-web)
+        run: cd crates/paavo-web-ui && trunk build --release
+      - name: Lint the WASM UI crate (fmt + clippy)
+        run: |
+          cd crates/paavo-web-ui
+          cargo fmt -- --check
+          cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo test --workspace

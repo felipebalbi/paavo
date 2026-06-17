@@ -98,19 +98,24 @@ impl PaavodClient {
     }
 }
 
-/// Combined router state: the read-only sqlite handle the pages
-/// already use, plus the upstream paavod HTTP client used by the SSE
-/// proxy. Each page handler can keep its existing
-/// `State<WebDb>` extractor thanks to `FromRef` (declared in
-/// `app.rs`).
+/// Combined router state: the read-only sqlite handle the JSON API
+/// reads, the upstream paavod HTTP client used by the SSE log proxy,
+/// and the process-local live state (poller-maintained jobs index +
+/// per-resource revisions) behind `/api/jobs` and `/api/events`.
+///
+/// Handlers extract whichever slice they need via `FromRef` (declared
+/// in `app.rs`): `State<WebDb>`, `State<PaavodClient>`,
+/// `State<LiveState>`, or the whole `State<AppState>`.
 #[derive(Clone)]
 pub struct AppState {
     /// Read-only sqlite handle.
     pub db: crate::db::WebDb,
-    /// paavod HTTP client (for the SSE proxy; pages don't use it).
+    /// paavod HTTP client (for the SSE log proxy; JSON handlers don't
+    /// use it).
     pub paavod: PaavodClient,
-    /// Dashboard live-feed channel (poller → SSE fan-out).
-    pub feed: crate::feed::JobFeed,
+    /// Process-local live state: jobs index + revision watch channel,
+    /// shared with the background poller.
+    pub live: crate::index::LiveState,
 }
 
 /// `GET /api/jobs/:id/stream` — open a streaming connection to

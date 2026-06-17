@@ -245,3 +245,34 @@ fn list_all_returns_rows_ordered_by_id_ascending() {
     let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["hourly", "nightly", "weekly"]);
 }
+
+#[test]
+fn list_page_and_count_paginate_by_id_ascending() {
+    let db = fresh_db();
+    // Insert out of order so the ORDER BY id ASC actually matters.
+    for id in ["weekly", "nightly"] {
+        ScheduleRow::upsert(
+            db.raw_conn(),
+            &ScheduleRow {
+                id: id.into(),
+                cron: "0 0 * * *".into(),
+                enabled: true,
+                last_triggered_at: None,
+                last_completed_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    assert_eq!(ScheduleRow::count(db.raw_conn()).unwrap(), 2);
+
+    // First page of one, id-ascending → "nightly".
+    let page = ScheduleRow::list_page(db.raw_conn(), 0, 1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "nightly");
+
+    // Second page picks up "weekly" after the offset.
+    let page2 = ScheduleRow::list_page(db.raw_conn(), 1, 1).unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].id, "weekly");
+}

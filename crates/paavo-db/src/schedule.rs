@@ -92,6 +92,29 @@ impl ScheduleRow {
         Ok(rows)
     }
 
+    /// Page of schedules ordered by id ascending. The schedule set is
+    /// tiny and id-stable, so a plain `LIMIT/OFFSET` on the same `id ASC`
+    /// order as `list_all` is sufficient. Decodes via `row_to_schedule`,
+    /// which is single-`Result` (no JSON/enum columns), so there is no
+    /// inner decode layer to collect.
+    pub fn list_page(conn: &Connection, offset: u32, limit: u32) -> Result<Vec<ScheduleRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, cron, enabled, last_triggered_at, last_completed_at
+             FROM schedule ORDER BY id ASC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], row_to_schedule)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Total schedule count. Paired with `list_page` so paavo-web can
+    /// render the total page count for the schedules list.
+    pub fn count(conn: &Connection) -> Result<u64> {
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM schedule", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
     /// Apply a partial update; fields set to `None` are not touched.
     pub fn apply_update(conn: &Connection, id: &str, u: &ScheduleUpdate) -> Result<()> {
         if let Some(t) = u.last_triggered_at {

@@ -7,7 +7,9 @@ itself.)
 
 **paavo** is a self-hosted Linux **hardware-in-the-loop (HIL) test runner**
 for the `embassy-mcxa` HAL (and any future embassy chip wired into the lab).
-It is a Rust workspace of 10 crates producing 3 binaries:
+It is a Rust workspace of 10 crates — plus a workspace-*excluded* `wasm32` UI
+crate (`paavo-web-ui`, the Leptos CSR SPA, embedded into `paavo-web`) —
+producing 3 binaries:
 
 - **`paavod`** — the daemon. Owns the job queue, the board fleet, the SQLite
   database, the build sandbox, and the HTTP API.
@@ -96,6 +98,14 @@ PAAVO_HOST=http://127.0.0.1:8090 cargo run -p paavo-cli -- jobs
 
 # Serve the read-only web UI
 cargo run -p paavo-web -- --config sample-paavo.toml
+
+# Build the WASM UI (Leptos SPA → crates/paavo-web-ui/dist), embedded into
+# paavo-web at compile time. One-time prereqs: the wasm target + trunk.
+#   rustup target add wasm32-unknown-unknown
+#   cargo install trunk            # or: cargo binstall trunk (prebuilt, faster)
+just build-ui                          # = cd crates/paavo-web-ui && trunk build --release
+# paavo-web still compiles WITHOUT a built dist/ (rust-embed #[allow_missing]
+# serves a "UI not built" placeholder); run build-ui to embed the real SPA.
 ```
 
 **System dependency:** `probe-rs` needs `libudev-dev` and `pkg-config` on Linux
@@ -200,7 +210,7 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
 | **paavo-core** | Scheduler + policy glue (enqueue, quarantine, cancel, build-cache bridge). **No HTTP, no async runtime.** | proto, db, build, runner | `src/scheduler.rs`, `src/enqueue.rs`, `src/quarantine.rs`, `src/build_cache.rs` |
 | **paavod** | The daemon. The **only** crate with axum. Two-stage dispatch, routes, config, cron, drain, frame sink. Largest crate. | proto, db, core, build, runner, probe | `src/main.rs`, `src/dispatch.rs`, `src/app.rs`, `src/routes/`, `src/config.rs` |
 | **paavo-cli** | Developer HTTP client (clap). The only user-facing TUI. | proto *(dev-only: paavod, paavo-db for integration tests)* | `src/cli.rs`, `src/cmd_run.rs`, `src/cmd_new.rs`, `src/client.rs` |
-| **paavo-web** | Read-only web viewer. Reads SQLite RO; proxies the daemon's NDJSON stream to browser SSE. | proto, db | `src/app.rs`, `src/proxy.rs`, `src/feed.rs`, `src/pages/` |
+| **paavo-web** | Read-only web backend for the WASM SPA. Reads SQLite RO; serves a JSON/SSE API and embeds the `paavo-web-ui` (Leptos CSR) bundle; proxies the daemon's NDJSON stream to browser SSE. | proto, db | `src/app.rs`, `src/api/`, `src/proxy.rs`, `src/index.rs`, `src/embed.rs` |
 
 ---
 
@@ -236,12 +246,18 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
 
 ## Landmines & gotchas
 
-- **Workspace-excluded crates won't build with the host toolchain.** These are
-  intentionally outside `[workspace] members` (see `Cargo.toml` `exclude`):
-  `tests/fixtures/smoke-crate`, `soak-tests/`, `dev/probe-rs-spike`,
-  `dev/spike-fixture-mcxa266`. The fixtures cross-compile to
-  `thumbv8m.main-none-eabihf`. `cargo test --workspace` does **not** touch
-  them; don't "fix" them into the workspace.
+- **Workspace-excluded crates won't build with the host toolchain** (with one
+  exception, noted below). These are intentionally outside `[workspace] members`
+  (see `Cargo.toml` `exclude`): `tests/fixtures/smoke-crate`, `soak-tests/`,
+  `dev/probe-rs-spike`, `dev/spike-fixture-mcxa266`, `crates/paavo-web-ui`, and
+  `dev/seed-demo`. The fixtures cross-compile to `thumbv8m.main-none-eabihf`;
+  `crates/paavo-web-ui` (the Leptos SPA) cross-compiles to
+  `wasm32-unknown-unknown` and is built by `trunk` (`just build-ui`).
+  `dev/seed-demo` is the **exception** — a standalone *host* binary (links
+  `paavo-db` to flood a dev SQLite DB with fake boards + jobs for UI
+  stress-testing) excluded only to keep it out of the workspace build, not
+  because of a target mismatch. `cargo test --workspace` does **not** touch any
+  of them; don't "fix" them into the workspace.
 - **`.cargo/config.toml` inside test crates is load-bearing.** `paavo-cli run`
   strips `target/`, `.git/`, and `Cargo.lock` from the tar but **keeps
   `.cargo/config.toml`** — it sets the defmt log level so the info-level
@@ -251,9 +267,15 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
   string) followed by `cortex_m::asm::bkpt()`. A bkpt without a preceding
   `Test OK` is classified as a test error.
 - **Known doc/code drift — trust the code:**
-  - `paavo-web` is **plain axum + server-rendered HTML with baked CSS/JS**
-    (`format!` + `include_str!`), **not Leptos**, despite what the 2026-06-09
-    master spec says.
+  - `paavo-web` is a **JSON/SSE API backend that embeds the Leptos CSR
+    WASM SPA** (`paavo-web-ui`) via `rust-embed` over
+    `../paavo-web-ui/dist`, **not** server-rendered HTML. The `dist/`
+    bundle is git-ignored and built out of band (`trunk build` /
+    `just build-ui`). The `rust-embed` derive uses `#[allow_missing =
+    true]`, so `paavo-web` still **compiles without `dist/`** (every
+    request then serves a "UI not built" placeholder) — a fresh
+    checkout/CI passes `cargo build/test --workspace` without the UI,
+    but you must run `just build-ui` to serve the real SPA.
   - `paavo-meta` is **self-contained `macro_rules!` macros**, not a
     re-export of any upstream `*-meta` crate.
   - `insta`, `proptest`, and `mockall` are pinned in

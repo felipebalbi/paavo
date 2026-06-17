@@ -60,7 +60,7 @@ fn paavo_web_router(paavod_addr: SocketAddr) -> (tempfile::TempDir, axum::Router
     let state = AppState {
         db,
         paavod,
-        feed: paavo_web::feed::JobFeed::new(paavo_web::feed::EMPTY_PAYLOAD.to_string()),
+        live: paavo_web::index::LiveState::new(),
     };
     let app = paavo_web::app::build_router(state);
     (dir, app)

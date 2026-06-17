@@ -57,8 +57,73 @@ impl WebDb {
         paavo_proto::LogFrame::list(self.inner.lock().raw_conn(), id, 0, limit)
     }
 
+    /// A page of log frames for a job (oldest first), starting at
+    /// `offset`. Backs `GET /api/jobs/:id/log`, which the SPA uses to
+    /// backfill scrollback before attaching the live SSE tail.
+    pub fn job_logs_page(
+        &self,
+        id: &paavo_proto::JobId,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_proto::LogFrame>> {
+        paavo_proto::LogFrame::list(self.inner.lock().raw_conn(), id, offset, limit)
+    }
+
     /// All schedule rows.
     pub fn all_schedules(&self) -> paavo_db::Result<Vec<ScheduleRow>> {
         ScheduleRow::list_all(self.inner.lock().raw_conn())
+    }
+
+    /// Lightweight jobs index projection (id/state/priority/submitter/board/ts).
+    pub fn jobs_index(&self) -> paavo_db::Result<Vec<paavo_proto::JobListItem>> {
+        paavo_db::JobRow::list_index(self.inner.lock().raw_conn())
+    }
+
+    /// Page of full job rows, optionally pinned to `submitted_at <= as_of`.
+    pub fn jobs_page(
+        &self,
+        as_of: Option<i64>,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::JobRow>> {
+        paavo_db::JobRow::list_page(self.inner.lock().raw_conn(), as_of, offset, limit)
+    }
+
+    /// Count of jobs (optionally `submitted_at <= as_of`).
+    pub fn jobs_count(&self, as_of: Option<i64>) -> paavo_db::Result<u64> {
+        paavo_db::JobRow::count(self.inner.lock().raw_conn(), as_of)
+    }
+
+    /// Page of boards (id ASC), optionally narrowed to an `id`/`kind`
+    /// substring (see [`paavo_db::BoardRow::list_page`]). The filter is
+    /// applied across the whole `board` table server-side, so the SPA's
+    /// fleet search finds matches regardless of which page they fall on.
+    pub fn boards_page(
+        &self,
+        filter: Option<&str>,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::BoardRow>> {
+        paavo_db::BoardRow::list_page(self.inner.lock().raw_conn(), filter, offset, limit)
+    }
+
+    /// Total board count, optionally filtered exactly like
+    /// [`Self::boards_page`] so the page count reflects the filtered set.
+    pub fn boards_count(&self, filter: Option<&str>) -> paavo_db::Result<u64> {
+        paavo_db::BoardRow::count(self.inner.lock().raw_conn(), filter)
+    }
+
+    /// Page of schedules (id ASC).
+    pub fn schedules_page(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> paavo_db::Result<Vec<paavo_db::ScheduleRow>> {
+        paavo_db::ScheduleRow::list_page(self.inner.lock().raw_conn(), offset, limit)
+    }
+
+    /// Total schedule count.
+    pub fn schedules_count(&self) -> paavo_db::Result<u64> {
+        paavo_db::ScheduleRow::count(self.inner.lock().raw_conn())
     }
 }

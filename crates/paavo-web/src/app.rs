@@ -1,18 +1,18 @@
 //! axum router.
 
 use crate::db::WebDb;
+use crate::index::LiveState;
 use crate::proxy::{AppState, PaavodClient};
 use axum::extract::FromRef;
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 
-// FromRef glue: page handlers keep their `State<WebDb>` extractor
-// untouched (no per-page edit needed). The proxy handler extracts
-// `State<AppState>` directly. axum `from_ref`-derives the substate
-// for each request from the parent state at extract time; cloning
-// `WebDb` is just `Arc::clone` and `PaavodClient` is the same.
+// FromRef glue: each handler extracts only the slice of `AppState` it
+// needs. `WebDb` and `PaavodClient` are `Arc`-backed; `LiveState` is a
+// bundle of `Arc`s — all cheap to clone per request. The boards/
+// schedules handlers extract the whole `State<AppState>` (they need DB
+// rows *and* the live revision), which axum supplies via the blanket
+// `FromRef<S> for S`.
 
 impl FromRef<AppState> for WebDb {
     fn from_ref(s: &AppState) -> Self {
@@ -26,86 +26,10 @@ impl FromRef<AppState> for PaavodClient {
     }
 }
 
-impl FromRef<AppState> for crate::feed::JobFeed {
+impl FromRef<AppState> for LiveState {
     fn from_ref(s: &AppState) -> Self {
-        s.feed.clone()
+        s.live.clone()
     }
-}
-
-/// `/static/style.css` — serves the baked-in ef-cyprus + ef-symbiosis
-/// stylesheet. The bytes are pulled in at compile time via
-/// `include_str!` so paavo-web stays a single binary deploy and the
-/// CSS is byte-identical to whatever was committed alongside the code.
-///
-/// Two cache headers:
-/// - `cache-control: public, max-age=86400, must-revalidate` — tell
-///   the browser it's safe to cache for a day; `must-revalidate`
-///   forces a conditional GET on the next visit so we don't serve a
-///   stale CSS for weeks if a user keeps the tab open.
-/// - The HTML shell appends `?v={CARGO_PKG_VERSION}` to the link so a
-///   release-built paavo-web invalidates browser caches mechanically
-///   even if max-age would otherwise miss.
-async fn serve_css() -> impl IntoResponse {
-    const CSS: &str = include_str!("assets/style.css");
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/css; charset=utf-8"),
-            ),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, must-revalidate"),
-            ),
-        ],
-        CSS,
-    )
-}
-
-/// `/static/live-log.js` — serves the EventSource consumer that
-/// drives the live log pane on `/jobs/:id`. Same caching contract
-/// as `/static/style.css`: bake at compile time, year-long cache,
-/// must-revalidate, version-busted via `?v={CARGO_PKG_VERSION}` on
-/// the `<script src=...>` link rendered by `pages::job_detail`.
-async fn serve_live_log_js() -> impl IntoResponse {
-    const JS: &str = include_str!("assets/live-log.js");
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/javascript; charset=utf-8"),
-            ),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, must-revalidate"),
-            ),
-        ],
-        JS,
-    )
-}
-
-/// `/static/dashboard-live.js` — serves the dashboard live-feed
-/// consumer. Same caching contract as `/static/live-log.js`: baked in
-/// at compile time, day-long cache, must-revalidate, version-busted via
-/// `?v={CARGO_PKG_VERSION}` on the `<script src=...>` link.
-async fn serve_dashboard_live_js() -> impl IntoResponse {
-    const JS: &str = include_str!("assets/dashboard-live.js");
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/javascript; charset=utf-8"),
-            ),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, must-revalidate"),
-            ),
-        ],
-        JS,
-    )
 }
 
 /// Build the router from a fully-constructed [`AppState`].
@@ -115,17 +39,21 @@ async fn serve_dashboard_live_js() -> impl IntoResponse {
 /// in-memory sqlite). The single entry point keeps the route
 /// definitions in one place — anything that wants to spin up the
 /// router stays in sync.
+///
+/// Two kinds of route live here:
+/// - the JSON/SSE API (`/api/*`) the WASM SPA fetches from, and
+/// - a catch-all `fallback` that serves the embedded UI bundle (with a
+///   `index.html` SPA fallback). Because the API routes are registered
+///   first, they always win over the asset fallback.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(crate::pages::dashboard::render))
-        .route("/jobs", get(crate::pages::jobs_list::render))
-        .route("/jobs/:id", get(crate::pages::job_detail::render))
-        .route("/boards", get(crate::pages::boards::render))
-        .route("/schedule", get(crate::pages::schedule::render))
-        .route("/static/style.css", get(serve_css))
-        .route("/static/live-log.js", get(serve_live_log_js))
-        .route("/static/dashboard-live.js", get(serve_dashboard_live_js))
+        .route("/api/jobs", get(crate::api::jobs::list))
+        .route("/api/jobs/:id", get(crate::api::jobs::get))
+        .route("/api/jobs/:id/log", get(crate::api::jobs::log))
         .route("/api/jobs/:id/stream", get(crate::proxy::stream_job))
-        .route("/api/dashboard/feed", get(crate::feed::dashboard_feed))
+        .route("/api/boards", get(crate::api::boards::list))
+        .route("/api/schedules", get(crate::api::schedules::list))
+        .route("/api/events", get(crate::api::events::events))
+        .fallback(crate::embed::serve)
         .with_state(state)
 }

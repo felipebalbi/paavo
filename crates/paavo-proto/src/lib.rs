@@ -17,13 +17,17 @@ mod board;
 mod ids;
 mod job;
 mod log;
+mod page;
+mod schedule;
 mod stream;
 
 pub use board::{BoardHealth, BoardSelector, BoardSpec, BoardView, ProbeSelector};
 pub use ids::JobId;
 pub use job::{
-    AbortReason, JobOutcome, JobSource, JobSpec, JobState, JobView, Priority, TerminalOutcome,
-    TimeoutReason,
+    AbortReason, JobListItem, JobOutcome, JobSource, JobSpec, JobState, JobView, Priority,
+    TerminalOutcome, TimeoutReason,
 };
 pub use log::{LogFrame, LogLevel};
+pub use page::Page;
+pub use schedule::ScheduleView;
 pub use stream::{JobPhase, WireMessage};

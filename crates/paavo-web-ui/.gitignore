@@ -1,0 +1,7 @@
+# Build artifacts — never committed. `dist/` is trunk's wasm bundle output;
+# `target/` is this standalone crate's build dir. Cargo.lock IS committed
+# (unlike the run-by-hand dev/* spikes) so the exact transitive dependency set
+# proven to build on Rust 1.95 stays reproducible for later UI tasks and for
+# the rust-embed step that bakes dist/ into paavo-web.
+/target
+/dist

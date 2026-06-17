@@ -80,6 +80,63 @@ impl BoardRow {
         Ok(rows)
     }
 
+    /// Page of boards ordered by id ascending. When `filter` is `Some(q)`
+    /// (and non-empty after trimming), only boards whose `id` OR `kind`
+    /// contains `q` (case-insensitive ASCII substring) are returned. The
+    /// board fleet is small and id-stable (no live churn like the jobs
+    /// table), so a plain `LIMIT/OFFSET` on the same `id ASC` order as
+    /// `list_all` is sufficient — no `as_of` pin is needed.
+    pub fn list_page(
+        conn: &Connection,
+        filter: Option<&str>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Self>> {
+        let needle = filter.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let (sql, bind): (String, Vec<rusqlite::types::Value>) = match needle {
+            Some(q) => {
+                let like = format!("%{}%", escape_like(q));
+                (
+                    "SELECT * FROM board WHERE (id LIKE ?1 ESCAPE '\\' OR kind LIKE ?1 ESCAPE '\\') \
+                     ORDER BY id ASC LIMIT ?2 OFFSET ?3"
+                        .into(),
+                    vec![like.into(), (limit as i64).into(), (offset as i64).into()],
+                )
+            }
+            None => (
+                "SELECT * FROM board ORDER BY id ASC LIMIT ?1 OFFSET ?2".into(),
+                vec![(limit as i64).into(), (offset as i64).into()],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bind), from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total board count, optionally filtered exactly like [`list_page`]
+    /// (`id`/`kind` case-insensitive substring). Paired with `list_page`
+    /// so paavo-web can render the total page count for the (filtered)
+    /// boards list.
+    pub fn count(conn: &Connection, filter: Option<&str>) -> Result<u64> {
+        let needle = filter.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let n: i64 = match needle {
+            Some(q) => {
+                let like = format!("%{}%", escape_like(q));
+                conn.query_row(
+                    "SELECT COUNT(*) FROM board WHERE (id LIKE ?1 ESCAPE '\\' OR kind LIKE ?1 ESCAPE '\\')",
+                    params![like],
+                    |r| r.get(0),
+                )?
+            }
+            None => conn.query_row("SELECT COUNT(*) FROM board", [], |r| r.get(0))?,
+        };
+        Ok(n as u64)
+    }
+
     /// Find healthy boards matching the selector AND not currently
     /// dispatched (no `job` row in `running` state on this board — only
     /// the run phase holds a board; the build phase is board-free).
@@ -270,6 +327,21 @@ fn require_one_row(n: usize, id: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Escape `LIKE` wildcards in a user-supplied substring so `%`, `_`, and
+/// `\` are matched literally (paired with `ESCAPE '\'` in the query). Used
+/// by [`BoardRow::list_page`] / [`BoardRow::count`] so a filter like `a_b`
+/// matches the literal characters rather than `_` standing for any char.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn health_to_str(h: BoardHealth) -> &'static str {
