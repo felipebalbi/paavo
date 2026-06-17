@@ -2,9 +2,10 @@
 //!
 //! The cron-schedule registry: a paginated table of
 //! [`ScheduleView`](paavo_proto::ScheduleView) rows that refreshes in place
-//! when the server bumps the schedules revision. No client-side filter, so
-//! (unlike the boards page) this uses the `<Suspense>` pattern from the jobs
-//! list for its loading fallback.
+//! when the server bumps the schedules revision. No client-side filter, but
+//! like the jobs and boards pages the table is wrapped in `<Transition>` so a
+//! live refetch keeps the current rows on screen instead of flashing the
+//! loading fallback.
 
 use leptos::prelude::*;
 
@@ -47,7 +48,7 @@ pub fn Schedule() -> impl IntoView {
 
     view! {
         <h1>"Schedule"</h1>
-        <Suspense fallback=move || {
+        <Transition fallback=move || {
             view! { <p class="muted">"loading…"</p> }
         }>
             {move || Suspend::new(async move {
@@ -140,6 +141,6 @@ pub fn Schedule() -> impl IntoView {
                     }
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }

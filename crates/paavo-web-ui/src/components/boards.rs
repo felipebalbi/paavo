@@ -105,7 +105,7 @@ pub fn Boards() -> impl IntoView {
             placeholder="filter boards by id or kind…"
             on:input=on_input
         />
-        <Suspense fallback=move || {
+        <Transition fallback=move || {
             view! { <p class="muted">"loading…"</p> }
         }>
             {move || Suspend::new(async move {
@@ -194,6 +194,6 @@ pub fn Boards() -> impl IntoView {
                     }
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }

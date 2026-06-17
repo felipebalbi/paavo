@@ -127,7 +127,7 @@ pub fn JobsList() -> impl IntoView {
             placeholder="fuzzy search jobs…"
             on:input=on_input
         />
-        <Suspense fallback=move || {
+        <Transition fallback=move || {
             view! { <p class="muted">"loading…"</p> }
         }>
             {move || Suspend::new(async move {
@@ -218,6 +218,6 @@ pub fn JobsList() -> impl IntoView {
                     }
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }
