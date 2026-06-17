@@ -414,7 +414,10 @@ mod tests {
         let err = resolve_board_selector(None, Some("nope"), &inv).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("nope"), "got: {msg}");
-        assert!(msg.contains("mcxa266-01"), "should list known ids; got: {msg}");
+        assert!(
+            msg.contains("mcxa266-01"),
+            "should list known ids; got: {msg}"
+        );
     }
 
     #[test]
@@ -448,7 +451,10 @@ mod tests {
         let err = resolve_board_selector(None, None, &inv).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("multiple board kinds"), "got: {msg}");
-        assert!(msg.contains("mcxa266") && msg.contains("rt685"), "got: {msg}");
+        assert!(
+            msg.contains("mcxa266") && msg.contains("rt685"),
+            "got: {msg}"
+        );
     }
 
     #[test]
