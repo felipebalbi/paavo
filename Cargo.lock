@@ -2295,6 +2295,7 @@ name = "paavo-db"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fuzzy-matcher",
  "paavo-proto",
  "refinery",
  "rusqlite",
