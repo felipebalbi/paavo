@@ -371,8 +371,9 @@ mod tests {
     use std::fs;
     use std::io::Read as _;
 
-    // NOTE: do NOT import `BoardView` here — it is added at the file's top
-    // level in Step 3 and reaches this module via the existing `use super::*`.
+    // NOTE: do NOT import `BoardView` here — it is imported at the file's top
+    // level and reaches this module via the existing `use super::*`. Importing
+    // it again would be a redundant import (caught by `-D warnings`).
     use paavo_proto::{BoardHealth, BoardSpec, ProbeSelector};
 
     /// Build a minimal `BoardView` for resolver tests. Only `id` and
