@@ -3,6 +3,10 @@
 //! error, BEFORE it tars or uploads anything. The bogus crate path is
 //! intentional: selector resolution runs before crate handling, so the
 //! command must error at resolution and never touch the path.
+//!
+//! Note: boards are seeded into the DB, which `GET /boards` reads directly
+//! (`BoardRow::list_all`); the in-memory inventory cache is intentionally left
+//! empty here, so seeding only the DB is sufficient.
 
 use assert_cmd::Command as AssertCommand;
 use paavo_db::Db;
