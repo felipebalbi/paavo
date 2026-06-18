@@ -145,7 +145,8 @@ In `crates/paavo-cli/src/cmd_run.rs`, inside the existing `#[cfg(test)] mod test
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p paavo-cli --lib resolve 2>&1 | tail -20`
+Run: `cargo test -p paavo-cli --bins 2>&1 | tail -20`
+(`paavo-cli` is a binary-only crate, so use `--bins`, not `--lib`. The unit tests live in `cmd_run.rs`.)
 Expected: FAIL to compile — `cannot find function 'resolve_board_selector' in this scope` (and `cannot find type 'BoardView'` until Step 3 adds the top-level import). This is the red state.
 
 - [ ] **Step 3: Implement the resolver**
@@ -359,8 +360,8 @@ with:
 
 - [ ] **Step 6: Run the unit tests and a scoped clippy to verify green + no dead code**
 
-Run: `cargo test -p paavo-cli --lib resolve 2>&1 | tail -20`
-Expected: PASS — all eight resolver tests ok.
+Run: `cargo test -p paavo-cli --bins 2>&1 | tail -20`
+Expected: PASS — all eight resolver tests `ok` (among the `cmd_run.rs` bin unit tests).
 
 Run: `cargo clippy -p paavo-cli --all-targets -- -D warnings 2>&1 | tail -20`
 Expected: no warnings (resolver + `list_boards` are now used by `run()`/tests; no `dead_code`).
