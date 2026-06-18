@@ -22,7 +22,10 @@ pub enum Cmd {
     Run {
         /// .rs file, crate dir, or .elf.
         path: PathBuf,
-        /// Required board kind (e.g. mcxa266).
+        /// Board kind (e.g. mcxa266). Optional: inferred from --instance,
+        /// or defaulted when the lab has a single kind. Needed only to
+        /// disambiguate when multiple kinds exist and no --instance is
+        /// given.
         #[arg(long)]
         board_kind: Option<String>,
         /// Specific board instance.

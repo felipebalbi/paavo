@@ -3,7 +3,8 @@
 use crate::cli::PriorityArg;
 use crate::client::Client;
 use anyhow::{Context, Result};
-use paavo_proto::{BoardSelector, JobSpec, Priority};
+use paavo_proto::{BoardSelector, BoardView, JobSpec, Priority};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Entry point for `paavo-cli run`.
@@ -26,7 +27,28 @@ pub async fn run(
     follow: bool,
     skip_cache: bool,
 ) -> Result<()> {
-    let kind = board_kind.ok_or_else(|| anyhow::anyhow!("--board-kind is required for `run`"))?;
+    // Resolve the board selector BEFORE touching the crate, so a bad
+    // --instance or an ambiguous kind fails fast without tarring or
+    // uploading anything. Only the explicit-kind-without-instance case
+    // can skip the GET /boards round-trip.
+    let selector = {
+        let need_inventory = instance.is_some() || board_kind.is_none();
+        let boards = if need_inventory {
+            client
+                .list_boards()
+                .await
+                .context("fetching board inventory from paavod")?
+        } else {
+            Vec::new()
+        };
+        resolve_board_selector(board_kind, instance, &boards)?
+    };
+    eprintln!(
+        "resolved board: kind={} instance={}",
+        selector.kind,
+        selector.instance.as_deref().unwrap_or("(any)")
+    );
+
     let crate_dir = resolve_crate_dir(path)?;
     let tar_bytes = make_tar(&crate_dir).context("tarring crate dir")?;
 
@@ -39,11 +61,7 @@ pub async fn run(
             PriorityArg::Scheduled => Priority::Scheduled,
         },
         submitter: whoami().unwrap_or_else(|| "anon".into()),
-        board_selector: BoardSelector {
-            kind: kind.into(),
-            instance: instance.map(String::from),
-            wiring_profile: None,
-        },
+        board_selector: selector,
         inactivity_timeout_ms: inactivity.map(parse_duration_ms).transpose()?,
         hard_max_ms: timeout.map(parse_duration_ms).transpose()?,
         skip_cache,
@@ -276,11 +294,189 @@ fn handle_ndjson_line(line: &str) {
     }
 }
 
+/// Render the known board ids for an error message.
+fn join_ids(boards: &[BoardView]) -> String {
+    boards
+        .iter()
+        .map(|b| b.spec.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve the wire `BoardSelector` from the two optional CLI flags plus the
+/// daemon inventory. Pure: the caller performs the `GET /boards`.
+///
+/// Rules (spec 2026-06-17-cli-board-kind-resolution):
+///   (instance=Some, _)      derive kind from that board; cross-check an
+///                           explicit `board_kind` if also given.
+///   (instance=None, Some k) use `k` verbatim (inventory ignored).
+///   (instance=None, None)   the sole inventory kind, or an actionable error.
+fn resolve_board_selector(
+    board_kind: Option<&str>,
+    instance: Option<&str>,
+    boards: &[BoardView],
+) -> Result<BoardSelector> {
+    match (instance, board_kind) {
+        (Some(id), kind_hint) => {
+            let board = boards.iter().find(|b| b.spec.id == id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no board with id '{id}' in inventory (known: {})",
+                    join_ids(boards)
+                )
+            })?;
+            let kind = board.spec.kind.as_str();
+            if let Some(hint) = kind_hint {
+                if hint != kind {
+                    anyhow::bail!(
+                        "board '{id}' is kind '{kind}', which conflicts with --board-kind '{hint}'"
+                    );
+                }
+            }
+            Ok(BoardSelector {
+                kind: kind.to_string(),
+                instance: Some(id.to_string()),
+                wiring_profile: None,
+            })
+        }
+        (None, Some(kind)) => Ok(BoardSelector {
+            kind: kind.to_string(),
+            instance: None,
+            wiring_profile: None,
+        }),
+        (None, None) => {
+            let kinds: BTreeSet<&str> = boards.iter().map(|b| b.spec.kind.as_str()).collect();
+            match kinds.len() {
+                1 => Ok(BoardSelector {
+                    kind: kinds.into_iter().next().unwrap().to_string(),
+                    instance: None,
+                    wiring_profile: None,
+                }),
+                0 => anyhow::bail!(
+                    "no boards registered with paavod; pass --board-kind <kind> \
+                     (or register a board first)"
+                ),
+                _ => anyhow::bail!(
+                    "multiple board kinds available ({}); \
+                     pass --instance <id> or --board-kind <kind>",
+                    kinds.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Read as _;
+
+    // NOTE: do NOT import `BoardView` here — it is imported at the file's top
+    // level and reaches this module via the existing `use super::*`. Importing
+    // it again would be a redundant import (caught by `-D warnings`).
+    use paavo_proto::{BoardHealth, BoardSpec, ProbeSelector};
+
+    /// Build a minimal `BoardView` for resolver tests. Only `id` and
+    /// `kind` matter to `resolve_board_selector`; the rest are filler.
+    fn bv(id: &str, kind: &str) -> BoardView {
+        BoardView {
+            spec: BoardSpec {
+                id: id.into(),
+                kind: kind.into(),
+                probe_selector: ProbeSelector {
+                    vid: "1366".into(),
+                    pid: "1015".into(),
+                    serial: format!("S-{id}"),
+                },
+                chip_name: "MCXA266".into(),
+                target_name: format!("target-{kind}"),
+                wiring_profile: None,
+                health: BoardHealth::Healthy,
+            },
+            quarantine_reason: None,
+            consecutive_infra_failures: 0,
+            last_used_at: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn instance_derives_kind() {
+        let inv = vec![bv("mcxa266-01", "mcxa266"), bv("mcxa266-02", "mcxa266")];
+        let sel = resolve_board_selector(None, Some("mcxa266-02"), &inv).unwrap();
+        assert_eq!(sel.kind, "mcxa266");
+        assert_eq!(sel.instance.as_deref(), Some("mcxa266-02"));
+        assert_eq!(sel.wiring_profile, None);
+    }
+
+    #[test]
+    fn instance_not_found_errors() {
+        let inv = vec![bv("mcxa266-01", "mcxa266")];
+        let err = resolve_board_selector(None, Some("nope"), &inv).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "got: {msg}");
+        assert!(
+            msg.contains("mcxa266-01"),
+            "should list known ids; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn instance_and_matching_kind_ok() {
+        let inv = vec![bv("mcxa266-01", "mcxa266")];
+        let sel = resolve_board_selector(Some("mcxa266"), Some("mcxa266-01"), &inv).unwrap();
+        assert_eq!(sel.kind, "mcxa266");
+        assert_eq!(sel.instance.as_deref(), Some("mcxa266-01"));
+    }
+
+    #[test]
+    fn instance_and_conflicting_kind_errors() {
+        let inv = vec![bv("mcxa266-01", "mcxa266")];
+        let err = resolve_board_selector(Some("rt685"), Some("mcxa266-01"), &inv).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mcxa266"), "got: {msg}");
+        assert!(msg.contains("rt685"), "got: {msg}");
+    }
+
+    #[test]
+    fn neither_single_kind_defaults() {
+        let inv = vec![bv("mcxa266-01", "mcxa266"), bv("mcxa266-02", "mcxa266")];
+        let sel = resolve_board_selector(None, None, &inv).unwrap();
+        assert_eq!(sel.kind, "mcxa266");
+        assert_eq!(sel.instance, None);
+    }
+
+    #[test]
+    fn neither_multiple_kinds_errors() {
+        let inv = vec![bv("mcxa266-01", "mcxa266"), bv("rt685-01", "rt685")];
+        let err = resolve_board_selector(None, None, &inv).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multiple board kinds"), "got: {msg}");
+        assert!(
+            msg.contains("mcxa266") && msg.contains("rt685"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn neither_zero_boards_errors() {
+        let inv: Vec<BoardView> = vec![];
+        let err = resolve_board_selector(None, None, &inv).unwrap_err();
+        assert!(
+            err.to_string().contains("no boards registered"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_kind_no_instance_skips_inventory() {
+        // Empty inventory on purpose: the (None, Some) branch must not
+        // depend on it (the caller skips the GET /boards round-trip).
+        let inv: Vec<BoardView> = vec![];
+        let sel = resolve_board_selector(Some("mcxa266"), None, &inv).unwrap();
+        assert_eq!(sel.kind, "mcxa266");
+        assert_eq!(sel.instance, None);
+    }
 
     /// Regression for the M7.7 manual smoke: `.cargo/config.toml`
     /// MUST survive the tar. Stripping it (as an earlier version of

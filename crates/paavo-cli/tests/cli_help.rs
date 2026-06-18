@@ -95,3 +95,22 @@ fn admin_purge_help_lists_boards_and_yes() {
         .stdout(contains("--boards"))
         .stdout(contains("--yes"));
 }
+
+#[test]
+fn run_help_board_kind_is_optional() {
+    // `run --help` must telegraph that --board-kind is no longer
+    // mandatory — it's inferred from --instance or a single-kind lab.
+    let out = Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("inferred"),
+        "`run --help` should explain board-kind inference; got:\n{text}"
+    );
+}
