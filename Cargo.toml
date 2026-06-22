@@ -46,14 +46,14 @@ authors = ["Felipe Balbi <febalbi@microsoft.com>"]
 
 [workspace.dependencies]
 # Internal
-paavo-proto  = { path = "crates/paavo-proto" }
-paavo-meta   = { path = "crates/paavo-meta" }
-paavo-db     = { path = "crates/paavo-db" }
-paavo-build  = { path = "crates/paavo-build" }
-paavo-probe  = { path = "crates/paavo-probe" }
-paavo-runner = { path = "crates/paavo-runner" }
-paavo-core   = { path = "crates/paavo-core" }
-paavod       = { path = "crates/paavod" }
+paavo-proto  = { version = "0.1.0", path = "crates/paavo-proto" }
+paavo-meta   = { version = "0.1.0", path = "crates/paavo-meta" }
+paavo-db     = { version = "0.1.0", path = "crates/paavo-db" }
+paavo-build  = { version = "0.1.0", path = "crates/paavo-build" }
+paavo-probe  = { version = "0.1.0", path = "crates/paavo-probe" }
+paavo-runner = { version = "0.1.0", path = "crates/paavo-runner" }
+paavo-core   = { version = "0.1.0", path = "crates/paavo-core" }
+paavod       = { version = "0.1.0", path = "crates/paavod" }
 
 # Serialization / data
 serde       = { version = "1", features = ["derive"] }

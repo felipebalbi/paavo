@@ -21,8 +21,8 @@ publish = false
 # writes through the same typed helpers paavod uses.
 
 [dependencies]
-paavo-db = { path = "../../crates/paavo-db" }
-paavo-proto = { path = "../../crates/paavo-proto" }
+paavo-db = { version = "0.1.0", path = "../../crates/paavo-db" }
+paavo-proto = { version = "0.1.0", path = "../../crates/paavo-proto" }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 anyhow = "1"

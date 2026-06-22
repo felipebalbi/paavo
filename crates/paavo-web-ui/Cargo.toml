@@ -35,7 +35,7 @@ path = "src/main.rs"
 [dependencies]
 leptos = { version = "=0.7.8", features = ["csr"] }
 leptos_router = "=0.7.8"
-paavo-proto = { path = "../paavo-proto" }
+paavo-proto = { version = "0.1.0", path = "../paavo-proto" }
 gloo-net = "=0.6.0"
 gloo-timers = { version = "=0.3.0", features = ["futures"] }
 # Pinned to 0.2.100 to match the wasm-bindgen-cli version trunk has cached
