@@ -928,6 +928,7 @@ mod tests {
                 vid: "1366".into(),
                 pid: "1015".into(),
                 serial: id.into(),
+                interface: None,
             },
             chip_name: "MCXA266VFL".into(),
             target_name: "frdm-mcx-a266".into(),

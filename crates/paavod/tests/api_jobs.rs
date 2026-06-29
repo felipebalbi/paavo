@@ -25,6 +25,7 @@ fn state_with_upload_cap(tmp_root: &std::path::Path, max_upload_bytes: usize) ->
             vid: "x".into(),
             pid: "x".into(),
             serial: "x".into(),
+            interface: None,
         },
         chip_name: "x".into(),
         target_name: "x".into(),

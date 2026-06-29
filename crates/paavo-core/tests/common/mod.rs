@@ -45,6 +45,7 @@ pub fn insert_board(db: &Db, id: &str, kind: &str, health: BoardHealth) -> Board
             vid: "1366".into(),
             pid: "1015".into(),
             serial: id.into(),
+            interface: None,
         },
         chip_name: "X".into(),
         target_name: format!("target-{kind}"),

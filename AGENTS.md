@@ -246,6 +246,12 @@ Dependencies flow **upward** — a crate may only depend on crates above it.
 
 ## Landmines & gotchas
 
+- **`board add` accepts probe-rs `list` output directly.** `paavo-cli board add
+  --probe` takes a probe-rs selector token (`1fc9:0143-0:SERIAL`, where `-0` is
+  the USB interface) or a full pasted `probe-rs list` line. VID/PID are
+  validated as hex at registration (CLI **and** `POST /boards`), not deferred to
+  `probe_attach`. The canonical parser is `ProbeSelector::parse` in
+  `paavo-proto`.
 - **Workspace-excluded crates won't build with the host toolchain** (with one
   exception, noted below). These are intentionally outside `[workspace] members`
   (see `Cargo.toml` `exclude`): `tests/fixtures/smoke-crate`, `soak-tests/`,

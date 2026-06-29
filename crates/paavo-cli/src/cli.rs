@@ -142,7 +142,9 @@ pub enum BoardOp {
         /// Instance id (e.g. mcxa266-02).
         #[arg(long)]
         instance: String,
-        /// VID:PID:serial.
+        /// Probe selector. Accepts a probe-rs selector token
+        /// (`1fc9:0143:SERIAL`, optional `-IFACE`) or a full `probe-rs list`
+        /// line pasted verbatim.
         #[arg(long)]
         probe: String,
         /// probe-rs chip name.

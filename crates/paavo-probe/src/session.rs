@@ -161,7 +161,7 @@ impl RealSession {
         let selector = DebugProbeSelector {
             vendor_id: vid,
             product_id: pid,
-            interface: None,
+            interface: opts.probe_selector.interface,
             serial_number: serial_filter.clone(),
         };
         let probe = lister.open(selector).map_err(|e| {

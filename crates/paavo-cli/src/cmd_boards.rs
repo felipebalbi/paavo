@@ -32,23 +32,17 @@ pub async fn op(client: &Client, op: BoardOp) -> Result<()> {
             target,
             wiring_profile,
         } => {
-            let mut parts = probe.split(':');
-            let vid = parts
-                .next()
-                .ok_or_else(|| anyhow!("probe missing VID"))?
-                .to_string();
-            let pid = parts
-                .next()
-                .ok_or_else(|| anyhow!("probe missing PID"))?
-                .to_string();
-            let serial = parts
-                .next()
-                .ok_or_else(|| anyhow!("probe missing serial"))?
-                .to_string();
+            let probe_selector = ProbeSelector::parse(&probe).map_err(|e| {
+                anyhow!(
+                    "invalid --probe {probe:?}: {e}\n\n\
+                     Paste a probe-rs selector (`1fc9:0143:SERIAL`) or a full \
+                     `probe-rs list` line."
+                )
+            })?;
             let spec = BoardSpec {
                 id: instance,
                 kind,
-                probe_selector: ProbeSelector { vid, pid, serial },
+                probe_selector,
                 chip_name: chip,
                 target_name: target,
                 wiring_profile: Some(wiring_profile),

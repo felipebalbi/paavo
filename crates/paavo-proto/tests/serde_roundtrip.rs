@@ -170,6 +170,7 @@ fn board_spec_roundtrip() {
             vid: "1366".into(),
             pid: "1015".into(),
             serial: "000123456789".into(),
+            interface: None,
         },
         chip_name: "MCXA266VFL".into(),
         target_name: "frdm-mcx-a266".into(),
@@ -202,6 +203,7 @@ fn board_selector_matches_kind_instance_and_wiring_profile() {
             vid: "1366".into(),
             pid: "1015".into(),
             serial: "abc".into(),
+            interface: None,
         },
         chip_name: "MCXA266VFL".into(),
         target_name: "frdm-mcx-a266".into(),
@@ -431,4 +433,36 @@ fn awaiting_board_serializes_to_snake_case() {
     let back: paavo_proto::JobState = serde_json::from_str("\"awaiting_board\"").unwrap();
     assert_eq!(back, paavo_proto::JobState::AwaitingBoard);
     assert!(!back.is_terminal());
+}
+
+#[test]
+fn probe_selector_omits_interface_when_none() {
+    let sel = paavo_proto::ProbeSelector {
+        vid: "1fc9".into(),
+        pid: "0143".into(),
+        serial: "ABCD".into(),
+        interface: None,
+    };
+    let j = serde_json::to_string(&sel).unwrap();
+    assert!(
+        !j.contains("interface"),
+        "None interface must be omitted: {j}"
+    );
+    assert_eq!(sel, serde_json::from_str(&j).unwrap());
+}
+
+#[test]
+fn probe_selector_serializes_interface_when_some() {
+    let sel = paavo_proto::ProbeSelector {
+        vid: "0403".into(),
+        pid: "6010".into(),
+        serial: "X".into(),
+        interface: Some(1),
+    };
+    let j = serde_json::to_string(&sel).unwrap();
+    assert!(
+        j.contains("\"interface\":1"),
+        "Some interface must serialize: {j}"
+    );
+    assert_eq!(sel, serde_json::from_str(&j).unwrap());
 }

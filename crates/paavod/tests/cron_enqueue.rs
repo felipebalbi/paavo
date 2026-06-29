@@ -45,6 +45,7 @@ fn make_state(corpus: Vec<CorpusEntry>, state_root: &std::path::Path) -> AppStat
                 vid: "x".into(),
                 pid: "x".into(),
                 serial: "x".into(),
+                interface: None,
             },
             chip_name: "x".into(),
             target_name: "x".into(),

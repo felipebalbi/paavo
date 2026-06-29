@@ -12,6 +12,12 @@ Restart=on-failure
 RestartSec=5
 StateDirectory=paavo
 ReadWritePaths=/var/lib/paavo
+# paavod builds submitted test crates with cargo. ProtectHome=true hides /home,
+# so the toolchain must live under the (writable) state dir — see contrib/README.md
+# for the one-time install. These must match RUSTUP_HOME/CARGO_HOME there.
+Environment=CARGO_HOME=/var/lib/paavo/.cargo
+Environment=RUSTUP_HOME=/var/lib/paavo/.rustup
+Environment=PATH=/var/lib/paavo/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true

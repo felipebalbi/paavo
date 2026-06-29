@@ -235,6 +235,7 @@ async fn quarantine_and_unquarantine_flip_health_and_cache() {
                 vid: "x".into(),
                 pid: "x".into(),
                 serial: "x".into(),
+                interface: None,
             },
             chip_name: "x".into(),
             target_name: "x".into(),
@@ -370,6 +371,7 @@ async fn delete_board_with_referencing_job_returns_409() {
                 vid: "x".into(),
                 pid: "x".into(),
                 serial: "x".into(),
+                interface: None,
             },
             chip_name: "x".into(),
             target_name: "x".into(),
@@ -414,4 +416,43 @@ async fn delete_board_with_referencing_job_returns_409() {
         body.contains("job") || body.contains("referenc"),
         "body should explain the FK conflict, got: {body}"
     );
+}
+
+#[tokio::test]
+async fn add_board_rejects_non_hex_vid() {
+    let app = build_router(state());
+    let mut body = sample_board_json();
+    body["probe_selector"]["vid"] = serde_json::json!("zz");
+    let resp = post_json(app, "/boards", body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_text(resp).await;
+    assert!(
+        body.contains("probe_selector"),
+        "body should name the failing field, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn add_board_normalizes_vid_pid() {
+    let app = build_router(state());
+    let mut body = sample_board_json();
+    body["probe_selector"]["vid"] = serde_json::json!("1FC9"); // uppercase
+    body["probe_selector"]["pid"] = serde_json::json!("143"); // unpadded
+    let resp = post_json(app.clone(), "/boards", body).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // GET /boards and confirm the stored selector was canonicalized.
+    // Mirrors `post_boards_then_get_boards_returns_full_view`: build an
+    // inline GET request and decode the `Vec<BoardView>` body via
+    // `read_json`. The view flattens `BoardSpec`, so `probe_selector` is
+    // nested and reflects exactly what the daemon persisted.
+    let req = Request::builder()
+        .uri("/boards")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let v = read_json(app.oneshot(req).await.unwrap()).await;
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["probe_selector"]["vid"], "1fc9");
+    assert_eq!(arr[0]["probe_selector"]["pid"], "0143");
 }

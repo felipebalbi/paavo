@@ -125,6 +125,7 @@ fn real_runner_passes_against_real_mcxa266() {
                     vid: "1fc9".into(),             // NXP
                     pid: "0143".into(),             // MCU-Link CMSIS-DAP
                     serial: "EDFHUAFM4J5ZJ".into(), // Felipe's specific EVK
+                    interface: None,
                 },
                 chip_name: "MCXA276".into(),
                 target_name: "frdm-mcx-a266".into(),
