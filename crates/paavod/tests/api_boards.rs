@@ -417,3 +417,17 @@ async fn delete_board_with_referencing_job_returns_409() {
         "body should explain the FK conflict, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn add_board_rejects_non_hex_vid() {
+    let app = build_router(state());
+    let mut body = sample_board_json();
+    body["probe_selector"]["vid"] = serde_json::json!("zz");
+    let resp = post_json(app, "/boards", body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_text(resp).await;
+    assert!(
+        body.contains("probe_selector"),
+        "body should name the failing field, got: {body}"
+    );
+}

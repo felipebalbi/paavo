@@ -53,6 +53,14 @@ pub async fn add_board(
                 .into(),
         ));
     }
+    // The wire carries vid/pid as free-form strings; reject non-hex here so a
+    // malformed selector never lands in the DB or reaches probe-rs at attach.
+    spec.probe_selector.validate().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid probe_selector: {e}"),
+        )
+    })?;
     let now_ms = Utc::now().timestamp_millis();
     {
         let db = s.db.lock();
