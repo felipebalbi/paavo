@@ -43,7 +43,7 @@ pub async fn list_boards(State(s): State<AppState>) -> HandlerResult<Json<Vec<Bo
 /// can never be `NULL` for a quarantined row.
 pub async fn add_board(
     State(s): State<AppState>,
-    Json(spec): Json<BoardSpec>,
+    Json(mut spec): Json<BoardSpec>,
 ) -> HandlerResult<StatusCode> {
     if spec.health != BoardHealth::Healthy {
         return Err((
@@ -53,9 +53,10 @@ pub async fn add_board(
                 .into(),
         ));
     }
-    // The wire carries vid/pid as free-form strings; reject non-hex here so a
-    // malformed selector never lands in the DB or reaches probe-rs at attach.
-    spec.probe_selector.validate().map_err(|e| {
+    // The wire carries vid/pid as free-form strings; normalize to canonical
+    // lowercase 4-hex (and reject non-hex) so stored selectors are uniform and
+    // never fail later at probe_attach.
+    spec.probe_selector.canonicalize().map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("invalid probe_selector: {e}"),

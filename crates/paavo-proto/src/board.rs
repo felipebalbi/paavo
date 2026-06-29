@@ -123,6 +123,24 @@ impl ProbeSelector {
         })?;
         Ok(())
     }
+
+    /// Validate **and** normalize `vid`/`pid` in place to canonical lowercase
+    /// 4-hex (e.g. `"1FC9"`/`"143"` → `"1fc9"`/`"0143"`). `serial` and
+    /// `interface` are left unchanged. Returns the same `BadVid`/`BadPid`
+    /// errors as [`ProbeSelector::validate`] when the fields are not hex.
+    pub fn canonicalize(&mut self) -> Result<(), ProbeSelectorParseError> {
+        let vid = parse_hex_u16(&self.vid).map_err(|source| ProbeSelectorParseError::BadVid {
+            value: self.vid.clone(),
+            source,
+        })?;
+        let pid = parse_hex_u16(&self.pid).map_err(|source| ProbeSelectorParseError::BadPid {
+            value: self.pid.clone(),
+            source,
+        })?;
+        self.vid = format!("{vid:04x}");
+        self.pid = format!("{pid:04x}");
+        Ok(())
+    }
 }
 
 /// Extract the `VID:PID…` token from either a bare token or a full
@@ -379,5 +397,35 @@ mod tests {
             interface: None,
         };
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn canonicalize_normalizes_vid_pid_in_place() {
+        let mut s = ProbeSelector {
+            vid: "1FC9".into(),
+            pid: "143".into(),
+            serial: "S".into(),
+            interface: Some(0),
+        };
+        s.canonicalize().unwrap();
+        assert_eq!(s.vid, "1fc9");
+        assert_eq!(s.pid, "0143");
+        // serial + interface are untouched.
+        assert_eq!(s.serial, "S");
+        assert_eq!(s.interface, Some(0));
+    }
+
+    #[test]
+    fn canonicalize_rejects_bad_hex() {
+        let mut s = ProbeSelector {
+            vid: "zz".into(),
+            pid: "0143".into(),
+            serial: "S".into(),
+            interface: None,
+        };
+        assert!(matches!(
+            s.canonicalize(),
+            Err(ProbeSelectorParseError::BadVid { .. })
+        ));
     }
 }
