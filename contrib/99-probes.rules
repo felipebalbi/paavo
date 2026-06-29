@@ -2,10 +2,17 @@
 # Source: https://probe.rs/docs/getting-started/probe-setup/
 
 # Daplink (e.g. mcxa eval boards)
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", MODE="0660", GROUP="paavo"
+
+# NXP MCU-Link / on-board CMSIS-DAP (e.g. MCX-A266 EVK)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1fc9", MODE="0660", GROUP="paavo"
 
 # Segger J-Link
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1366", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1366", MODE="0660", GROUP="paavo"
 
 # ST-Link (in case you mix)
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", MODE="0660", GROUP="paavo"
+
+# Single-purpose HIL box? Instead of maintaining a per-VID allowlist above,
+# grant the paavo service every USB device with one rule:
+#   SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", MODE="0660", GROUP="paavo"
