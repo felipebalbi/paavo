@@ -48,7 +48,12 @@ pub async fn op(client: &Client, op: BoardOp) -> Result<()> {
             let spec = BoardSpec {
                 id: instance,
                 kind,
-                probe_selector: ProbeSelector { vid, pid, serial },
+                probe_selector: ProbeSelector {
+                    vid,
+                    pid,
+                    serial,
+                    interface: None,
+                },
                 chip_name: chip,
                 target_name: target,
                 wiring_profile: Some(wiring_profile),

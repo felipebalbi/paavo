@@ -376,6 +376,7 @@ fn main() -> Result<()> {
                 vid: "1366".into(),
                 pid: "1015".into(),
                 serial: format!("FAKE{i:02}"),
+                interface: None,
             },
             chip_name: "MCXA266".into(),
             target_name: "thumbv8m.main-none-eabihf".into(),

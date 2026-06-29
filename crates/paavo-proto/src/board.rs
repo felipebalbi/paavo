@@ -5,12 +5,17 @@ use serde::{Deserialize, Serialize};
 /// VID/PID/serial selector for a probe, matching the probe-rs naming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeSelector {
-    /// USB vendor id, hex string e.g. `"1366"`.
+    /// USB vendor id, hex string e.g. `"1fc9"`. Canonical form is lowercase 4-hex.
     pub vid: String,
-    /// USB product id, hex string e.g. `"1015"`.
+    /// USB product id, hex string e.g. `"0143"`. Canonical form is lowercase 4-hex.
     pub pid: String,
-    /// Probe serial number as reported by USB.
+    /// Probe serial number as reported by USB. May be empty ("no filter")
+    /// and may contain `:` (e.g. ESP JTAG MAC serials).
     pub serial: String,
+    /// USB interface index (the `-N` in a probe-rs selector). `None` matches
+    /// any interface; set only for multi-interface probes (e.g. FTDI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<u8>,
 }
 
 /// Whether a board is currently eligible to receive jobs.

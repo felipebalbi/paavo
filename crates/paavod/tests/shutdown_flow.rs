@@ -26,6 +26,7 @@ fn make_state(tmp: &std::path::Path) -> AppState {
             vid: "x".into(),
             pid: "x".into(),
             serial: "x".into(),
+            interface: None,
         },
         chip_name: "x".into(),
         target_name: "x".into(),

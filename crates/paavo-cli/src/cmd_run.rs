@@ -387,6 +387,7 @@ mod tests {
                     vid: "1366".into(),
                     pid: "1015".into(),
                     serial: format!("S-{id}"),
+                    interface: None,
                 },
                 chip_name: "MCXA266".into(),
                 target_name: format!("target-{kind}"),

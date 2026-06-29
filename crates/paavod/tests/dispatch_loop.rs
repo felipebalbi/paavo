@@ -61,6 +61,7 @@ fn fixture_state(_out: JobOutcome) -> (AppState, paavo_proto::JobId, tempfile::T
             vid: "x".into(),
             pid: "x".into(),
             serial: "x".into(),
+            interface: None,
         },
         chip_name: "x".into(),
         target_name: "x".into(),

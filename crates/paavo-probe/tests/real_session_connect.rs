@@ -72,6 +72,7 @@ fn connect_flashes_and_returns_live_session() {
             vid: "1fc9".into(),             // NXP
             pid: "0143".into(),             // MCU-Link CMSIS-DAP
             serial: "EDFHUAFM4J5ZJ".into(), // Felipe's specific EVK
+            interface: None,
         },
         chip_name: "MCXA276".into(), // NOT MCXA266; spike finding
         elf_path: elf_fixture(),
