@@ -35,7 +35,9 @@ Then follow [`contrib/README.md`](../contrib/README.md) for systemd + udev.
 - `sandboxes/` — per-job build dirs.
 - `cargo-target/` — shared `CARGO_TARGET_DIR` for cargo's incremental reuse.
 - `cache/elf/` — cached ELFs paired with `build_cache` table rows (DB row holds the path; the ELF file lives here). LRU evicted when `build_cache.max_bytes` is hit.
-- `boards.toml` — `paavo-cli board add` writes this; restart paavod to pick up changes.
+- `boards.toml` — declarative seed read at startup (inserts boards whose id is
+  not already in the DB). `paavo-cli board add` writes the **DB** via `POST
+  /boards`, not this file; edit `boards.toml` by hand to seed a fresh deploy.
 
 ## Updating
 
