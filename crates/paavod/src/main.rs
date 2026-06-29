@@ -157,10 +157,19 @@ fn load_inventory(
         let parsed: Boards =
             toml::from_str(&raw).with_context(|| format!("parsing {}", boards_toml.display()))?;
         for spec in &parsed.board {
+            // Canonicalize (normalize + validate) each seed so stored selectors
+            // are uniform lowercase 4-hex — matching what POST /boards does — and
+            // a malformed selector fails fast here rather than blowing up later at
+            // probe_attach. boards.toml is operator input, so a clear startup
+            // error beats a silent bad insert.
+            let mut spec = spec.clone();
+            spec.probe_selector
+                .canonicalize()
+                .with_context(|| format!("invalid probe_selector for board {}", spec.id))?;
             if paavo_db::BoardRow::find(db.raw_conn(), &spec.id)?.is_none() {
                 paavo_db::BoardRow::insert(
                     db.raw_conn(),
-                    spec,
+                    &spec,
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .with_context(|| format!("inserting board {}", spec.id))?;
@@ -184,5 +193,92 @@ impl paavo_core::Runner for FakeRunner {
             outcome: JobOutcome::Passed,
             probe_released_cleanly: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_boards_toml(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("boards.toml");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_inventory_rejects_bad_selector_in_boards_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = paavo_db::Db::open(tmp.path().join("paavo.sqlite")).unwrap();
+        // The selector vid is non-hex; every other field is well-formed so the
+        // TOML deserializes cleanly and the ONLY failure is selector validation.
+        let toml = write_boards_toml(
+            tmp.path(),
+            r#"
+[[board]]
+id = "bad-01"
+kind = "mcxa266"
+chip_name = "MCXA266VFL"
+target_name = "frdm-mcx-a266"
+wiring_profile = "default"
+health = "healthy"
+probe_selector = { vid = "zz", pid = "0143", serial = "S" }
+"#,
+        );
+        let err = load_inventory(&db, &toml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid probe_selector"),
+            "error should be the selector validation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_inventory_accepts_good_selector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = paavo_db::Db::open(tmp.path().join("paavo.sqlite")).unwrap();
+        let toml = write_boards_toml(
+            tmp.path(),
+            r#"
+[[board]]
+id = "ok-01"
+kind = "mcxa266"
+chip_name = "MCXA266VFL"
+target_name = "frdm-mcx-a266"
+wiring_profile = "default"
+health = "healthy"
+probe_selector = { vid = "1fc9", pid = "0143", serial = "S" }
+"#,
+        );
+        let inv = load_inventory(&db, &toml).unwrap();
+        assert!(inv.iter().any(|b| b.id == "ok-01"));
+    }
+
+    #[test]
+    fn load_inventory_canonicalizes_seeded_selector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = paavo_db::Db::open(tmp.path().join("paavo.sqlite")).unwrap();
+        let toml = write_boards_toml(
+            tmp.path(),
+            r#"
+[[board]]
+id = "up-01"
+kind = "mcxa266"
+chip_name = "MCXA266VFL"
+target_name = "frdm-mcx-a266"
+wiring_profile = "default"
+health = "healthy"
+probe_selector = { vid = "1FC9", pid = "143", serial = "S" }
+"#,
+        );
+        let inv = load_inventory(&db, &toml).unwrap();
+        let b = inv
+            .iter()
+            .find(|b| b.id == "up-01")
+            .expect("seeded board present");
+        assert_eq!(b.probe_selector.vid, "1fc9");
+        assert_eq!(b.probe_selector.pid, "0143");
     }
 }
