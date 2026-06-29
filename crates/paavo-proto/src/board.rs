@@ -1,6 +1,7 @@
 //! Board inventory and selector types.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// VID/PID/serial selector for a probe, matching the probe-rs naming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +17,140 @@ pub struct ProbeSelector {
     /// any interface; set only for multi-interface probes (e.g. FTDI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<u8>,
+}
+
+/// Error parsing a probe-rs selector string into a [`ProbeSelector`].
+#[derive(Debug, Error)]
+pub enum ProbeSelectorParseError {
+    /// Selector was empty or had no PID part.
+    #[error(
+        "selector is empty or missing the PID (expected `VID:PID[-IFACE][:SERIAL]`, \
+             e.g. `1fc9:0143:ABCD1234`)"
+    )]
+    Format,
+    /// VID was not a hex u16.
+    #[error("bad VID {value:?}: {source}")]
+    BadVid {
+        /// The offending VID text.
+        value: String,
+        /// The underlying parse error.
+        source: std::num::ParseIntError,
+    },
+    /// PID was not a hex u16.
+    #[error("bad PID {value:?}: {source}")]
+    BadPid {
+        /// The offending PID text.
+        value: String,
+        /// The underlying parse error.
+        source: std::num::ParseIntError,
+    },
+    /// Interface suffix was not a u8.
+    #[error("bad USB interface {value:?}: {source}")]
+    BadInterface {
+        /// The offending interface text.
+        value: String,
+        /// The underlying parse error.
+        source: std::num::ParseIntError,
+    },
+}
+
+impl ProbeSelector {
+    /// Parse a probe-rs selector token **or** a full `probe-rs list` line.
+    ///
+    /// Grammar matches probe-rs's own `DebugProbeSelector`:
+    /// `VID:PID[-IFACE][:SERIAL]`, split via `splitn(3, ':')` so colon-bearing
+    /// serials (e.g. ESP JTAG MACs) survive. VID/PID are hex and are
+    /// normalized to lowercase 4-hex.
+    pub fn parse(input: &str) -> Result<Self, ProbeSelectorParseError> {
+        let token = extract_selector_token(input);
+
+        let mut parts = token.splitn(3, ':');
+        let vid_raw = parts.next().unwrap_or("").trim();
+        let pid_field = parts.next().ok_or(ProbeSelectorParseError::Format)?.trim();
+        let serial = parts.next().map(|s| s.to_string()).unwrap_or_default();
+
+        // Peel the optional `-IFACE` off the PID field.
+        let (pid_raw, interface) = match pid_field.split_once('-') {
+            Some((pid, iface)) => {
+                let iface = iface.trim();
+                let interface = if iface.is_empty() {
+                    None
+                } else {
+                    Some(iface.parse::<u8>().map_err(|source| {
+                        ProbeSelectorParseError::BadInterface {
+                            value: iface.to_string(),
+                            source,
+                        }
+                    })?)
+                };
+                (pid.trim(), interface)
+            }
+            None => (pid_field, None),
+        };
+
+        if vid_raw.is_empty() || pid_raw.is_empty() {
+            return Err(ProbeSelectorParseError::Format);
+        }
+
+        let vid = parse_hex_u16(vid_raw).map_err(|source| ProbeSelectorParseError::BadVid {
+            value: vid_raw.to_string(),
+            source,
+        })?;
+        let pid = parse_hex_u16(pid_raw).map_err(|source| ProbeSelectorParseError::BadPid {
+            value: pid_raw.to_string(),
+            source,
+        })?;
+
+        Ok(ProbeSelector {
+            vid: format!("{vid:04x}"),
+            pid: format!("{pid:04x}"),
+            serial,
+            interface,
+        })
+    }
+
+    /// Validate that `vid`/`pid` are hex `u16`. Used by paavod at registration
+    /// (the wire already carries a structured selector, so there's nothing to
+    /// re-split — just confirm the fields are well-formed).
+    pub fn validate(&self) -> Result<(), ProbeSelectorParseError> {
+        parse_hex_u16(&self.vid).map_err(|source| ProbeSelectorParseError::BadVid {
+            value: self.vid.clone(),
+            source,
+        })?;
+        parse_hex_u16(&self.pid).map_err(|source| ProbeSelectorParseError::BadPid {
+            value: self.pid.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+}
+
+/// Extract the `VID:PID…` token from either a bare token or a full
+/// `probe-rs list` line (`[N]: <identifier> -- <token> (<TYPE>)`).
+fn extract_selector_token(input: &str) -> &str {
+    let s = input.trim();
+    match s.rfind(" -- ") {
+        Some(idx) => {
+            let after = s[idx + 4..].trim();
+            // Strip a trailing ` (TYPE)` parenthetical only on the list-line path.
+            match after.rfind(" (") {
+                Some(p) => after[..p].trim(),
+                None => after,
+            }
+        }
+        None => s,
+    }
+}
+
+/// Parse a hex string into `u16`, tolerating a `0x`/`0X` prefix and whitespace.
+/// Kept in sync with `paavo_probe::session::parse_hex_u16` (see spec future-work).
+fn parse_hex_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
+    let s = s.trim();
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u16::from_str_radix(stripped, 16)
 }
 
 /// Whether a board is currently eligible to receive jobs.
@@ -107,4 +242,113 @@ pub struct BoardView {
     pub last_used_at: Option<i64>,
     /// Epoch ms when this board was first registered.
     pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bare_token() {
+        let s = ProbeSelector::parse("1fc9:0143:EDFHUAFM4J5ZJ").unwrap();
+        assert_eq!(
+            s,
+            ProbeSelector {
+                vid: "1fc9".into(),
+                pid: "0143".into(),
+                serial: "EDFHUAFM4J5ZJ".into(),
+                interface: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_with_interface() {
+        let s = ProbeSelector::parse("1fc9:0143-0:EDFHUAFM4J5ZJ").unwrap();
+        assert_eq!(s.pid, "0143");
+        assert_eq!(s.interface, Some(0));
+    }
+
+    #[test]
+    fn parse_empty_interface_is_none() {
+        let s = ProbeSelector::parse("1fc9:0143-:S").unwrap();
+        assert_eq!(s.interface, None);
+        assert_eq!(s.serial, "S");
+    }
+
+    #[test]
+    fn parse_colon_serial_preserved() {
+        let s = ProbeSelector::parse("303a:1001:DC:DA:0C:D3:FE:D8").unwrap();
+        assert_eq!(s.vid, "303a");
+        assert_eq!(s.pid, "1001");
+        assert_eq!(s.serial, "DC:DA:0C:D3:FE:D8");
+    }
+
+    #[test]
+    fn parse_no_serial_is_empty() {
+        let s = ProbeSelector::parse("1fc9:0143").unwrap();
+        assert_eq!(s.serial, "");
+        assert_eq!(s.interface, None);
+    }
+
+    #[test]
+    fn parse_normalizes_hex() {
+        let s = ProbeSelector::parse("0X1FC9:143:S").unwrap();
+        assert_eq!(s.vid, "1fc9");
+        assert_eq!(s.pid, "0143");
+    }
+
+    #[test]
+    fn parse_rejects_bad_vid() {
+        assert!(matches!(
+            ProbeSelector::parse("zz:0143:S"),
+            Err(ProbeSelectorParseError::BadVid { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_bad_pid() {
+        assert!(matches!(
+            ProbeSelector::parse("1fc9:gg:S"),
+            Err(ProbeSelectorParseError::BadPid { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_missing_pid() {
+        assert!(matches!(
+            ProbeSelector::parse("1fc9"),
+            Err(ProbeSelectorParseError::Format)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_bad_interface() {
+        assert!(matches!(
+            ProbeSelector::parse("1fc9:0143-x:S"),
+            Err(ProbeSelectorParseError::BadInterface { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_normalized() {
+        let s = ProbeSelector {
+            vid: "1fc9".into(),
+            pid: "0143".into(),
+            serial: "S".into(),
+            interface: None,
+        };
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_hex() {
+        let s = ProbeSelector {
+            vid: "zz".into(),
+            pid: "0143".into(),
+            serial: "S".into(),
+            interface: None,
+        };
+        assert!(s.validate().is_err());
+    }
 }

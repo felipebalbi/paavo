@@ -9,6 +9,7 @@ description = "Wire types and protocol definitions shared across the paavo works
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
