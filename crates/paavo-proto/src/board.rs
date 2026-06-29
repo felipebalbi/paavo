@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// VID/PID/serial selector for a probe, matching the probe-rs naming.
+/// VID/PID/serial/interface selector for a probe, matching the probe-rs naming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeSelector {
     /// USB vendor id, hex string e.g. `"1fc9"`. Canonical form is lowercase 4-hex.
@@ -318,6 +318,11 @@ mod tests {
     #[test]
     fn parse_normalizes_hex() {
         let s = ProbeSelector::parse("0X1FC9:143:S").unwrap();
+        assert_eq!(s.vid, "1fc9");
+        assert_eq!(s.pid, "0143");
+
+        // Whitespace around the inner fields is tolerated and normalized too.
+        let s = ProbeSelector::parse(" 1fc9 : 0143 :S").unwrap();
         assert_eq!(s.vid, "1fc9");
         assert_eq!(s.pid, "0143");
     }
