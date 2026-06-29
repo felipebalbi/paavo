@@ -292,6 +292,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_full_probe_rs_list_line() {
+        let line = "[0]: MCU-LINK on-board (r2E4) CMSIS-DAP V3.172 \
+                    -- 1fc9:0143-0:EDFHUAFM4J5ZJ (CMSIS-DAP)";
+        let s = ProbeSelector::parse(line).unwrap();
+        assert_eq!(
+            s,
+            ProbeSelector {
+                vid: "1fc9".into(),
+                pid: "0143".into(),
+                serial: "EDFHUAFM4J5ZJ".into(),
+                interface: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_empty_input_is_format_error() {
+        assert!(matches!(
+            ProbeSelector::parse(""),
+            Err(ProbeSelectorParseError::Format)
+        ));
+    }
+
+    #[test]
     fn parse_normalizes_hex() {
         let s = ProbeSelector::parse("0X1FC9:143:S").unwrap();
         assert_eq!(s.vid, "1fc9");
