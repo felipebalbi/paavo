@@ -26,6 +26,19 @@ fn path_without_cargo_generate() -> std::ffi::OsString {
     std::env::join_paths(kept).expect("rejoin PATH")
 }
 
+/// The workspace root, discovered by walking up from the test's CWD
+/// until we find `templates/mcxa266/cargo-generate.toml`. Used to point
+/// `new` at the in-repo templates as a LOCAL source, so these tests are
+/// deterministic and never touch the network.
+fn workspace_root() -> std::path::PathBuf {
+    std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|p| p.join("templates/mcxa266/cargo-generate.toml").exists())
+        .expect("templates/mcxa266 not found from any ancestor of CWD")
+        .to_path_buf()
+}
+
 #[test]
 fn new_without_cargo_generate_errors_clearly() {
     // Exercise the missing-binary pre-flight by stripping cargo-generate
@@ -47,9 +60,14 @@ fn new_without_cargo_generate_errors_clearly() {
 
 #[test]
 fn new_with_unknown_board_kind_errors_with_kinds_list() {
+    // Point at the in-repo templates as a LOCAL source so the rich
+    // pre-flight (existence + "Available:" list) runs. With the default
+    // URL source this validation is deferred to cargo-generate instead.
+    let root = workspace_root();
     Command::cargo_bin("paavo-cli")
         .unwrap()
-        .args(["new", "hello", "--board-kind", "bogus-xyz"])
+        .args(["new", "hello", "--board-kind", "bogus-xyz", "--templates"])
+        .arg(&root)
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown board kind: bogus-xyz"))
@@ -79,6 +97,7 @@ fn new_mcxa266_scaffolds_and_typechecks() {
         eprintln!("PAAVO_HW not set; skipping");
         return;
     }
+    let root = workspace_root();
     let tmp = tempfile::tempdir().expect("tempdir");
     Command::cargo_bin("paavo-cli")
         .unwrap()
@@ -89,7 +108,9 @@ fn new_mcxa266_scaffolds_and_typechecks() {
             "mcxa266",
             "--into",
             tmp.path().to_str().unwrap(),
+            "--templates",
         ])
+        .arg(&root)
         .assert()
         .success();
 
@@ -101,9 +122,6 @@ fn new_mcxa266_scaffolds_and_typechecks() {
     assert!(scaffolded.join("src/main.rs").is_file(), "main.rs missing");
     assert!(scaffolded.join("memory.x").is_file(), "memory.x missing");
 
-    // `cargo check` (not build) against thumbv8m.main-none-eabihf.
-    // We don't link or download crates we don't need; check stops at
-    // typeck which exercises feature-flag correctness.
     let out = std::process::Command::new("cargo")
         .args(["check", "--target", "thumbv8m.main-none-eabihf"])
         .current_dir(&scaffolded)

@@ -1,3 +1,125 @@
+# `paavo-cli new` Remote/Local Templates — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Let `paavo-cli new` scaffold a test crate from a git URL *or* a local path, defaulting to a baked-in canonical URL so no checkout is needed.
+
+**Architecture:** A pure core in `cmd_new.rs` — `classify_source` (URL vs path) and `build_cg_args` (exact cargo-generate argv) — fully unit-tested with no network/hardware, behind a thin side-effecting `run()` that keeps validation, the cargo-generate presence check, and the spawn. The CLI gains `--templates` (with `PAAVO_TEMPLATES` env + `--templates-path` alias), `--templates-subdir`, and `--templates-rev`. The old walk-up auto-discovery is removed.
+
+**Tech Stack:** Rust 1.95.0, clap 4 (derive + env), cargo-generate 0.23 (external binary), `assert_cmd`/`predicates`/`tempfile`/`which` for tests, `tracing` for the ignored-rev warning.
+
+**Reference spec:** `docs/superpowers/specs/2026-06-29-cli-new-remote-templates-design.md`
+
+---
+
+## File structure
+
+| File | Responsibility | Change |
+|------|----------------|--------|
+| `crates/paavo-cli/src/cmd_new.rs` | Source classification, argv construction, `run()` side effects, unit tests | Rewrite |
+| `crates/paavo-cli/src/cli.rs` | `New` subcommand flag surface | Modify the `New { … }` variant |
+| `crates/paavo-cli/src/main.rs` | Thread `New` flags into `NewArgs` | Modify the `Cmd::New` arm |
+| `crates/paavo-cli/tests/cli_new.rs` | Integration tests for `new` | Modify 2 tests + add a helper |
+| `README.md` | User-facing docs for `new` templates | Add a subsection |
+
+> **Why one big code task:** the new `TemplateSource::Git` variant must be *constructed in non-test code* the moment it exists, or `cargo clippy --all-targets -D warnings` fails with `variant never constructed`. So the enum, `run()` rewrite, and CLI flags land together in Task 1. Docs (Task 2) and final verification (Task 3) follow.
+
+---
+
+## Task 1: Templates can be a URL or a local path
+
+**Files:**
+- Modify: `crates/paavo-cli/src/cli.rs` (the `New { … }` variant, ~lines 59-77)
+- Modify: `crates/paavo-cli/src/main.rs` (the `cli::Cmd::New { … }` arm, ~lines 49-74)
+- Rewrite: `crates/paavo-cli/src/cmd_new.rs`
+- Modify: `crates/paavo-cli/tests/cli_new.rs`
+
+Intermediate states between steps will not compile (the three source files change in lockstep); that is expected. Verify and commit only at the end.
+
+- [ ] **Step 1: Update the CLI flag surface in `cli.rs`**
+
+Replace the `New { … }` variant (currently lines 59-77) with this. Note the `templates_path` field is gone, replaced by `templates` (which keeps `--templates-path` as a visible alias):
+
+```rust
+    /// Scaffold a new test crate via cargo-generate templates.
+    New {
+        /// Crate name to create.
+        name: String,
+        /// Required board kind.
+        #[arg(long)]
+        board_kind: String,
+        /// quick / soak.
+        #[arg(long, default_value = "quick")]
+        kind: TestKindArg,
+        /// Destination directory; the scaffolded crate lands at
+        /// `<into>/<name>/`. Defaults to the current working directory.
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Template tree root: a git URL or a local directory
+        /// (auto-detected). Defaults to the canonical paavo repo, so no
+        /// checkout is needed. Override with the `PAAVO_TEMPLATES` env
+        /// var. The legacy `--templates-path` is an alias.
+        #[arg(
+            long,
+            visible_alias = "templates-path",
+            env = "PAAVO_TEMPLATES",
+            default_value = crate::cmd_new::DEFAULT_TEMPLATES_URL
+        )]
+        templates: String,
+        /// Subdirectory within the templates root that holds the
+        /// board-kind folders. Use "." when the root is itself the
+        /// templates directory.
+        #[arg(long, default_value = "templates")]
+        templates_subdir: String,
+        /// Pin a URL templates source to a git ref (a tag or commit
+        /// SHA). Ignored, with a warning, for local sources.
+        #[arg(long)]
+        templates_rev: Option<String>,
+    },
+```
+
+- [ ] **Step 2: Thread the new flags through `main.rs`**
+
+Replace the `cli::Cmd::New { … } => { … }` arm (currently lines 49-74) with:
+
+```rust
+        cli::Cmd::New {
+            name,
+            board_kind,
+            kind,
+            into,
+            templates,
+            templates_subdir,
+            templates_rev,
+        } => {
+            let kind_str = match kind {
+                cli::TestKindArg::Quick => "quick",
+                cli::TestKindArg::Soak => "soak",
+            }
+            .to_string();
+            let into = match into {
+                Some(p) => p,
+                None => std::env::current_dir()
+                    .context("resolving current directory for default --into")?,
+            };
+            let code = cmd_new::run(cmd_new::NewArgs {
+                crate_name: name,
+                board_kind,
+                kind: kind_str,
+                into,
+                templates,
+                templates_subdir,
+                templates_rev,
+            })?;
+            std::process::exit(code);
+        }
+```
+
+- [ ] **Step 3: Rewrite `cmd_new.rs` (core + `run` + unit tests)**
+
+Replace the entire contents of `crates/paavo-cli/src/cmd_new.rs` with the following. Keep the existing `validate_kebab_name` function and its tests verbatim (shown here in full so the file is complete):
+
+```rust
 //! `paavo-cli new` — scaffold a test crate from a template tree that is
 //! either a local directory or a remote git repository. Thin wrapper
 //! around `cargo generate`.
@@ -363,9 +485,7 @@ mod tests {
         assert!(!s.contains(&"--git".to_string()));
         let idx = s.iter().position(|x| x == "--path").unwrap();
         assert!(
-            s[idx + 1]
-                .replace('\\', "/")
-                .ends_with("/root/templates/mcxa266"),
+            s[idx + 1].replace('\\', "/").ends_with("/root/templates/mcxa266"),
             "path was {:?}",
             s[idx + 1]
         );
@@ -495,3 +615,200 @@ mod tests {
         assert!(validate_kebab_name("").is_err());
     }
 }
+```
+
+- [ ] **Step 4: Update the integration tests in `tests/cli_new.rs`**
+
+Add a helper and update the two tests that relied on the old local default. The missing-cargo-generate test stays as-is (the default URL source skips the local pre-flight and still hits the presence check → exit 2 with no network). Insert this helper after the `path_without_cargo_generate` function:
+
+```rust
+/// The workspace root, discovered by walking up from the test's CWD
+/// until we find `templates/mcxa266/cargo-generate.toml`. Used to point
+/// `new` at the in-repo templates as a LOCAL source, so these tests are
+/// deterministic and never touch the network.
+fn workspace_root() -> std::path::PathBuf {
+    std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|p| p.join("templates/mcxa266/cargo-generate.toml").exists())
+        .expect("templates/mcxa266 not found from any ancestor of CWD")
+        .to_path_buf()
+}
+```
+
+Replace `new_with_unknown_board_kind_errors_with_kinds_list` with (adds an explicit local `--templates <root>`, since the default is now a URL that would otherwise be deferred to cargo-generate):
+
+```rust
+#[test]
+fn new_with_unknown_board_kind_errors_with_kinds_list() {
+    // Point at the in-repo templates as a LOCAL source so the rich
+    // pre-flight (existence + "Available:" list) runs. With the default
+    // URL source this validation is deferred to cargo-generate instead.
+    let root = workspace_root();
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args(["new", "hello", "--board-kind", "bogus-xyz", "--templates"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown board kind: bogus-xyz"))
+        .stderr(predicate::str::contains("mcxa266"));
+}
+```
+
+Replace the body of the PAAVO_HW-gated `new_mcxa266_scaffolds_and_typechecks` so it scaffolds from the local in-repo templates (no network even under `PAAVO_HW=1`):
+
+```rust
+#[test]
+#[ignore] // gated under PAAVO_HW=1 because it does a real cargo-generate +
+          // real cargo check against thumbv8m.main-none-eabihf, which is
+          // slow and requires the target to be installed.
+fn new_mcxa266_scaffolds_and_typechecks() {
+    if std::env::var("PAAVO_HW").is_err() {
+        eprintln!("PAAVO_HW not set; skipping");
+        return;
+    }
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    Command::cargo_bin("paavo-cli")
+        .unwrap()
+        .args([
+            "new",
+            "smoke-test",
+            "--board-kind",
+            "mcxa266",
+            "--into",
+            tmp.path().to_str().unwrap(),
+            "--templates",
+        ])
+        .arg(&root)
+        .assert()
+        .success();
+
+    let scaffolded = tmp.path().join("smoke-test");
+    assert!(
+        scaffolded.join("Cargo.toml").is_file(),
+        "Cargo.toml missing"
+    );
+    assert!(scaffolded.join("src/main.rs").is_file(), "main.rs missing");
+    assert!(scaffolded.join("memory.x").is_file(), "memory.x missing");
+
+    let out = std::process::Command::new("cargo")
+        .args(["check", "--target", "thumbv8m.main-none-eabihf"])
+        .current_dir(&scaffolded)
+        .output()
+        .expect("spawn cargo check");
+    assert!(
+        out.status.success(),
+        "cargo check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+```
+
+- [ ] **Step 5: Build and run the paavo-cli tests**
+
+Run: `cargo test -p paavo-cli`
+Expected: PASS. The new unit tests (`classify_source_*`, `build_cg_args_*`) and the existing `validate_kebab_name_*` pass; the integration tests `new_without_cargo_generate_errors_clearly`, `new_with_unknown_board_kind_errors_with_kinds_list`, and `new_with_non_kebab_name_errors_before_touching_filesystem` pass. The `#[ignore]`d HW test is skipped.
+
+- [ ] **Step 6: Format and lint**
+
+Run: `cargo fmt --all`
+Then: `cargo fmt --all -- --check`
+Expected: no diff.
+
+Run: `cargo clippy -p paavo-cli --all-targets -- -D warnings`
+Expected: no warnings. (In particular, no `variant never constructed` for `TemplateSource::Git` — `run()` constructs it for the default URL source.)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/paavo-cli/src/cli.rs crates/paavo-cli/src/main.rs crates/paavo-cli/src/cmd_new.rs crates/paavo-cli/tests/cli_new.rs
+git commit -m "feat(paavo-cli): new scaffolds from a git URL or local path"
+```
+
+---
+
+## Task 2: Document the templates sources in the README
+
+**Files:**
+- Modify: `README.md` (insert a subsection after the `cli.toml` block, before `## Scheduled runs`)
+
+- [ ] **Step 1: Add the templates subsection**
+
+In `README.md`, immediately after the closing ```` ``` ```` of the `cli.toml` example (line 61) and before `## Scheduled runs` (line 63), insert:
+
+```markdown
+
+### Templates for `paavo-cli new`
+
+`paavo-cli new` scaffolds a test crate from a template tree. The source can
+be a git URL or a local directory and is auto-detected. It resolves in this
+order:
+
+1. `--templates <url-or-path>` flag
+2. `PAAVO_TEMPLATES` environment variable
+3. Default: `https://github.com/felipebalbi/paavo` (the canonical repo)
+
+So the quick-start one-liner works with no checkout — `new` clones the
+templates for you. The template for a board kind is read from
+`<source>/<subdir>/<board-kind>/`, where `<subdir>` defaults to `templates`.
+
+```bash
+# Default: clone the canonical repo (no checkout needed).
+paavo-cli new my-dma-test --board-kind mcxa266
+
+# Working inside a paavo checkout, against your local template edits:
+paavo-cli new my-dma-test --board-kind mcxa266 --templates .
+
+# A fork, pinned to a release tag (a tag or commit SHA):
+paavo-cli new my-dma-test --board-kind mcxa266 \
+    --templates https://github.com/acme/paavo-fork --templates-rev v1.2.0
+```
+
+The legacy `--templates-path` flag still works as an alias for `--templates`,
+but now names the tree *root* (use `--templates-subdir .` if it points
+directly at a templates directory).
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add README.md
+git commit -m "docs(readme): document paavo-cli new template sources"
+```
+
+---
+
+## Task 3: Full-workspace verification
+
+**Files:** none (verification only)
+
+- [ ] **Step 1: Run the exact CI gate across the whole workspace**
+
+Run: `cargo fmt --all -- --check`
+Expected: no diff.
+
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Expected: no warnings.
+
+Run: `cargo test --workspace`
+Expected: PASS. (The `templates_mcxa266_smoke.rs` tests are unaffected — they read the template files textually and never invoke `new`.)
+
+- [ ] **Step 2: (Optional, manual) sanity-check the CLI surface**
+
+Run: `cargo run -p paavo-cli -- new --help`
+Expected: help shows `--templates` (with alias `--templates-path`), `--templates-subdir`, `--templates-rev`, and `[env: PAAVO_TEMPLATES=]` on `--templates`.
+
+Run: `cargo run -p paavo-cli -- new my-test --board-kind bogus --templates .`
+Expected (from a repo checkout): `unknown board kind: bogus. Available: mcxa266, rt685-evk` (exact kinds depend on `templates/`).
+
+---
+
+## Self-review notes
+
+- **Spec coverage:** `--templates` default URL + env + alias (Task 1 Step 1, Task 2); `--templates-subdir` (Step 1 + `subdir_base`/`git_subfolder`); `--templates-rev` → `--revision` with local-warn (Step 3 `build_cg_args`/`run`); URL validation deferred to cargo-generate (Step 3 `run`); local "Available kinds" preserved (Step 3 `list_available_kinds`); walk-up removed (no `resolve_templates_root` in the rewrite); pure unit-tested core (Step 3 tests); README docs (Task 2); CI gate (Task 3).
+- **Type consistency:** `TemplateSource`, `classify_source(&str, Option<String>)`, `build_cg_args(&TemplateSource, &str, &str, &str, &str, &Path) -> Vec<OsString>`, `subdir_base`, `local_template_dir`, `git_subfolder`, `list_available_kinds(&Path, &str)`, and `NewArgs { crate_name, board_kind, kind, into, templates, templates_subdir, templates_rev }` are used identically in `cli.rs`, `main.rs`, `cmd_new.rs`, and the tests.
+- **No placeholders:** every code block is complete and compilable.
+```
