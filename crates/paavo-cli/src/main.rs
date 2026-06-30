@@ -51,7 +51,9 @@ async fn main() -> Result<()> {
             board_kind,
             kind,
             into,
-            templates_path,
+            templates,
+            templates_subdir,
+            templates_rev,
         } => {
             let kind_str = match kind {
                 cli::TestKindArg::Quick => "quick",
@@ -68,7 +70,9 @@ async fn main() -> Result<()> {
                 board_kind,
                 kind: kind_str,
                 into,
-                templates_path,
+                templates,
+                templates_subdir,
+                templates_rev,
             })?;
             std::process::exit(code);
         }

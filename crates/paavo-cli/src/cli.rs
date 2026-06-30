@@ -70,10 +70,26 @@ pub enum Cmd {
         /// `<into>/<name>/`. Defaults to the current working directory.
         #[arg(long)]
         into: Option<PathBuf>,
-        /// Explicit templates root. Overrides the default
-        /// auto-discovery (walking up from CWD for a paavo checkout).
+        /// Template tree root: a git URL or a local directory
+        /// (auto-detected). Defaults to the canonical paavo repo, so no
+        /// checkout is needed. Override with the `PAAVO_TEMPLATES` env
+        /// var. The legacy `--templates-path` is an alias.
+        #[arg(
+            long,
+            visible_alias = "templates-path",
+            env = "PAAVO_TEMPLATES",
+            default_value = crate::cmd_new::DEFAULT_TEMPLATES_URL
+        )]
+        templates: String,
+        /// Subdirectory within the templates root that holds the
+        /// board-kind folders. Use "." when the root is itself the
+        /// templates directory.
+        #[arg(long, default_value = "templates")]
+        templates_subdir: String,
+        /// Pin a URL templates source to a git ref (a tag or commit
+        /// SHA). Ignored, with a warning, for local sources.
         #[arg(long)]
-        templates_path: Option<PathBuf>,
+        templates_rev: Option<String>,
     },
     /// Cancel a queued or running job.
     Cancel {
