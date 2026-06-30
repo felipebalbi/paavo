@@ -60,6 +60,36 @@ The `cli.toml` file is minimal:
 host = "http://your-paavod-server:8090"
 ```
 
+### Templates for `paavo-cli new`
+
+`paavo-cli new` scaffolds a test crate from a template tree. The source can
+be a git URL or a local directory and is auto-detected. It resolves in this
+order:
+
+1. `--templates <url-or-path>` flag
+2. `PAAVO_TEMPLATES` environment variable
+3. Default: `https://github.com/felipebalbi/paavo` (the canonical repo)
+
+So the quick-start one-liner works with no checkout — `new` clones the
+templates for you. The template for a board kind is read from
+`<source>/<subdir>/<board-kind>/`, where `<subdir>` defaults to `templates`.
+
+```bash
+# Default: clone the canonical repo (no checkout needed).
+paavo-cli new my-dma-test --board-kind mcxa266
+
+# Working inside a paavo checkout, against your local template edits:
+paavo-cli new my-dma-test --board-kind mcxa266 --templates .
+
+# A fork, pinned to a release tag (a tag or commit SHA):
+paavo-cli new my-dma-test --board-kind mcxa266 \
+    --templates https://github.com/acme/paavo-fork --templates-rev v1.2.0
+```
+
+The legacy `--templates-path` flag still works as an alias for `--templates`,
+but now names the tree *root* (use `--templates-subdir .` if it points
+directly at a templates directory).
+
 ## Scheduled runs
 
 Paavo supports automatic nightly (or any cron schedule) test runs via
